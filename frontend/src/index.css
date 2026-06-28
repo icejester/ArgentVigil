@@ -76,7 +76,22 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .chart-title {
   font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
-  text-transform: uppercase; color: #5a6278; margin-bottom: 12px;
+  text-transform: uppercase; color: #5a6278; margin-bottom: 8px;
+}
+.chart-legend {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;
+}
+.legend-btn {
+  display: flex; align-items: center; gap: 6px;
+  background: none; border: 1px solid #2e3547; border-radius: 4px;
+  padding: 4px 10px; font-size: 11px; color: #8a94a6;
+  cursor: pointer; transition: opacity 0.15s, border-color 0.15s;
+}
+.legend-btn:hover { border-color: #4a5268; color: #c8d0de; }
+.legend-btn--off { opacity: 0.35; }
+.legend-swatch {
+  display: inline-block; width: 12px; height: 3px; border-radius: 2px;
+  background: var(--legend-color);
 }
 .chart-note { margin-top: 10px; font-size: 11px; color: #4a5268; }
 
@@ -104,6 +119,67 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .macro-value { font-size: 13px; color: #c8d0de; }
 .macro-empty { color: #2e3547; font-style: italic; }
 .macro-note { margin-top: 14px; font-size: 11px; color: #3e4860; line-height: 1.7; }
+
+/* ── Signal Track Record ── */
+.track-record {
+  background: #141820; border: 1px solid #2e3547;
+  border-radius: 8px; overflow: hidden;
+}
+.track-record-toggle {
+  width: 100%; display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 20px; background: none; border: none; cursor: pointer;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: #5a6278;
+}
+.track-record-toggle:hover { color: #8a94a6; }
+.toggle-caret { font-size: 10px; }
+.track-record-body { padding: 0 20px 20px; display: flex; flex-direction: column; gap: 20px; }
+.track-record-disclaimer {
+  font-size: 11px; color: #4a5860; background: #0f1520; border: 1px solid #1e2d3a;
+  border-radius: 5px; padding: 8px 12px; line-height: 1.6;
+}
+.zone-block { display: flex; flex-direction: column; gap: 10px; }
+.zone-title {
+  font-size: 12px; font-weight: 600; color: #7b8fa6; letter-spacing: 0.04em;
+}
+.thin-sample-warning {
+  font-size: 12px; background: #1a1510; border: 1px solid #4a3820;
+  border-radius: 5px; padding: 8px 12px; color: #c89a4a;
+}
+.track-table, .events-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+}
+.track-table th, .events-table th {
+  text-align: left; padding: 5px 10px; color: #4a5268;
+  font-weight: 500; border-bottom: 1px solid #1e2333; font-size: 11px;
+}
+.track-table td, .events-table td {
+  padding: 6px 10px; border-bottom: 1px solid #1a1f2b;
+}
+.track-table tr:last-child td, .events-table tr:last-child td { border-bottom: none; }
+.tr-label { color: #7b8fa6; }
+.tr-hitrate { font-weight: 600; color: #c8d0de; font-size: 14px; }
+.tr-count { color: #5a6278; }
+.tr-median { font-weight: 600; }
+.tr-range { color: #4a5268; font-size: 11px; }
+.tr-empty { color: #2e3547; font-style: italic; }
+.pos { color: #4caf76; }
+.neg { color: #e05252; }
+.zone-note { font-size: 11px; color: #3e4860; }
+.events-toggle {
+  align-self: flex-start; background: none; border: 1px solid #2e3547;
+  border-radius: 4px; padding: 4px 10px; font-size: 11px; color: #5a6278;
+  cursor: pointer;
+}
+.events-toggle:hover { color: #8a94a6; border-color: #4a5268; }
+.events-table { margin-top: 6px; }
+
+/* ── Metal section divider ── */
+.metal-section-label {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
+  text-transform: uppercase; color: #4a5268;
+  border-top: 1px solid #1e2333; padding-top: 18px;
+}
 
 /* ── Footer ── */
 .footer {
