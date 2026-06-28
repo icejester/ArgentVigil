@@ -5,9 +5,10 @@ Central configuration — tune thresholds here without touching pipeline logic.
 # CFTC Socrata API
 CFTC_API_BASE = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
 SILVER_CONTRACT_CODE = "084691"
+GOLD_CONTRACT_CODE = "088691"
 
 # How many years of history to pull (need >5yr to have a full 5yr window from day one)
-FETCH_YEARS = 7
+FETCH_YEARS = 15
 
 # Lookback windows for percentile calculation (in weeks)
 WINDOW_2YR = 104   # ~2 years of weekly data

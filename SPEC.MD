@@ -114,7 +114,46 @@ Display as supporting context around the CoT signal, not as additional manufactu
 - Alerting/notifications
 - Multi-asset support (gold-only or platinum tracking) — silver only for v1
 - User accounts / persistence beyond local cache
-- Backtesting or any price-prediction modeling
+
+## 5a. Signal validation: historical hit-rate analysis
+
+**Purpose:** Descriptive, not predictive. Answer the question: "At past positioning
+extremes, was the crowd wrong?" This validates whether the crowded/capitulated
+thresholds in config are meaningful or arbitrary, and gives an honest track record
+for the signal.
+
+**Hard constraints (same tone rules as Sec. 2 apply):**
+- Present as historical hit rate only — never as a forward prediction.
+- No price targets. "Price was higher 8 weeks later in X of Y cases" is acceptable.
+  "Silver will go to $X" is not.
+- Make the sample size visible. If there are only 6 historical crowded-long events,
+  say so — don't let a thin sample look authoritative.
+
+**Price data source:** FRED API (St. Louis Fed), LBMA silver price series.
+Standard library fetch, same pattern as the CFTC pipeline. Cache alongside CoT
+data. Series ID: `SLVPRUSD` (LBMA Silver Price, USD, daily — use Friday close
+or nearest available to align with CoT report week).
+
+**Lookahead windows:** 4 weeks and 8 weeks.
+
+**What to compute (per signal zone — crowded and capitulated separately):**
+1. Find all historical weeks where `net_long_pct_oi` percentile (5yr window)
+   crossed into the crowded zone (≥ CROWDED_THRESHOLD) or capitulated zone
+   (≤ CAPITULATED_THRESHOLD).
+2. For each such week, record the silver price at signal date and at +4w / +8w.
+3. Compute: % of cases where price was lower at +4w / +8w (for crowded signal)
+   and % of cases where price was higher at +4w / +8w (for capitulated signal).
+4. Show median and range of price change, not just win rate — a signal that's
+   right 70% of the time but the losses are 3× the gains is not a good signal.
+
+**Frontend:** A separate collapsible "Signal Track Record" panel, clearly labeled
+as historical description. Show a small table per signal zone with sample count,
+4w hit rate, 8w hit rate, median price change, and range. If sample count < 5,
+show a prominent caveat that the sample is too thin to draw conclusions.
+
+**Pipeline:** Add `pipeline/price_fetch.py` for the FRED fetch and extend
+`pipeline/compute.py` to join price data and compute the hit-rate stats. Add
+results to the cache JSON under a `signal_track_record` key.
 
 ## 6. Prior context Claude Code should know
 

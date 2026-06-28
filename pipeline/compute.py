@@ -1,16 +1,15 @@
 """
-Transforms raw CoT API rows into net_long_pct_oi time series and computes
-trailing percentiles for the 2yr and 5yr lookback windows.
+Transforms raw CoT API rows into net_long_pct_oi time series, computes
+trailing percentiles, and joins price data to produce signal hit-rate stats.
 """
 
 from config import WINDOW_2YR, WINDOW_5YR, CROWDED_THRESHOLD, CAPITULATED_THRESHOLD
 
+LOOKAHEAD_WEEKS = [4, 8]
+MIN_SAMPLE_FOR_CONCLUSIONS = 5
+
 
 def _percentile_rank(series: list[float], value: float) -> float:
-    """
-    Returns the percentile rank of `value` within `series` (0–100).
-    Fraction of series values strictly less than value, times 100.
-    """
     if not series:
         return float("nan")
     below = sum(1 for v in series if v < value)
@@ -26,19 +25,10 @@ def classify_signal(percentile: float) -> str:
 
 
 def parse_and_compute(rows: list[dict]) -> dict:
-    """
-    Accepts raw API rows (list of dicts), computes net_long_pct_oi for each
-    week, then derives 2yr/5yr trailing percentiles for the most recent reading.
-
-    Returns a dict with:
-      - series: list of {date, net_long, open_interest, net_long_pct_oi}
-      - latest: the most recent record with percentile/classification data
-      - windows: {"2yr": {...}, "5yr": {...}}
-    """
     series = []
     for row in rows:
         try:
-            date_str = row["report_date_as_yyyy_mm_dd"][:10]  # YYYY-MM-DD
+            date_str = row["report_date_as_yyyy_mm_dd"][:10]
             nc_long = float(row.get("noncomm_positions_long_all") or 0)
             nc_short = float(row.get("noncomm_positions_short_all") or 0)
             oi = float(row.get("open_interest_all") or 0)
@@ -61,7 +51,6 @@ def parse_and_compute(rows: list[dict]) -> dict:
     if not series:
         raise ValueError("No usable rows returned from CFTC API.")
 
-    # Series is already sorted oldest-first from the API query
     pct_series = [r["net_long_pct_oi"] for r in series]
     latest = series[-1]
     current_val = latest["net_long_pct_oi"]
@@ -79,8 +68,6 @@ def parse_and_compute(rows: list[dict]) -> dict:
         "2yr": window_stats(WINDOW_2YR),
         "5yr": window_stats(WINDOW_5YR),
     }
-
-    # Flag when the two windows disagree on classification
     windows["disagree"] = (
         windows["2yr"]["classification"] != windows["5yr"]["classification"]
     )
@@ -90,3 +77,114 @@ def parse_and_compute(rows: list[dict]) -> dict:
         "latest": latest,
         "windows": windows,
     }
+
+
+def compute_signal_track_record(series: list[dict], prices: dict[str, float]) -> dict:
+    """
+    Joins CoT series with price data and computes historical hit rates for
+    crowded-long and capitulated signal zones.
+
+    For each week in the series, computes the rolling 5yr percentile at that
+    point in time (so we don't look ahead into history the signal wouldn't
+    have had). Then for weeks that crossed into a signal zone, measures whether
+    price moved in the "expected" direction at +4w and +8w.
+
+    Crowded signal "correct" = price lower at +Nw (downside flush materialized).
+    Capitulated signal "correct" = price higher at +Nw (recovery materialized).
+    """
+    from price_fetch import align_price_to_cot_week
+
+    n = len(series)
+    results = {"crowded": {}, "capitulated": {}, "thin_sample_warning": False}
+
+    for zone in ("crowded", "capitulated"):
+        events = []  # each: {date, price_at_signal, price_4w, price_8w, pct_chg_4w, pct_chg_8w}
+
+        for i in range(WINDOW_5YR, n):
+            # Rolling 5yr percentile using only data available at week i
+            window = [r["net_long_pct_oi"] for r in series[max(0, i - WINDOW_5YR):i]]
+            current = series[i]["net_long_pct_oi"]
+            pct = _percentile_rank(window, current)
+
+            in_zone = (
+                pct >= CROWDED_THRESHOLD if zone == "crowded"
+                else pct <= CAPITULATED_THRESHOLD
+            )
+            if not in_zone:
+                continue
+
+            # Need forward price data at +4w and +8w
+            max_lookahead = max(LOOKAHEAD_WEEKS)
+            if i + max_lookahead >= n:
+                continue  # not enough future history yet
+
+            signal_date = series[i]["date"]
+            price_now = align_price_to_cot_week(signal_date, prices)
+            if price_now is None:
+                continue
+
+            forward_prices = {}
+            for weeks in LOOKAHEAD_WEEKS:
+                future_date = series[i + weeks]["date"]
+                p = align_price_to_cot_week(future_date, prices)
+                forward_prices[weeks] = p
+
+            if any(v is None for v in forward_prices.values()):
+                continue
+
+            event = {
+                "date": signal_date,
+                "percentile": round(pct, 1),
+                "price_at_signal": round(price_now, 4),
+            }
+            for weeks in LOOKAHEAD_WEEKS:
+                p_fwd = forward_prices[weeks]
+                pct_chg = round((p_fwd - price_now) / price_now * 100, 2)
+                event[f"price_{weeks}w"] = round(p_fwd, 4)
+                event[f"pct_chg_{weeks}w"] = pct_chg
+            events.append(event)
+
+        lookahead_stats = {}
+        for weeks in LOOKAHEAD_WEEKS:
+            chg_key = f"pct_chg_{weeks}w"
+            changes = [e[chg_key] for e in events]
+            if not changes:
+                lookahead_stats[f"{weeks}w"] = None
+                continue
+
+            if zone == "crowded":
+                # Signal "correct" = price fell (negative change)
+                correct = sum(1 for c in changes if c < 0)
+            else:
+                # Signal "correct" = price rose (positive change)
+                correct = sum(1 for c in changes if c > 0)
+
+            sorted_changes = sorted(changes)
+            mid = len(sorted_changes) // 2
+            median = (
+                sorted_changes[mid]
+                if len(sorted_changes) % 2 == 1
+                else round((sorted_changes[mid - 1] + sorted_changes[mid]) / 2, 2)
+            )
+
+            lookahead_stats[f"{weeks}w"] = {
+                "hit_rate_pct": round(correct / len(changes) * 100, 1),
+                "correct": correct,
+                "total": len(changes),
+                "median_price_chg_pct": median,
+                "min_price_chg_pct": round(min(changes), 2),
+                "max_price_chg_pct": round(max(changes), 2),
+            }
+
+        sample_count = len(events)
+        results[zone] = {
+            "sample_count": sample_count,
+            "thin_sample": sample_count < MIN_SAMPLE_FOR_CONCLUSIONS,
+            "events": events,
+            "lookahead": lookahead_stats,
+        }
+
+        if sample_count < MIN_SAMPLE_FOR_CONCLUSIONS:
+            results["thin_sample_warning"] = True
+
+    return results

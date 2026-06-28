@@ -9,43 +9,95 @@ import os
 import sys
 from datetime import datetime, timezone
 
-# Allow running from either repo root or pipeline/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fetch import fetch_cot_data
-from compute import parse_and_compute
+from fetch import fetch_cot_data, fetch_gold_cot_data
+from price_fetch import fetch_silver_prices, fetch_gold_prices, fetch_spot_prices
+from compute import parse_and_compute, compute_signal_track_record
 
-# Always resolve to <repo>/pipeline/cache/cot_data.json regardless of cwd
 _PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
 _CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache", "cot_data.json")
 
 
-def main():
-    print("ArgentVigil pipeline — fetching CFTC CoT data...")
-    rows = fetch_cot_data()
-    print(f"  Received {len(rows)} weekly records from PRE API.")
+def _run_metal(name: str, rows_fn, prices_fn) -> tuple[dict, dict]:
+    print(f"\n  [{name}] Fetching CoT data...")
+    rows = rows_fn()
+    print(f"  [{name}] {len(rows)} weekly records.")
+
+    print(f"  [{name}] Fetching price data...")
+    prices = prices_fn(years=8)
+    print(f"  [{name}] {len(prices)} price records.")
 
     result = parse_and_compute(rows)
-
     latest = result["latest"]
     w2 = result["windows"]["2yr"]
     w5 = result["windows"]["5yr"]
-    disagree = result["windows"]["disagree"]
+    print(f"  [{name}] Latest: {latest['date']}  net_long_pct_oi={latest['net_long_pct_oi']:.2f}%")
+    print(f"  [{name}] 2yr: {w2['percentile']} → {w2['classification']}")
+    print(f"  [{name}] 5yr: {w5['percentile']} → {w5['classification']}")
+    if result["windows"]["disagree"]:
+        print(f"  [{name}] ⚠  2yr and 5yr disagree.")
 
-    print(f"\n  Latest report date : {latest['date']}")
-    print(f"  net_long_pct_oi    : {latest['net_long_pct_oi']:.2f}%")
-    print(f"  2yr percentile     : {w2['percentile']}  → {w2['classification']}")
-    print(f"  5yr percentile     : {w5['percentile']}  → {w5['classification']}")
-    if disagree:
-        print("  ⚠  2yr and 5yr windows disagree — see both readings in the UI.")
+    print(f"  [{name}] Computing track record...")
+    track_record = compute_signal_track_record(result["series"], prices)
+    for zone in ("crowded", "capitulated"):
+        z = track_record[zone]
+        suffix = " (thin sample)" if z["thin_sample"] else ""
+        print(f"  [{name}] {zone.capitalize()}: {z['sample_count']} events{suffix}")
 
-    output = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        # CoT data lag: as-of Tuesday, published Friday (~3 days later)
-        "cot_as_of_date": latest["date"],
+    cot_data = {
         "series": result["series"],
         "latest": latest,
         "windows": result["windows"],
+        "signal_track_record": track_record,
+    }
+    return cot_data, prices
+
+
+def _compute_gsr_series(gold_spot: dict, silver_spot: dict) -> list[dict]:
+    """
+    Computes weekly Gold/Silver Ratio from spot price dicts (GC=F / SI=F).
+    Both are USD per troy oz so the ratio is directly comparable to the
+    published GSR (e.g. 80:1, 60:1).
+    """
+    common_dates = sorted(set(gold_spot) & set(silver_spot))
+    series = []
+    for date in common_dates:
+        g = gold_spot[date]
+        s = silver_spot[date]
+        if s and s > 0:
+            series.append({"date": date, "gsr": round(g / s, 1)})
+    print(f"\n  [GSR] {len(series)} weekly data points computed.")
+    return series
+
+
+def main():
+    print("ArgentVigil pipeline starting...")
+
+    silver, silver_prices = _run_metal("Silver", fetch_cot_data, fetch_silver_prices)
+    gold, gold_prices = _run_metal("Gold", fetch_gold_cot_data, fetch_gold_prices)
+
+    print("\n  [GSR] Fetching spot prices (GC=F, SI=F)...")
+    gold_spot = fetch_spot_prices("GC=F", years=8)
+    silver_spot = fetch_spot_prices("SI=F", years=8)
+    gsr_series = _compute_gsr_series(gold_spot, silver_spot)
+
+    output = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cot_as_of_date": silver["latest"]["date"],
+        # Silver (top-level keys preserved for backwards compat)
+        "series": silver["series"],
+        "latest": silver["latest"],
+        "windows": silver["windows"],
+        "signal_track_record": silver["signal_track_record"],
+        # Gold
+        "gold": {
+            "series": gold["series"],
+            "latest": gold["latest"],
+            "windows": gold["windows"],
+            "signal_track_record": gold["signal_track_record"],
+        },
+        "gsr_series": gsr_series,
         "macro_watchlist": _load_existing_watchlist(),
     }
 
@@ -57,7 +109,6 @@ def main():
 
 
 def _load_existing_watchlist() -> dict:
-    """Preserve any manually-entered macro watchlist values across pipeline runs."""
     try:
         with open(_CACHE_PATH) as f:
             existing = json.load(f)
