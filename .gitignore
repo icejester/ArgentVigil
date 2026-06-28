@@ -221,3 +221,4 @@ __marimo__/
 pipeline/cache/cot_data.json
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
