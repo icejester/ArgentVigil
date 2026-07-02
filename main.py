@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date
@@ -12,6 +13,13 @@ import db
 from mc_token import authed_headers
 
 METALCHARTS = "https://metalcharts.org"
+MARKET_BALANCE_PATH = "silver_market_balance.json"
+
+# Recoverable stock = Investment (coins/bars) + ETF/Exchange Vaults + Central
+# Bank reserves only. Excludes industrial (unrecoverable) and jewelry/silverware
+# (partially recoverable, illiquid) per SPEC.MD's Open Questions resolution.
+RECOVERABLE_STOCK_LOW_OZ = 12_500_000_000
+RECOVERABLE_STOCK_HIGH_OZ = 17_000_000_000
 
 _client: httpx.AsyncClient | None = None
 
@@ -268,6 +276,61 @@ async def pslv():
 async def shfe_db_history():
     rows = db.get_shfe_history()
     return {"success": True, "data": rows}
+
+
+def _runway_years(deficit_moz: float | None) -> dict | None:
+    if not deficit_moz or deficit_moz <= 0:
+        return None
+    deficit_oz = deficit_moz * 1_000_000
+    return {
+        "low_years": round(RECOVERABLE_STOCK_LOW_OZ / deficit_oz, 1),
+        "high_years": round(RECOVERABLE_STOCK_HIGH_OZ / deficit_oz, 1),
+    }
+
+
+@app.get("/api/silver/market-balance")
+async def silver_market_balance():
+    try:
+        with open(MARKET_BALANCE_PATH) as f:
+            rows = json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(500, "silver_market_balance.json not found")
+
+    rows = sorted(rows, key=lambda r: r["year"])
+
+    for i, r in enumerate(rows):
+        window = rows[max(0, i - 4): i + 1]
+        vals = [w["net_balance_moz"] for w in window if w.get("net_balance_moz") is not None]
+        r["cumulative_5y_moz"] = round(sum(vals), 1) if vals else None
+
+    latest = rows[-1] if rows else None
+    latest_deficit = (
+        abs(latest["net_balance_moz"])
+        if latest and latest.get("net_balance_moz") is not None and latest["net_balance_moz"] < 0
+        else None
+    )
+    recent5 = [r["net_balance_moz"] for r in rows[-5:] if r.get("net_balance_moz") is not None]
+    avg5 = (sum(recent5) / len(recent5)) if recent5 else None
+    avg5_deficit = abs(avg5) if avg5 is not None and avg5 < 0 else None
+
+    months_stale = None
+    if latest:
+        published = date(latest["year"] + 1, 4, 1)
+        today = date.today()
+        months_stale = (today.year - published.year) * 12 + (today.month - published.month)
+
+    return {
+        "success": True,
+        "data": rows,
+        "meta": {
+            "latest_year": latest["year"] if latest else None,
+            "recoverable_stock_range_oz": [RECOVERABLE_STOCK_LOW_OZ, RECOVERABLE_STOCK_HIGH_OZ],
+            "runway_latest_year": _runway_years(latest_deficit),
+            "runway_5y_avg_deficit": _runway_years(avg5_deficit),
+            "months_since_expected_publication": months_stale,
+            "stale": months_stale is not None and months_stale > 18,
+        },
+    }
 
 
 @app.get("/api/prices")

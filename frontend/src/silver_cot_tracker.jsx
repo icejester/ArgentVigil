@@ -426,6 +426,69 @@ function ZoneTable({ title, zone, directionLabel }) {
   );
 }
 
+function PaperLeveragePanel() {
+  const [leverageData, setLeverageData] = useState(null);
+
+  useEffect(() => {
+    fetch("/api/silver/leverage")
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(setLeverageData)
+      .catch(() => {});
+  }, []);
+
+  if (!leverageData) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Paper Leverage Ratio</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const row = (leverageData.data || [])[0];
+  const leverage = row?.paper_leverage;
+  const oi = row?.openInterest;
+  const vol = row?.volume;
+  const date = row?.date;
+
+  const alertLevel = leverage == null ? null
+    : leverage >= 10 ? "high"
+    : leverage >= 5  ? "med"
+    : "low";
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Paper Leverage Ratio — OI × 5,000 oz / Registered</div>
+      <div className="comex-panel-note">
+        Above 1.0 = more paper claims than registered metal available for delivery.
+        OI is in contracts (5,000 troy oz each). Positioning context alongside CoT.
+      </div>
+      {leverage != null ? (
+        <div className="comex-leverage-card">
+          <div className={`comex-leverage-value comex-leverage--${alertLevel}`}>
+            {leverage.toFixed(2)}x
+          </div>
+          <div className="comex-leverage-meta">
+            <span>Open interest: <strong>{oi?.toLocaleString()} contracts</strong> ({(oi * 5000)?.toLocaleString()} oz)</span>
+            <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
+            <span>As of: <strong>{date}</strong></span>
+          </div>
+          <div className="comex-leverage-note">
+            {leverage >= 10
+              ? "⚠ Extreme paper leverage — registered inventory is thinly covered."
+              : leverage >= 5
+              ? "Elevated paper leverage — watch registered inventory levels."
+              : "Paper leverage within normal range."}
+          </div>
+        </div>
+      ) : (
+        <div className="comex-empty">No leverage data available.</div>
+      )}
+    </div>
+  );
+}
+
 function SignalTrackRecord({ trackRecord }) {
   const [open, setOpen] = useState(false);
   if (!trackRecord) return null;
@@ -506,19 +569,27 @@ export default function SilverCoTTracker({ onData }) {
         />
       </div>
 
-      <CombinedChart
-        silverSeries={data.series}
-        goldSeries={data.gold?.series}
-        gsrSeries={data.gsr_series}
-      />
+      <details className="collapsible-pane" open>
+        <summary className="collapsible-pane-title">
+          Positioning Extremes / Speculative Crowding
+        </summary>
+        <div className="collapsible-pane-body">
+          <CombinedChart
+            silverSeries={data.series}
+            goldSeries={data.gold?.series}
+            gsrSeries={data.gsr_series}
+          />
 
-      <div className="metal-section-label">Silver</div>
-      <SignalBanner latest={data.latest} windows={data.windows} metal="Silver" />
-      <SignalTrackRecord trackRecord={data.signal_track_record} />
+          <div className="metal-section-label">Silver</div>
+          <PaperLeveragePanel />
+          <SignalBanner latest={data.latest} windows={data.windows} metal="Silver" />
+          <SignalTrackRecord trackRecord={data.signal_track_record} />
 
-      <div className="metal-section-label">Gold</div>
-      <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
-      <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
+          <div className="metal-section-label">Gold</div>
+          <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
+          <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
+        </div>
+      </details>
 
       <div className="footer">
         CoT source: CFTC Public Reporting Environment (PRE), Legacy Futures-Only,

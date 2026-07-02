@@ -12,6 +12,8 @@ import {
   Pie,
   Cell,
 } from "recharts";
+import MarketBalancePanel from "./market_balance";
+import { VAULT_COLORS } from "./palette";
 
 const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
 const STALE_MS = 5 * 60 * 1000;
@@ -77,83 +79,56 @@ function xTicks(data) {
   return data.filter((_, i) => i % step === 0).map((r) => r.date);
 }
 
-// ── Panel 1: Total inventory over time ─────────────────────────────────────
-
-function TotalInventoryPanel({ history }) {
-  const [range, setRange] = useState("1Y");
-  const filtered = filterByRange(history, range);
-  const ticks = xTicks(filtered);
-
-  return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">
-        Total COMEX Silver Inventory
-        <RangeSelector value={range} onChange={setRange} />
-      </div>
-      {filtered && filtered.length > 0 ? (
-        <ResponsiveContainer width="100%" height={280}>
-          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-            <YAxis
-              tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
-              tick={{ fill: "#8a94a6", fontSize: 11 }}
-            />
-            <Tooltip
-              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-              labelStyle={{ color: "#c8d0de" }}
-              formatter={(v) => [fmt_moz(v), "Total"]}
-            />
-            <Line
-              type="monotone"
-              dataKey="total"
-              stroke="#7b9fff"
-              dot={false}
-              strokeWidth={1.8}
-              connectNulls={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      ) : (
-        <div className="comex-empty">No data</div>
-      )}
-    </div>
-  );
-}
-
 // ── Panel 2: Registered vs Eligible ────────────────────────────────────────
 
 function RegEligiblePanel({ history }) {
   const [range, setRange] = useState("1Y");
-  const filtered = filterByRange(history, range);
+  const filtered = (filterByRange(history, range) ?? []).map((r) => {
+    const total = (r.registered ?? 0) + (r.eligible ?? 0);
+    return {
+      ...r,
+      pct_available: r.registered != null && total > 0 ? (r.registered / total) * 100 : null,
+    };
+  });
   const ticks = xTicks(filtered);
 
   return (
     <div className="comex-panel">
       <div className="comex-panel-header">
-        Registered vs Eligible Silver
+        Registered vs Eligible Silver — % Available for Delivery
         <RangeSelector value={range} onChange={setRange} />
       </div>
       <div className="comex-panel-note">
         Registered = deliverable (warranted). Eligible = stored, not warranted.
-        Sharp registered drop = delivery pressure signal.
+        Sharp registered drop = delivery pressure signal. % available spike up =
+        more of total COMEX silver warranted for delivery (bullish physical demand signal).
       </div>
       {filtered && filtered.length > 0 ? (
-        <ResponsiveContainer width="100%" height={280}>
+        <ResponsiveContainer width="100%" height={300}>
           <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
             <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
             <YAxis
+              yAxisId="oz"
               tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
               tick={{ fill: "#8a94a6", fontSize: 11 }}
+            />
+            <YAxis
+              yAxisId="pct"
+              orientation="right"
+              tickFormatter={(v) => `${v.toFixed(0)}%`}
+              tick={{ fill: "#e8ecf4", fontSize: 11 }}
             />
             <Tooltip
               contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
               labelStyle={{ color: "#c8d0de" }}
-              formatter={(v, name) => [fmt_moz(v), name === "registered" ? "Registered" : "Eligible"]}
+              formatter={(v, name) => {
+                if (name === "pct_available") return [v != null ? v.toFixed(1) + "%" : "—", "% available for delivery — right axis"];
+                return [fmt_moz(v), name === "registered" ? "Registered — left axis" : "Eligible — left axis"];
+              }}
             />
-            <Legend formatter={(v) => v === "registered" ? "Registered" : "Eligible"} />
             <Line
+              yAxisId="oz"
               type="monotone"
               dataKey="registered"
               stroke="#4caf76"
@@ -162,58 +137,22 @@ function RegEligiblePanel({ history }) {
               connectNulls={false}
             />
             <Line
+              yAxisId="oz"
               type="monotone"
               dataKey="eligible"
-              stroke="#c9a227"
+              stroke="#e05252"
               dot={false}
               strokeWidth={1.8}
               connectNulls={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      ) : (
-        <div className="comex-empty">No data</div>
-      )}
-    </div>
-  );
-}
-
-// ── Panel 3: Registered/Eligible ratio ─────────────────────────────────────
-
-function RegEligibleRatioPanel({ history }) {
-  const [range, setRange] = useState("1Y");
-  const filtered = filterByRange(history, range);
-  const ticks = xTicks(filtered);
-
-  return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">
-        Registered / Eligible Ratio
-        <RangeSelector value={range} onChange={setRange} />
-      </div>
-      <div className="comex-panel-note">
-        Spike up = more metal being warranted for delivery (bullish physical demand signal).
-      </div>
-      {filtered && filtered.length > 0 ? (
-        <ResponsiveContainer width="100%" height={240}>
-          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-            <YAxis
-              tickFormatter={(v) => v.toFixed(2)}
-              tick={{ fill: "#8a94a6", fontSize: 11 }}
-            />
-            <Tooltip
-              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-              labelStyle={{ color: "#c8d0de" }}
-              formatter={(v) => [v != null ? v.toFixed(4) : "—", "Reg/Elig"]}
             />
             <Line
+              yAxisId="pct"
               type="monotone"
-              dataKey="reg_eligible_ratio"
-              stroke="#e0a830"
+              dataKey="pct_available"
+              stroke="#e8ecf4"
               dot={false}
               strokeWidth={1.8}
+              strokeDasharray="4 3"
               connectNulls={false}
             />
           </LineChart>
@@ -221,6 +160,20 @@ function RegEligibleRatioPanel({ history }) {
       ) : (
         <div className="comex-empty">No data</div>
       )}
+      <div className="comex-legend-list">
+        <div className="comex-legend-item">
+          <span className="comex-legend-swatch" style={{ background: "#4caf76" }} />
+          <span><strong>Registered</strong> — deliverable (warranted) COMEX silver, left axis.</span>
+        </div>
+        <div className="comex-legend-item">
+          <span className="comex-legend-swatch" style={{ background: "#e05252" }} />
+          <span><strong>Eligible</strong> — stored at COMEX vaults but not warranted for delivery, left axis.</span>
+        </div>
+        <div className="comex-legend-item">
+          <span className="comex-legend-swatch comex-legend-swatch--dashed" style={{ borderColor: "#e8ecf4" }} />
+          <span><strong>% available for delivery</strong> — registered ÷ (registered + eligible), right axis. Higher = more of COMEX inventory is deliverable, not delivered.</span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -229,63 +182,7 @@ function RegEligibleRatioPanel({ history }) {
 // The volume-oi endpoint returns today's snapshot only (no historical series),
 // so this renders as a stat card rather than a chart.
 
-function PaperLeveragePanel({ leverageData }) {
-  if (!leverageData) return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">Paper Leverage Ratio</div>
-      <div className="comex-empty">Loading…</div>
-    </div>
-  );
-
-  const row = (leverageData.data || [])[0];
-  const leverage = row?.paper_leverage;
-  const oi = row?.openInterest;
-  const vol = row?.volume;
-  const date = row?.date;
-
-  const alertLevel = leverage == null ? null
-    : leverage >= 10 ? "high"
-    : leverage >= 5  ? "med"
-    : "low";
-
-  return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">Paper Leverage Ratio — OI × 5,000 oz / Registered</div>
-      <div className="comex-panel-note">
-        Above 1.0 = more paper claims than registered metal available for delivery.
-        OI is in contracts (5,000 troy oz each).
-      </div>
-      {leverage != null ? (
-        <div className="comex-leverage-card">
-          <div className={`comex-leverage-value comex-leverage--${alertLevel}`}>
-            {leverage.toFixed(2)}x
-          </div>
-          <div className="comex-leverage-meta">
-            <span>Open interest: <strong>{oi?.toLocaleString()} contracts</strong> ({(oi * 5000)?.toLocaleString()} oz)</span>
-            <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
-            <span>As of: <strong>{date}</strong></span>
-          </div>
-          <div className="comex-leverage-note">
-            {leverage >= 10
-              ? "⚠ Extreme paper leverage — registered inventory is thinly covered."
-              : leverage >= 5
-              ? "Elevated paper leverage — watch registered inventory levels."
-              : "Paper leverage within normal range."}
-          </div>
-        </div>
-      ) : (
-        <div className="comex-empty">No leverage data available.</div>
-      )}
-    </div>
-  );
-}
-
 // ── Vault pie chart colors ──────────────────────────────────────────────────
-
-const VAULT_COLORS = [
-  "#7b9fff", "#4caf76", "#c9a227", "#e05252", "#a78bfa",
-  "#38bdf8", "#fb923c", "#f472b6", "#34d399", "#facc15", "#94a3b8",
-];
 
 function shortName(name) {
   return name
@@ -917,7 +814,6 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
 export default function ComexInventoryDashboard() {
   const [history, setHistory] = useState(null);
   const [depositories, setDepositories] = useState(null);
-  const [leverageData, setLeverageData] = useState(null);
   const [delivery, setDelivery] = useState(null);
   const [prices, setPrices] = useState(null);
   const [shfeHistory, setShfeHistory] = useState(null);
@@ -950,8 +846,6 @@ export default function ComexInventoryDashboard() {
     await delay(300);
     await get("/api/silver/depositories",      setDepositories,  null);
     await delay(300);
-    await get("/api/silver/leverage",          setLeverageData,  null);
-    await delay(300);
     await get("/api/silver/delivery?type=mtd", setDelivery,      null);
     await delay(300);
     await get("/api/shfe/db/history",          setShfeHistory,   (j) => j.data ?? null);
@@ -974,6 +868,10 @@ export default function ComexInventoryDashboard() {
   return (
     <div className="comex-shell">
       <div className="comex-header">
+        <div className="stock-flow-title">
+          Stock &amp; Flow
+          <span className="stock-flow-title-source">Source: Silver Institute</span>
+        </div>
         <div className="comex-title">Silver Inventory — Exchange Reserves</div>
         <div className="comex-subtitle">
           COMEX (USA) · SHFE (China) · metalcharts.org proxy · auto-refresh every{" "}
@@ -997,16 +895,16 @@ export default function ComexInventoryDashboard() {
       <CrossExchangePanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
 
       <div className="comex-section-label">COMEX — New York</div>
-      <TotalInventoryPanel history={history} />
       <RegEligiblePanel history={history} />
-      <RegEligibleRatioPanel history={history} />
-      <PaperLeveragePanel leverageData={leverageData} />
       <VaultSnapshotPanel depositories={depositories} />
       <DeliveryNoticesPanel delivery={delivery} />
 
       <div className="comex-section-label">SHFE — Shanghai</div>
       <ShfeHistoryPanel shfeHistory={shfeHistory} />
       <ShfeWarehousePanel shfeWarehouses={shfeWarehouses} />
+
+      <div className="comex-section-label">Annual Market Balance — Silver Institute</div>
+      <MarketBalancePanel />
 
       <div className="comex-section-label">Global Context</div>
       <GlobalSilverPanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
