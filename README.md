@@ -1,6 +1,6 @@
 # ArgentVigil
 
-A silver and gold speculative positioning monitor built for a long-horizon physical accumulator. The framing is **selling dollars, not buying metals** — the core question is whether the speculative futures crowd has genuinely capitulated or is just experiencing a routine pullback.
+A silver speculative positioning monitor, with gold as comparative context. The framing is **selling dollars, not buying metals** — the core question is whether the speculative futures crowd has genuinely capitulated or is just experiencing a routine pullback.
 
 ArgentVigil is not a trading system and produces no price targets. It is a positioning dashboard.
 
