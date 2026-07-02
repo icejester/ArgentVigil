@@ -1,0 +1,1021 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+} from "recharts";
+
+const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
+const STALE_MS = 5 * 60 * 1000;
+
+function fmt_moz(v) {
+  if (v == null) return "—";
+  return (v / 1_000_000).toFixed(2) + "M oz";
+}
+
+function fmt_oz(v) {
+  if (v == null) return "—";
+  return v.toLocaleString(undefined, { maximumFractionDigits: 0 }) + " oz";
+}
+
+function delta_class(val) {
+  if (val == null || val === 0) return "comex-delta-flat";
+  return val > 0 ? "comex-delta-pos" : "comex-delta-neg";
+}
+
+function delta_str(val) {
+  if (val == null) return "—";
+  if (val === 0) return "—";
+  const sign = val > 0 ? "+" : "";
+  return sign + fmt_oz(val);
+}
+
+// ── Range selector ──────────────────────────────────────────────────────────
+
+const RANGES = ["1M", "3M", "1Y", "5Y", "ALL"];
+
+function RangeSelector({ value, onChange }) {
+  return (
+    <div className="comex-range-selector">
+      {RANGES.map((r) => (
+        <button
+          key={r}
+          className={`comex-range-btn${value === r ? " comex-range-btn--active" : ""}`}
+          onClick={() => onChange(r)}
+        >
+          {r}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Filtered history by range ───────────────────────────────────────────────
+
+function filterByRange(data, range) {
+  if (!data || range === "ALL") return data;
+  const now = new Date();
+  const cutoffs = { "1M": 30, "3M": 90, "1Y": 365, "5Y": 1825 };
+  const days = cutoffs[range];
+  if (!days) return data;
+  const cutoff = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
+  return data.filter((r) => r.date >= cutoff);
+}
+
+function xTicks(data) {
+  if (!data || data.length === 0) return [];
+  const n = Math.min(data.length, 8);
+  const step = Math.floor(data.length / n);
+  return data.filter((_, i) => i % step === 0).map((r) => r.date);
+}
+
+// ── Panel 1: Total inventory over time ─────────────────────────────────────
+
+function TotalInventoryPanel({ history }) {
+  const [range, setRange] = useState("1Y");
+  const filtered = filterByRange(history, range);
+  const ticks = xTicks(filtered);
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        Total COMEX Silver Inventory
+        <RangeSelector value={range} onChange={setRange} />
+      </div>
+      {filtered && filtered.length > 0 ? (
+        <ResponsiveContainer width="100%" height={280}>
+          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <YAxis
+              tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
+              tick={{ fill: "#8a94a6", fontSize: 11 }}
+            />
+            <Tooltip
+              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+              labelStyle={{ color: "#c8d0de" }}
+              formatter={(v) => [fmt_moz(v), "Total"]}
+            />
+            <Line
+              type="monotone"
+              dataKey="total"
+              stroke="#7b9fff"
+              dot={false}
+              strokeWidth={1.8}
+              connectNulls={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="comex-empty">No data</div>
+      )}
+    </div>
+  );
+}
+
+// ── Panel 2: Registered vs Eligible ────────────────────────────────────────
+
+function RegEligiblePanel({ history }) {
+  const [range, setRange] = useState("1Y");
+  const filtered = filterByRange(history, range);
+  const ticks = xTicks(filtered);
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        Registered vs Eligible Silver
+        <RangeSelector value={range} onChange={setRange} />
+      </div>
+      <div className="comex-panel-note">
+        Registered = deliverable (warranted). Eligible = stored, not warranted.
+        Sharp registered drop = delivery pressure signal.
+      </div>
+      {filtered && filtered.length > 0 ? (
+        <ResponsiveContainer width="100%" height={280}>
+          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <YAxis
+              tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
+              tick={{ fill: "#8a94a6", fontSize: 11 }}
+            />
+            <Tooltip
+              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+              labelStyle={{ color: "#c8d0de" }}
+              formatter={(v, name) => [fmt_moz(v), name === "registered" ? "Registered" : "Eligible"]}
+            />
+            <Legend formatter={(v) => v === "registered" ? "Registered" : "Eligible"} />
+            <Line
+              type="monotone"
+              dataKey="registered"
+              stroke="#4caf76"
+              dot={false}
+              strokeWidth={1.8}
+              connectNulls={false}
+            />
+            <Line
+              type="monotone"
+              dataKey="eligible"
+              stroke="#c9a227"
+              dot={false}
+              strokeWidth={1.8}
+              connectNulls={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="comex-empty">No data</div>
+      )}
+    </div>
+  );
+}
+
+// ── Panel 3: Registered/Eligible ratio ─────────────────────────────────────
+
+function RegEligibleRatioPanel({ history }) {
+  const [range, setRange] = useState("1Y");
+  const filtered = filterByRange(history, range);
+  const ticks = xTicks(filtered);
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        Registered / Eligible Ratio
+        <RangeSelector value={range} onChange={setRange} />
+      </div>
+      <div className="comex-panel-note">
+        Spike up = more metal being warranted for delivery (bullish physical demand signal).
+      </div>
+      {filtered && filtered.length > 0 ? (
+        <ResponsiveContainer width="100%" height={240}>
+          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <YAxis
+              tickFormatter={(v) => v.toFixed(2)}
+              tick={{ fill: "#8a94a6", fontSize: 11 }}
+            />
+            <Tooltip
+              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+              labelStyle={{ color: "#c8d0de" }}
+              formatter={(v) => [v != null ? v.toFixed(4) : "—", "Reg/Elig"]}
+            />
+            <Line
+              type="monotone"
+              dataKey="reg_eligible_ratio"
+              stroke="#e0a830"
+              dot={false}
+              strokeWidth={1.8}
+              connectNulls={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="comex-empty">No data</div>
+      )}
+    </div>
+  );
+}
+
+// ── Panel 4: Paper leverage ratio ──────────────────────────────────────────
+// The volume-oi endpoint returns today's snapshot only (no historical series),
+// so this renders as a stat card rather than a chart.
+
+function PaperLeveragePanel({ leverageData }) {
+  if (!leverageData) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Paper Leverage Ratio</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const row = (leverageData.data || [])[0];
+  const leverage = row?.paper_leverage;
+  const oi = row?.openInterest;
+  const vol = row?.volume;
+  const date = row?.date;
+
+  const alertLevel = leverage == null ? null
+    : leverage >= 10 ? "high"
+    : leverage >= 5  ? "med"
+    : "low";
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Paper Leverage Ratio — OI × 5,000 oz / Registered</div>
+      <div className="comex-panel-note">
+        Above 1.0 = more paper claims than registered metal available for delivery.
+        OI is in contracts (5,000 troy oz each).
+      </div>
+      {leverage != null ? (
+        <div className="comex-leverage-card">
+          <div className={`comex-leverage-value comex-leverage--${alertLevel}`}>
+            {leverage.toFixed(2)}x
+          </div>
+          <div className="comex-leverage-meta">
+            <span>Open interest: <strong>{oi?.toLocaleString()} contracts</strong> ({(oi * 5000)?.toLocaleString()} oz)</span>
+            <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
+            <span>As of: <strong>{date}</strong></span>
+          </div>
+          <div className="comex-leverage-note">
+            {leverage >= 10
+              ? "⚠ Extreme paper leverage — registered inventory is thinly covered."
+              : leverage >= 5
+              ? "Elevated paper leverage — watch registered inventory levels."
+              : "Paper leverage within normal range."}
+          </div>
+        </div>
+      ) : (
+        <div className="comex-empty">No leverage data available.</div>
+      )}
+    </div>
+  );
+}
+
+// ── Vault pie chart colors ──────────────────────────────────────────────────
+
+const VAULT_COLORS = [
+  "#7b9fff", "#4caf76", "#c9a227", "#e05252", "#a78bfa",
+  "#38bdf8", "#fb923c", "#f472b6", "#34d399", "#facc15", "#94a3b8",
+];
+
+function shortName(name) {
+  return name
+    .replace(/\bBank\b.*/, "Bank")
+    .replace(/\bInternational\b/, "Intl")
+    .replace(/\bDepository\b/, "Dep.")
+    .replace(/\bPrecious Metals\b/, "PM")
+    .replace(/, (Inc|LLC|NA)\b\.?/i, "")
+    .replace(/\(US\)/i, "")
+    .trim();
+}
+
+// ── Panel 5: Per-vault snapshot table + pie chart ──────────────────────────
+
+function VaultSnapshotPanel({ depositories }) {
+  const [pieMetric, setPieMetric] = useState("total");
+
+  if (!depositories) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Per-Vault Snapshot (Today)</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const rows = [...(depositories.data || [])].sort(
+    (a, b) => (b.total ?? 0) - (a.total ?? 0)
+  );
+
+  const pieData = rows
+    .filter((r) => (r[pieMetric] ?? 0) > 0)
+    .map((r, i) => ({
+      name: shortName(r.depository),
+      fullName: r.depository,
+      value: r[pieMetric],
+      color: VAULT_COLORS[i % VAULT_COLORS.length],
+    }));
+
+  const METRIC_LABELS = { total: "Total", registered: "Registered", eligible: "Eligible" };
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Per-Vault Snapshot — Today</div>
+      <div className="comex-panel-note">
+        Sorted by total descending. Δ columns vs previous day. Green = increase, red = decrease.
+      </div>
+
+      {/* Pie chart */}
+      <div className="comex-vault-pie-row">
+        <div className="comex-pie-metric-selector">
+          {Object.entries(METRIC_LABELS).map(([k, label]) => (
+            <button
+              key={k}
+              className={`comex-range-btn${pieMetric === k ? " comex-range-btn--active" : ""}`}
+              onClick={() => setPieMetric(k)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <ResponsiveContainer width="100%" height={300}>
+          <PieChart>
+            <Pie
+              data={pieData}
+              dataKey="value"
+              nameKey="name"
+              cx="50%"
+              cy="50%"
+              outerRadius={110}
+              innerRadius={54}
+              paddingAngle={1}
+            >
+              {pieData.map((entry) => (
+                <Cell key={entry.fullName} fill={entry.color} />
+              ))}
+            </Pie>
+            <Tooltip
+              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+              formatter={(v, _, props) => [fmt_oz(v), props.payload.fullName]}
+            />
+            <Legend
+              formatter={(_, entry) => (
+                <span style={{ color: "#8a94a6", fontSize: 11 }}>{entry.payload.name}</span>
+              )}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Table */}
+      <div className="comex-table-wrap">
+        <table className="comex-table">
+          <thead>
+            <tr>
+              <th>Depository</th>
+              <th className="right">Registered</th>
+              <th className="right">Eligible</th>
+              <th className="right">Total</th>
+              <th className="right">Δ Registered</th>
+              <th className="right">Δ Eligible</th>
+              <th className="right">Δ Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const dReg = r.registered != null && r.prevRegistered != null
+                ? r.registered - r.prevRegistered : null;
+              const dElig = r.eligible != null && r.prevEligible != null
+                ? r.eligible - r.prevEligible : null;
+              const dTotal = r.total != null && r.prevTotal != null
+                ? r.total - r.prevTotal : null;
+              return (
+                <tr key={r.depository}>
+                  <td className="comex-vault-name">{r.depository}</td>
+                  <td className="right">{fmt_oz(r.registered)}</td>
+                  <td className="right">{fmt_oz(r.eligible)}</td>
+                  <td className="right comex-total-col">{fmt_oz(r.total)}</td>
+                  <td className={`right ${delta_class(dReg)}`}>{delta_str(dReg)}</td>
+                  <td className={`right ${delta_class(dElig)}`}>{delta_str(dElig)}</td>
+                  <td className={`right ${delta_class(dTotal)}`}>{delta_str(dTotal)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Panel 6: Delivery notices MTD ──────────────────────────────────────────
+
+function DeliveryNoticesPanel({ delivery }) {
+  if (!delivery) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Delivery Notices MTD</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const data = delivery.data;
+  const isArray = Array.isArray(data);
+
+  // MTD summary — may be a number, object, or array depending on response shape
+  let summary = null;
+  if (!isArray && data != null) {
+    summary = data;
+  } else if (isArray) {
+    summary = data;
+  }
+
+  function renderValue(v) {
+    if (v == null) return <span className="comex-empty">—</span>;
+    if (typeof v === "number") return <strong>{v.toLocaleString()}</strong>;
+    if (typeof v === "string") return <span>{v}</span>;
+    if (typeof v === "object") {
+      return (
+        <table className="comex-delivery-table">
+          <tbody>
+            {Object.entries(v).map(([k, val]) => (
+              <tr key={k}>
+                <td className="comex-delivery-key">{k}</td>
+                <td className="comex-delivery-val">
+                  {typeof val === "number" ? val.toLocaleString() : String(val)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      );
+    }
+    return String(v);
+  }
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Delivery Notices — Month to Date</div>
+      {isArray ? (
+        <div className="comex-delivery-list">
+          {summary.slice(0, 20).map((item, i) => (
+            <div key={i} className="comex-delivery-item">
+              {typeof item === "object"
+                ? Object.entries(item).map(([k, v]) => (
+                    <span key={k} className="comex-delivery-kv">
+                      <span className="comex-delivery-key">{k}:</span>{" "}
+                      <span className="comex-delivery-val">
+                        {typeof v === "number" ? v.toLocaleString() : String(v)}
+                      </span>
+                    </span>
+                  ))
+                : String(item)}
+            </div>
+          ))}
+          {summary.length === 0 && <div className="comex-empty">No MTD notices yet</div>}
+        </div>
+      ) : (
+        renderValue(summary)
+      )}
+    </div>
+  );
+}
+
+// ── Spot price badge ────────────────────────────────────────────────────────
+
+function spotPrice(entry) {
+  if (entry == null) return null;
+  // entry may be an object {price, change24h, …} or a bare number
+  return typeof entry === "object" ? entry.price : entry;
+}
+
+function SpotPriceBadge({ prices }) {
+  if (!prices) return null;
+  const xagEntry = prices?.XAG ?? prices?.xag ?? prices?.silver;
+  const xauEntry = prices?.XAU ?? prices?.xau ?? prices?.gold;
+  const xag = spotPrice(xagEntry);
+  const xau = spotPrice(xauEntry);
+  if (!xag && !xau) return null;
+
+  function pctColor(pct) {
+    if (pct == null) return "#6b778d";
+    return pct >= 0 ? "#4caf76" : "#e05252";
+  }
+
+  function pctStr(entry) {
+    const pct = typeof entry === "object" ? entry.changePercent24h : null;
+    if (pct == null) return null;
+    return (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
+  }
+
+  return (
+    <div className="comex-spot-row">
+      {xag != null && (
+        <div className="comex-spot-badge">
+          <span className="comex-spot-label">Silver (XAG)</span>
+          <span className="comex-spot-price">${Number(xag).toFixed(2)}</span>
+          {pctStr(xagEntry) && (
+            <span className="comex-spot-change" style={{ color: pctColor(xagEntry?.changePercent24h) }}>
+              {pctStr(xagEntry)} 24h
+            </span>
+          )}
+        </div>
+      )}
+      {xau != null && (
+        <div className="comex-spot-badge">
+          <span className="comex-spot-label">Gold (XAU)</span>
+          <span className="comex-spot-price">${Number(xau).toFixed(2)}</span>
+          {pctStr(xauEntry) && (
+            <span className="comex-spot-change" style={{ color: pctColor(xauEntry?.changePercent24h) }}>
+              {pctStr(xauEntry)} 24h
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Cross-exchange overlay chart ────────────────────────────────────────────
+// Aligns COMEX (oz) and SHFE (oz converted from kg) on a shared date axis.
+// SHFE only has ~8 months of history from metalcharts so the overlap window
+// determines how far back the combined view goes.
+
+function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
+  const [range, setRange] = useState("1Y");
+
+  if (!comexHistory && !shfeHistory) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">COMEX vs SHFE — Combined Inventory</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const shfeByDate = {};
+  for (const r of (shfeHistory || [])) shfeByDate[r.date] = r.total_oz;
+
+  const pslvOz = pslv?.total_oz ?? null;
+
+  const raw = (comexHistory || []).map((r) => ({
+    date: r.date,
+    comex: r.total,
+    shfe: shfeByDate[r.date] ?? null,
+    // PSLV is a point-in-time snapshot, not a series — show as constant line
+    pslv: pslvOz,
+  }));
+
+  const filtered = filterByRange(raw, range);
+  const ticks = xTicks(filtered);
+
+  const hasData = filtered.some((r) => r.comex != null || r.shfe != null);
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        COMEX vs SHFE — Physical Exchange Inventories
+        <RangeSelector value={range} onChange={setRange} />
+      </div>
+      <div className="comex-panel-note">
+        Both in troy oz. SHFE converted from kg (÷1000 × 32.1507). SHFE history
+        available from Nov 2025 via metalcharts. LME requires a paid subscription
+        and is not shown.
+      </div>
+      {hasData ? (
+        <>
+          {(() => {
+            const comexOz = filtered.filter(r=>r.comex).at(-1)?.comex ?? 0;
+            const shfeOz  = filtered.filter(r=>r.shfe).at(-1)?.shfe  ?? 0;
+            const barMax  = comexOz;
+            const bars = [
+              { label:"COMEX",        oz: comexOz,  color:"#7b9fff", note:"USA — New York vaults" },
+              { label:"PSLV (Sprott)",oz: pslvOz,   color:"#4caf76", note:"Canada — Royal Canadian Mint, Ottawa" },
+              { label:"SHFE",         oz: shfeOz,   color:"#f87171", note:"China — Shanghai warehouses" },
+            ].filter(b => b.oz > 0);
+            return (
+              <div className="comex-exchange-size-bar">
+                {bars.map(({ label, oz, color, note }) => (
+                  <div key={label} className="comex-exchange-size-row">
+                    <span className="comex-exchange-size-label" style={{color}}>{label}</span>
+                    <div className="comex-exchange-size-track">
+                      <div className="comex-exchange-size-fill" style={{
+                        width: `${Math.min(oz / barMax * 100, 100).toFixed(1)}%`,
+                        background: color,
+                      }} />
+                    </div>
+                    <span className="comex-exchange-size-val">
+                      {fmt_moz(oz)}
+                      {oz < comexOz && (
+                        <span className="comex-exchange-size-pct">
+                          {" "}({(oz / comexOz * 100).toFixed(1)}% of COMEX)
+                        </span>
+                      )}
+                    </span>
+                    <span className="comex-exchange-size-note">{note}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+          <ResponsiveContainer width="100%" height={300}>
+            <LineChart data={filtered} margin={{ top: 4, right: 56, left: 12, bottom: 4 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                yAxisId="comex"
+                tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
+                tick={{ fill: "#7b9fff", fontSize: 11 }}
+                width={52}
+              />
+              <YAxis
+                yAxisId="shfe"
+                orientation="right"
+                tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
+                tick={{ fill: "#f87171", fontSize: 11 }}
+                width={52}
+              />
+              <Tooltip
+                contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                labelStyle={{ color: "#c8d0de" }}
+                formatter={(v, name) => [
+                  fmt_moz(v),
+                  name === "comex" ? "COMEX (USA) — left axis" : "SHFE (China) — right axis",
+                ]}
+              />
+              <Legend formatter={(v) => ({
+                comex: <span style={{color:"#7b9fff"}}>COMEX (USA) — left axis</span>,
+                shfe:  <span style={{color:"#f87171"}}>SHFE (China) — right axis (independent scale)</span>,
+                pslv:  <span style={{color:"#4caf76"}}>PSLV/Sprott (Canada) — left axis, today's snapshot</span>,
+              }[v])} />
+              <Line yAxisId="comex" type="monotone" dataKey="comex" stroke="#7b9fff"
+                dot={false} strokeWidth={1.8} connectNulls={false} />
+              <Line yAxisId="shfe" type="monotone" dataKey="shfe" stroke="#f87171"
+                dot={false} strokeWidth={1.8} connectNulls={false} />
+              {pslvOz && (
+                <Line yAxisId="comex" type="monotone" dataKey="pslv" stroke="#4caf76"
+                  dot={false} strokeWidth={1.4} strokeDasharray="6 3" connectNulls={true} />
+              )}
+            </LineChart>
+          </ResponsiveContainer>
+          <div className="comex-dual-axis-note">
+            Dual independent axes — each line uses its own scale to show trend movement.
+            COMEX is genuinely ~12× larger than SHFE in absolute terms (see bars above).
+          </div>
+        </>
+      ) : (
+        <div className="comex-empty">No overlapping data in this range</div>
+      )}
+    </div>
+  );
+}
+
+// ── SHFE history panel ──────────────────────────────────────────────────────
+
+function ShfeHistoryPanel({ shfeHistory }) {
+  const [range, setRange] = useState("1Y");
+  const filtered = filterByRange(shfeHistory, range);
+  const ticks = xTicks(filtered);
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        SHFE Silver Inventory (Shanghai)
+        <RangeSelector value={range} onChange={setRange} />
+      </div>
+      <div className="comex-panel-note">
+        Shanghai Futures Exchange warranted silver, in troy oz (converted from kg).
+        SHFE silver is measured in kg; 1 lot = 15 kg.
+      </div>
+      {filtered && filtered.length > 0 ? (
+        <ResponsiveContainer width="100%" height={260}>
+          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <YAxis
+              tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
+              tick={{ fill: "#8a94a6", fontSize: 11 }}
+            />
+            <Tooltip
+              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+              labelStyle={{ color: "#c8d0de" }}
+              formatter={(v) => [fmt_moz(v), "SHFE Total"]}
+            />
+            <Line type="monotone" dataKey="total_oz" stroke="#f87171" dot={false}
+              strokeWidth={1.8} connectNulls={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="comex-empty">No data</div>
+      )}
+    </div>
+  );
+}
+
+// ── SHFE warehouse snapshot table ───────────────────────────────────────────
+
+function ShfeWarehousePanel({ shfeWarehouses }) {
+  if (!shfeWarehouses) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">SHFE Warehouse Snapshot</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const rows = [...(shfeWarehouses.data || [])].sort(
+    (a, b) => (b.warrant ?? 0) - (a.warrant ?? 0)
+  );
+
+  const totalOz = rows.reduce((s, r) => s + (r.warrant_oz ?? 0), 0);
+  const date = rows[0]?.date ?? "—";
+
+  const pieData = rows
+    .filter((r) => (r.warrant_oz ?? 0) > 0)
+    .map((r, i) => ({
+      name: r.warehouse,
+      value: r.warrant_oz,
+      color: VAULT_COLORS[i % VAULT_COLORS.length],
+    }));
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">SHFE Warehouse Snapshot — {date}</div>
+      <div className="comex-panel-note">
+        Warranted silver by approved SHFE warehouse. Δ = change from prior day.
+        Values in troy oz (converted from kg).
+      </div>
+
+      <ResponsiveContainer width="100%" height={280}>
+        <PieChart>
+          <Pie data={pieData} dataKey="value" nameKey="name"
+            cx="50%" cy="50%" outerRadius={100} innerRadius={48} paddingAngle={2}>
+            {pieData.map((entry) => (
+              <Cell key={entry.name} fill={entry.color} />
+            ))}
+          </Pie>
+          <Tooltip
+            contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+            formatter={(v, _, props) => [fmt_oz(v), props.payload.name]}
+          />
+          <Legend
+            formatter={(_, entry) => (
+              <span style={{ color: "#8a94a6", fontSize: 11 }}>{entry.payload.name}</span>
+            )}
+          />
+        </PieChart>
+      </ResponsiveContainer>
+
+      <div className="comex-table-wrap">
+        <table className="comex-table">
+          <thead>
+            <tr>
+              <th>Warehouse</th>
+              <th className="right">Warrants (oz)</th>
+              <th className="right">Δ (oz)</th>
+              <th className="right">Share</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const share = totalOz > 0 ? ((r.warrant_oz ?? 0) / totalOz * 100).toFixed(1) : "—";
+              const dClass = delta_class(r.warrant_change_oz);
+              return (
+                <tr key={r.warehouse}>
+                  <td className="comex-vault-name">{r.warehouse}</td>
+                  <td className="right">{fmt_oz(r.warrant_oz)}</td>
+                  <td className={`right ${dClass}`}>{delta_str(r.warrant_change_oz)}</td>
+                  <td className="right" style={{ color: "#6b778d" }}>{share}%</td>
+                </tr>
+              );
+            })}
+            <tr className="comex-table-total">
+              <td><strong>Total</strong></td>
+              <td className="right"><strong>{fmt_oz(totalOz)}</strong></td>
+              <td className="right" />
+              <td className="right" style={{ color: "#6b778d" }}>100%</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Global silver context panel ─────────────────────────────────────────────
+// Figures: Silver Institute World Silver Survey 2024, USGS Mineral Commodity
+// Summary 2024, CPM Group Silver Yearbook. All estimates ± 20%.
+
+const ABOVE_GROUND_OZ = 41_152_896_000; // ~1,280,000 tonnes × 32,150.7 oz/t
+
+const GLOBAL_CATEGORIES = [
+  { label: "Jewelry & Silverware",          oz: 22_505_490_000, note: "privately held, partially recoverable" },
+  { label: "Investment (coins & bars)",     oz: 10_448_977_500, note: "public holdings, outside vaults" },
+  { label: "Industrial (in products)",      oz:  6_430_140_000, note: "largely unrecoverable — electronics, solar, etc." },
+  { label: "ETF & Exchange Vaults",         oz:  1_446_781_500, note: "tracked, allocated — the part markets can see" },
+  { label: "Central Bank / Govt Reserves",  oz:    321_507_000, note: "US Treasury ~7,000 t at West Point; most CBs divested" },
+];
+
+function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
+  const [stackOz, setStackOz] = useState("500");
+  const stack = parseFloat(stackOz) || 0;
+
+  const comexLatest = comexHistory?.filter(r => r.total).at(-1)?.total ?? null;
+  const shfeLatest  = shfeHistory?.filter(r => r.total_oz).at(-1)?.total_oz ?? null;
+  const pslvLatest  = pslv?.total_oz ?? null;
+  const trackedOz   = (comexLatest ?? 0) + (shfeLatest ?? 0) + (pslvLatest ?? 0);
+
+  function pctOf(oz) {
+    if (!oz || !ABOVE_GROUND_OZ) return "—";
+    const p = oz / ABOVE_GROUND_OZ * 100;
+    if (p < 0.0001) return p.toExponential(3) + "%";
+    return p.toFixed(6) + "%";
+  }
+
+  const barMax = GLOBAL_CATEGORIES[0].oz;
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Global Silver — Estimated Above-Ground Stock</div>
+      <div className="comex-panel-note">
+        Sources: Silver Institute World Silver Survey 2024, USGS Mineral Commodity Summary 2024,
+        CPM Group. All figures are estimates ±20% — no single authoritative audit exists.
+        ~1,280,000 tonnes total above-ground = ~41.2 billion troy oz.
+      </div>
+
+      {/* Category breakdown bars */}
+      <div className="global-silver-bars">
+        {GLOBAL_CATEGORIES.map(({ label, oz, note }) => (
+          <div key={label} className="global-silver-row">
+            <div className="global-silver-label">{label}</div>
+            <div className="global-silver-track">
+              <div className="global-silver-fill"
+                style={{ width: `${(oz / barMax * 100).toFixed(1)}%` }} />
+            </div>
+            <div className="global-silver-amt">{(oz / 1e9).toFixed(2)}B oz</div>
+            <div className="global-silver-note">{note}</div>
+          </div>
+        ))}
+
+        {/* Live tracked exchange line */}
+        {trackedOz > 0 && (
+          <div className="global-silver-row global-silver-row--tracked">
+            <div className="global-silver-label" style={{color:"#4caf76"}}>
+              COMEX + SHFE + PSLV (live)
+            </div>
+            <div className="global-silver-track">
+              <div className="global-silver-fill"
+                style={{ width: `${(trackedOz / barMax * 100).toFixed(2)}%`, background:"#4caf76" }} />
+            </div>
+            <div className="global-silver-amt" style={{color:"#4caf76"}}>
+              {(trackedOz / 1e6).toFixed(0)}M oz
+            </div>
+            <div className="global-silver-note">
+              {pctOf(trackedOz)} of estimated above-ground stock
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Stack calculator */}
+      <div className="global-stack-calc">
+        <div className="global-stack-header">Stack Calculator</div>
+        <div className="global-stack-row">
+          <input
+            className="global-stack-input"
+            type="number"
+            min="0"
+            value={stackOz}
+            onChange={(e) => setStackOz(e.target.value)}
+          />
+          <span className="global-stack-unit">troy oz</span>
+          <span className="global-stack-eq">
+            = <strong>{pctOf(stack)}</strong> of estimated above-ground silver
+          </span>
+        </div>
+        {stack > 0 && (
+          <div className="global-stack-context">
+            <span>vs. COMEX registered: <strong>{pctOf(stack / (comexLatest ?? 1) * 100) === "—" ? "—" : (stack / (comexLatest ?? 1) * 100).toFixed(6) + "%"}</strong></span>
+            <span>vs. all exchange vaults (COMEX+SHFE): <strong>{trackedOz > 0 ? (stack / trackedOz * 100).toFixed(6) + "%" : "—"}</strong></span>
+          </div>
+        )}
+        <div className="global-stack-note">
+          In-ground reserves (USGS 2024): ~310,000 t economically mineable (~12 years at current
+          mining rates). Identified resources: ~610,000 t. Most silver is a byproduct of
+          copper/lead/zinc mining — primary silver mines are a minority of supply.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────────────────────
+
+export default function ComexInventoryDashboard() {
+  const [history, setHistory] = useState(null);
+  const [depositories, setDepositories] = useState(null);
+  const [leverageData, setLeverageData] = useState(null);
+  const [delivery, setDelivery] = useState(null);
+  const [prices, setPrices] = useState(null);
+  const [shfeHistory, setShfeHistory] = useState(null);
+  const [shfeWarehouses, setShfeWarehouses] = useState(null);
+  const [pslv, setPslv] = useState(null);
+  const [lastFetch, setLastFetch] = useState(null);
+  const [fetchError, setFetchError] = useState(null);
+  const timerRef = useRef(null);
+
+  const fetchAll = useCallback(async () => {
+    setFetchError(null);
+
+    async function get(url, setter, transform) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json = await r.json();
+        setter(transform ? transform(json) : json);
+      } catch (e) {
+        // individual endpoint failures are silent — panel shows its own empty state
+      }
+    }
+
+    const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+
+    // Stagger requests by 300ms each so panels fill in progressively
+    await get("/api/silver/db/history",        setHistory,       (j) => j.data ?? null);
+    await delay(300);
+    await get("/api/prices",                   setPrices,        (j) => j.data ?? j);
+    await delay(300);
+    await get("/api/silver/depositories",      setDepositories,  null);
+    await delay(300);
+    await get("/api/silver/leverage",          setLeverageData,  null);
+    await delay(300);
+    await get("/api/silver/delivery?type=mtd", setDelivery,      null);
+    await delay(300);
+    await get("/api/shfe/db/history",          setShfeHistory,   (j) => j.data ?? null);
+    await delay(300);
+    await get("/api/shfe/warehouses",          setShfeWarehouses, null);
+    await delay(300);
+    await get("/api/pslv",                     setPslv,           null);
+
+    setLastFetch(Date.now());
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+    timerRef.current = setInterval(fetchAll, REFRESH_MS);
+    return () => clearInterval(timerRef.current);
+  }, [fetchAll]);
+
+  const stale = lastFetch && Date.now() - lastFetch > STALE_MS;
+
+  return (
+    <div className="comex-shell">
+      <div className="comex-header">
+        <div className="comex-title">Silver Inventory — Exchange Reserves</div>
+        <div className="comex-subtitle">
+          COMEX (USA) · SHFE (China) · metalcharts.org proxy · auto-refresh every{" "}
+          {REFRESH_MS / 1000}s
+        </div>
+        {lastFetch && (
+          <div className={`comex-freshness${stale ? " comex-freshness--stale" : ""}`}>
+            {stale ? "⚠ Stale — " : ""}Last updated:{" "}
+            {new Date(lastFetch).toLocaleTimeString()}
+          </div>
+        )}
+        {fetchError && (
+          <div className="comex-error">
+            Error fetching data: {fetchError}. Is the FastAPI proxy running?{" "}
+            <code>uvicorn main:app --reload</code>
+          </div>
+        )}
+        <SpotPriceBadge prices={prices} />
+      </div>
+
+      <CrossExchangePanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
+
+      <div className="comex-section-label">COMEX — New York</div>
+      <TotalInventoryPanel history={history} />
+      <RegEligiblePanel history={history} />
+      <RegEligibleRatioPanel history={history} />
+      <PaperLeveragePanel leverageData={leverageData} />
+      <VaultSnapshotPanel depositories={depositories} />
+      <DeliveryNoticesPanel delivery={delivery} />
+
+      <div className="comex-section-label">SHFE — Shanghai</div>
+      <ShfeHistoryPanel shfeHistory={shfeHistory} />
+      <ShfeWarehousePanel shfeWarehouses={shfeWarehouses} />
+
+      <div className="comex-section-label">Global Context</div>
+      <GlobalSilverPanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
+
+      <div className="comex-footer">
+        COMEX data: metalcharts.org proxy (CME Group). SHFE data: metalcharts.org
+        proxy (Shanghai Futures Exchange, converted from kg). LME (London) requires
+        a paid API subscription and is not shown. SQLite persistence in argentvigil.db.
+      </div>
+    </div>
+  );
+}

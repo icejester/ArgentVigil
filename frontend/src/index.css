@@ -181,6 +181,219 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border-top: 1px solid #1e2333; padding-top: 18px;
 }
 
+/* ── Section divider between CoT and COMEX sections ── */
+.section-divider {
+  display: flex; align-items: center; gap: 14px;
+  margin: 12px 0 0;
+}
+.section-divider::before, .section-divider::after {
+  content: ""; flex: 1; height: 1px; background: #2e3547;
+}
+.section-divider-label {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
+  text-transform: uppercase; color: #4a5268; white-space: nowrap;
+}
+
+/* ── COMEX Inventory Dashboard ── */
+.comex-shell {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 20px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.comex-header {
+  display: flex; flex-direction: column; gap: 4px; padding-top: 16px;
+}
+.comex-title {
+  font-size: 22px; font-weight: 700; letter-spacing: 0.03em; color: #e8ecf4;
+}
+.comex-subtitle { font-size: 12px; color: #4a5268; }
+.comex-freshness {
+  font-size: 11px; color: #5a6278; margin-top: 2px;
+}
+.comex-freshness--stale {
+  color: #c89a4a; background: #1e1a10; border: 1px solid #3a2f14;
+  border-radius: 4px; padding: 4px 8px; display: inline-block;
+}
+.comex-error {
+  background: #1c1010; border: 1px solid #5c2020;
+  border-radius: 5px; padding: 10px 14px; color: #e05252;
+  font-size: 12px; margin-top: 4px;
+}
+
+/* Spot price badges */
+.comex-spot-row {
+  display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px;
+}
+.comex-spot-badge {
+  display: flex; flex-direction: column; gap: 2px;
+  background: #141820; border: 1px solid #2e3547;
+  border-radius: 6px; padding: 8px 14px;
+}
+.comex-spot-label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #5a6278; }
+.comex-spot-price { font-size: 18px; font-weight: 700; color: #c8d0de; }
+.comex-spot-change { font-size: 11px; font-weight: 500; }
+
+/* Panels */
+.comex-panel {
+  background: #141820; border: 1px solid #2e3547;
+  border-radius: 8px; padding: 18px 20px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.comex-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 8px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: #5a6278;
+}
+.comex-panel-note {
+  font-size: 11px; color: #3e4860; line-height: 1.55;
+}
+
+/* Range selector */
+.comex-range-selector { display: flex; gap: 4px; }
+.comex-range-btn {
+  background: none; border: 1px solid #2a2f3a; border-radius: 3px;
+  padding: 2px 8px; font-size: 11px; color: #5a6278; cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.comex-range-btn:hover { border-color: #4a5268; color: #8a94a6; }
+.comex-range-btn--active {
+  border-color: #7b9fff; color: #7b9fff; background: #0d1428;
+}
+
+/* COMEX/SHFE sub-section labels */
+.comex-dual-axis-note { font-size: 11px; color: #4a5268; margin-top: 6px; }
+
+/* Exchange size comparison bars */
+.comex-exchange-size-bar {
+  display: flex; flex-direction: column; gap: 6px;
+  background: #0f1117; border: 1px solid #1e2333;
+  border-radius: 5px; padding: 10px 14px; margin-bottom: 4px;
+}
+.comex-exchange-size-row { display: grid; grid-template-columns: 120px 1fr auto auto; align-items: center; gap: 10px; }
+.comex-exchange-size-label { font-size: 11px; font-weight: 700; width: 44px; flex-shrink: 0; }
+.comex-exchange-size-track {
+  flex: 1; height: 10px; background: #1e2333; border-radius: 3px; overflow: hidden;
+}
+.comex-exchange-size-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+.comex-exchange-size-val { font-size: 11px; color: #c8d0de; white-space: nowrap; }
+.comex-exchange-size-pct { color: #4a5268; }
+.comex-exchange-size-note { font-size: 11px; color: #3e4860; }
+
+/* COMEX/SHFE sub-section labels */
+.comex-section-label {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
+  text-transform: uppercase; color: #4a5268;
+  border-top: 1px solid #1e2333; padding-top: 14px;
+}
+
+/* Leverage card */
+.comex-leverage-card {
+  display: flex; flex-direction: column; gap: 10px;
+  background: #0f1117; border: 1px solid #2e3547;
+  border-radius: 6px; padding: 16px 20px;
+}
+.comex-leverage-value {
+  font-size: 48px; font-weight: 700; line-height: 1;
+}
+.comex-leverage--low  { color: #4caf76; }
+.comex-leverage--med  { color: #c9a227; }
+.comex-leverage--high { color: #e05252; }
+.comex-leverage-meta {
+  display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: #6b778d;
+}
+.comex-leverage-meta strong { color: #c8d0de; }
+.comex-leverage-note { font-size: 12px; color: #8a94a6; }
+
+/* Vault pie chart */
+.comex-vault-pie-row { display: flex; flex-direction: column; gap: 8px; }
+.comex-pie-metric-selector { display: flex; gap: 4px; }
+
+/* Vault table */
+.comex-table-wrap { overflow-x: auto; }
+.comex-table {
+  width: 100%; border-collapse: collapse; font-size: 12px; min-width: 620px;
+}
+.comex-table th {
+  text-align: left; padding: 6px 10px; color: #4a5268;
+  font-weight: 500; border-bottom: 1px solid #1e2333; font-size: 11px;
+}
+.comex-table th.right, .comex-table td.right { text-align: right; }
+.comex-table td {
+  padding: 7px 10px; border-bottom: 1px solid #1a1f2b; color: #c8d0de;
+}
+.comex-table tr:last-child td { border-bottom: none; }
+.comex-table-total td { border-top: 1px solid #2e3547; color: #e8ecf4; }
+.comex-vault-name { color: #7b8fa6; font-size: 12px; }
+.comex-total-col { font-weight: 600; color: #e8ecf4; }
+.comex-delta-pos { color: #4caf76; font-weight: 600; }
+.comex-delta-neg { color: #e05252; font-weight: 600; }
+.comex-delta-flat { color: #3e4860; }
+
+/* Delivery notices */
+.comex-delivery-list { display: flex; flex-direction: column; gap: 6px; }
+.comex-delivery-item {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  background: #0f1117; border: 1px solid #1e2333;
+  border-radius: 4px; padding: 8px 12px; font-size: 12px;
+}
+.comex-delivery-kv { display: flex; gap: 4px; }
+.comex-delivery-key { color: #5a6278; }
+.comex-delivery-val { color: #c8d0de; font-weight: 500; }
+.comex-delivery-table { font-size: 12px; }
+.comex-delivery-table td { padding: 3px 8px; }
+
+/* Empty states */
+.comex-empty { color: #3e4860; font-size: 12px; padding: 20px 0; text-align: center; }
+.comex-empty-note { font-size: 11px; color: #2e3547; }
+
+/* Global silver context panel */
+.global-silver-bars { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 16px; }
+.global-silver-row { display: grid; grid-template-columns: 200px 1fr 90px 1fr; align-items: center; gap: 10px; }
+.global-silver-row--tracked { border-top: 1px solid #1e2333; padding-top: 8px; margin-top: 2px; }
+.global-silver-label { font-size: 12px; color: #8a94a6; }
+.global-silver-track { height: 8px; background: #1e2333; border-radius: 3px; overflow: hidden; }
+.global-silver-fill { height: 100%; background: #4a5268; border-radius: 3px; transition: width 0.4s ease; }
+.global-silver-amt { font-size: 12px; color: #c8d0de; text-align: right; font-weight: 600; }
+.global-silver-note { font-size: 11px; color: #3e4860; }
+
+/* Stack calculator */
+.global-stack-calc {
+  background: #0f1117; border: 1px solid #2e3547;
+  border-radius: 6px; padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.global-stack-header {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.1em;
+  text-transform: uppercase; color: #5a6278;
+}
+.global-stack-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.global-stack-input {
+  width: 110px; background: #141820; border: 1px solid #2e3547;
+  border-radius: 4px; padding: 5px 10px; font-size: 14px; color: #c8d0de;
+  font-family: "Fira Code", monospace;
+}
+.global-stack-input:focus { outline: 1px solid #4a5268; }
+.global-stack-unit { font-size: 13px; color: #5a6278; }
+.global-stack-eq { font-size: 13px; color: #8a94a6; }
+.global-stack-eq strong { color: #e8ecf4; font-size: 15px; }
+.global-stack-context {
+  display: flex; gap: 20px; flex-wrap: wrap; font-size: 11px; color: #5a6278;
+}
+.global-stack-context strong { color: #c8d0de; }
+.global-stack-note { font-size: 11px; color: #3e4860; line-height: 1.6; }
+
+/* Footer */
+.comex-footer {
+  font-size: 11px; color: #2e3547;
+  border-top: 1px solid #1e2333; padding-top: 16px;
+}
+
 /* ── Footer ── */
 .footer {
   font-size: 11px; color: #2e3547;

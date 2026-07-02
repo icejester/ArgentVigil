@@ -279,7 +279,7 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries }) {
   );
 }
 
-function MacroWatchlist({ watchlist }) {
+export function MacroWatchlist({ watchlist }) {
   if (!watchlist) return null;
 
   const fields = [
@@ -459,7 +459,7 @@ function SignalTrackRecord({ trackRecord }) {
   );
 }
 
-export default function SilverCoTTracker() {
+export default function SilverCoTTracker({ onData }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
 
@@ -469,7 +469,7 @@ export default function SilverCoTTracker() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then(setData)
+      .then((d) => { setData(d); onData?.(d); })
       .catch((e) =>
         setError(
           `Could not load CoT data: ${e.message}. Run pipeline/run.py first.`
@@ -519,8 +519,6 @@ export default function SilverCoTTracker() {
       <div className="metal-section-label">Gold</div>
       <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
       <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
-
-      <MacroWatchlist watchlist={data.macro_watchlist} />
 
       <div className="footer">
         CoT source: CFTC Public Reporting Environment (PRE), Legacy Futures-Only,
