@@ -707,6 +707,9 @@ function ShfeWarehousePanel({ shfeWarehouses }) {
 // Summary 2024, CPM Group Silver Yearbook. All estimates ± 20%.
 
 const ABOVE_GROUND_OZ = 41_152_896_000; // ~1,280,000 tonnes × 32,150.7 oz/t
+const SURVEY_YEAR = 2024;
+const SURVEY_PUBLISHED = new Date(SURVEY_YEAR + 1, 3, 1); // typically published April of following year
+const SURVEY_STALE_MONTHS = 18;
 
 const GLOBAL_CATEGORIES = [
   { label: "Jewelry & Silverware",          oz: 22_505_490_000, note: "privately held, partially recoverable" },
@@ -733,14 +736,23 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
   }
 
   const barMax = GLOBAL_CATEGORIES[0].oz;
+  const monthsStale = Math.floor((Date.now() - SURVEY_PUBLISHED) / (1000 * 60 * 60 * 24 * 30.44));
+  const surveyStale = monthsStale > SURVEY_STALE_MONTHS;
 
   return (
     <div className="comex-panel">
-      <div className="comex-panel-header">Global Silver — Estimated Above-Ground Stock</div>
+      <div className="comex-panel-header">
+        Global Silver — Estimated Above-Ground Stock (Survey {SURVEY_YEAR})
+        {surveyStale && (
+          <span className="comex-freshness comex-freshness--stale">
+            ⚠ Stale — survey {SURVEY_YEAR} data is over {SURVEY_STALE_MONTHS} months old
+          </span>
+        )}
+      </div>
       <div className="comex-panel-note">
-        Sources: Silver Institute World Silver Survey 2024, USGS Mineral Commodity Summary 2024,
-        CPM Group. All figures are estimates ±20% — no single authoritative audit exists.
-        ~1,280,000 tonnes total above-ground = ~41.2 billion troy oz.
+        Sources: Silver Institute World Silver Survey {SURVEY_YEAR}, USGS Mineral Commodity
+        Summary {SURVEY_YEAR}, CPM Group. All figures are estimates ±20% — no single
+        authoritative audit exists. ~1,280,000 tonnes total above-ground = ~41.2 billion troy oz.
       </div>
 
       {/* Category breakdown bars */}
@@ -775,6 +787,14 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
             </div>
           </div>
         )}
+      </div>
+
+      <div className="flow-legend-note">
+        AV tracks COMEX + SHFE + PSLV live — a subset of the Silver Institute's "ETF &amp;
+        Exchange Vaults" category above ({(GLOBAL_CATEGORIES[3].oz / 1e9).toFixed(2)}B oz),
+        which also includes other global ETFs (iShares SLV, Aberdeen, etc.) that AV does not
+        fetch. The live figure will therefore always read lower than the full category — that
+        gap is expected, not a data error, and reflects the limits of what's publicly trackable.
       </div>
 
       {/* Stack calculator */}

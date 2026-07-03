@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS volume_oi (
     paper_leverage REAL,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS fred_observations (
+    series_id TEXT NOT NULL,
+    date      TEXT NOT NULL,
+    value     REAL,
+    PRIMARY KEY (series_id, date)
+);
 """
 
 
@@ -130,3 +137,23 @@ def has_date_aggregate(date: str) -> bool:
 def count_aggregate() -> int:
     with get_conn() as conn:
         return conn.execute("SELECT COUNT(*) FROM inventory_aggregate").fetchone()[0]
+
+
+def upsert_fred_observations(series_id: str, rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO fred_observations (series_id, date, value)
+               VALUES (?, ?, ?)""",
+            [(series_id, r["date"], r["value"]) for r in rows],
+        )
+
+
+def get_fred_observations(series_id: str, since: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, value FROM fred_observations
+               WHERE series_id = ? AND date >= ?
+               ORDER BY date ASC""",
+            (series_id, since),
+        ).fetchall()
+        return [dict(r) for r in rows]

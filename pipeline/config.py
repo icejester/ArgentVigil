@@ -20,3 +20,11 @@ CAPITULATED_THRESHOLD = 10  # bottom decile → specs capitulated
 
 # Cache file location (relative to repo root)
 CACHE_FILE = "pipeline/cache/cot_data.json"
+
+# FRED Money Supply
+FRED_SERIES_M2 = "M2SL"
+FRED_SERIES_WALCL = "WALCL"
+FRED_SERIES_CPI = "CPIAUCSL"  # CPI-U, seasonally adjusted; used for purchasing power
+FRED_FETCH_YEARS = 20        # how far back to fetch on refresh
+FRED_M2_YOY_LOOKBACK = 12    # months
+FRED_WALCL_YOY_LOOKBACK = 52  # weeks

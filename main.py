@@ -2,18 +2,30 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+load_dotenv()
+
 import db
 from mc_token import authed_headers
+from pipeline.config import (
+    FRED_FETCH_YEARS,
+    FRED_M2_YOY_LOOKBACK,
+    FRED_SERIES_CPI,
+    FRED_SERIES_M2,
+    FRED_SERIES_WALCL,
+    FRED_WALCL_YOY_LOOKBACK,
+)
 
 METALCHARTS = "https://metalcharts.org"
 MARKET_BALANCE_PATH = "silver_market_balance.json"
+FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
 # Recoverable stock = Investment (coins/bars) + ETF/Exchange Vaults + Central
 # Bank reserves only. Excludes industrial (unrecoverable) and jewelry/silverware
@@ -346,6 +358,123 @@ async def prices():
         return resp.json()
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+async def _fetch_fred_series(series_id: str, observation_start: str) -> list[dict]:
+    api_key = os.environ["FRED_API_KEY"]
+    resp = await _client.get(
+        FRED_BASE,
+        params={
+            "series_id": series_id,
+            "api_key": api_key,
+            "file_type": "json",
+            "observation_start": observation_start,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = []
+    for obs in data.get("observations", []):
+        v = obs.get("value")
+        rows.append({
+            "date": obs["date"],
+            "value": None if v == "." else float(v),
+        })
+    return rows
+
+
+def _compute_yoy(rows: list[dict], lookback: int) -> list[dict]:
+    out = []
+    for i, r in enumerate(rows):
+        yoy = None
+        if i >= lookback:
+            prior = rows[i - lookback]["value"]
+            cur = r["value"]
+            if prior is not None and cur is not None and prior != 0:
+                yoy = (cur - prior) / prior * 100
+        out.append({**r, "yoy": round(yoy, 2) if yoy is not None else None})
+    return out
+
+
+@app.get("/api/fred/money-supply/refresh")
+async def fred_money_supply_refresh():
+    if "FRED_API_KEY" not in os.environ:
+        raise HTTPException(500, "FRED_API_KEY environment variable is not set")
+    try:
+        observation_start = str(date.today() - timedelta(days=365 * FRED_FETCH_YEARS))
+        m2_rows = await _fetch_fred_series(FRED_SERIES_M2, observation_start)
+        walcl_rows = await _fetch_fred_series(FRED_SERIES_WALCL, observation_start)
+        cpi_rows = await _fetch_fred_series(FRED_SERIES_CPI, observation_start)
+        db.upsert_fred_observations(FRED_SERIES_M2, m2_rows)
+        db.upsert_fred_observations(FRED_SERIES_WALCL, walcl_rows)
+        db.upsert_fred_observations(FRED_SERIES_CPI, cpi_rows)
+        return {
+            "success": True,
+            "data": {
+                FRED_SERIES_M2: m2_rows,
+                FRED_SERIES_WALCL: walcl_rows,
+                FRED_SERIES_CPI: cpi_rows,
+            },
+        }
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+
+
+FRED_WINDOW_YEARS = {"2y": 2, "5y": 5, "10y": 10, "20y": 20}
+
+
+@app.get("/api/fred/money-supply/db")
+async def fred_money_supply_db(window: str = Query("5y")):
+    years = FRED_WINDOW_YEARS.get(window, 5)
+    since = str(date.today() - timedelta(days=365 * years))
+    # Fetch extra lookback history (>1yr) so YoY is computable at the start of the window.
+    fetch_since = str(date.today() - timedelta(days=365 * (years + 2)))
+
+    m2_all = db.get_fred_observations(FRED_SERIES_M2, fetch_since)
+    walcl_all = db.get_fred_observations(FRED_SERIES_WALCL, fetch_since)
+    cpi_all = db.get_fred_observations(FRED_SERIES_CPI, fetch_since)
+
+    m2_yoy = [r for r in _compute_yoy(m2_all, FRED_M2_YOY_LOOKBACK) if r["date"] >= since]
+    walcl_yoy = [r for r in _compute_yoy(walcl_all, FRED_WALCL_YOY_LOOKBACK) if r["date"] >= since]
+    cpi_windowed = [r for r in cpi_all if r["date"] >= since]
+
+    # Purchasing power of a dollar moves inversely to CPI. Index to 100 at the
+    # first point in the requested window so the line reads as "relative
+    # purchasing power since the start of this view," not an opaque raw ratio.
+    cpi_base = next((r["value"] for r in cpi_windowed if r["value"] is not None), None)
+    purchasing_power = [
+        {
+            "date": r["date"],
+            "index": round(100 * (cpi_base / r["value"]), 2)
+            if (cpi_base is not None and r["value"] is not None)
+            else None,
+        }
+        for r in cpi_windowed
+    ]
+
+    return {
+        "success": True,
+        "data": {
+            "m2": [
+                {
+                    "date": r["date"],
+                    "value_trillions": round(r["value"] / 1000, 3) if r["value"] is not None else None,
+                    "yoy": r["yoy"],
+                }
+                for r in m2_yoy
+            ],
+            "walcl": [
+                {
+                    "date": r["date"],
+                    "value_trillions": round(r["value"] / 1_000_000, 3) if r["value"] is not None else None,
+                    "yoy": r["yoy"],
+                }
+                for r in walcl_yoy
+            ],
+            "purchasing_power": purchasing_power,
+        },
+    }
 
 
 # Serve built frontend; keep last so API routes take priority
