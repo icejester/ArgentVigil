@@ -28,3 +28,10 @@ FRED_SERIES_CPI = "CPIAUCSL"  # CPI-U, seasonally adjusted; used for purchasing 
 FRED_FETCH_YEARS = 20        # how far back to fetch on refresh
 FRED_M2_YOY_LOOKBACK = 12    # months
 FRED_WALCL_YOY_LOOKBACK = 52  # weeks
+
+# Metal price history (Yahoo Finance), for the purchasing-power comparison chart
+METAL_PRICE_FETCH_YEARS = 20
+XAG_SERIES_ID = "XAG_CLOSE"
+XAU_SERIES_ID = "XAU_CLOSE"
+XAG_TICKER = "SI=F"  # COMEX silver futures, continuous front-month
+XAU_TICKER = "GC=F"  # COMEX gold futures, continuous front-month

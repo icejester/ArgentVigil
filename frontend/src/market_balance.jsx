@@ -30,10 +30,26 @@ function balanceLabel(v) {
 }
 
 const DEMAND_KEYS = [
-  { key: "industrial_demand_moz", label: "Industrial" },
-  { key: "jewelry_silverware_moz", label: "Jewelry & Silverware" },
-  { key: "physical_investment_moz", label: "Physical Investment" },
-  { key: "etf_net_flow_moz", label: "ETF Net Flow" },
+  {
+    key: "industrial_demand_moz",
+    label: "Industrial",
+    definition: "Silver consumed in electronics, solar panels, and other manufactured goods; largely non-recoverable.",
+  },
+  {
+    key: "jewelry_silverware_moz",
+    label: "Jewelry & Silverware",
+    definition: "Fabricated demand for jewelry and silverware.",
+  },
+  {
+    key: "physical_investment_moz",
+    label: "Physical Investment",
+    definition: "Coins and bars purchased by investors.",
+  },
+  {
+    key: "etf_net_flow_moz",
+    label: "ETF Net Flow",
+    definition: "Net silver flowing into (or out of, if negative) silver-backed ETFs.",
+  },
 ];
 
 function NetBalanceBarChart({ rows }) {
@@ -117,7 +133,6 @@ function DemandCompositionChart({ rows }) {
               return [v != null ? v.toFixed(1) + "%" : "—", found ? found.label : name];
             }}
           />
-          <Legend formatter={(v) => (DEMAND_KEYS.find((d) => d.key === v) || {}).label || v} />
           {DEMAND_KEYS.map(({ key }, i) => (
             <Area
               key={key}
@@ -132,6 +147,14 @@ function DemandCompositionChart({ rows }) {
           ))}
         </AreaChart>
       </ResponsiveContainer>
+      <div className="comex-legend-list">
+        {DEMAND_KEYS.map(({ key, label, definition }, i) => (
+          <div className="comex-legend-item" key={key}>
+            <span className="comex-legend-swatch" style={{ background: VAULT_COLORS[i] }} />
+            <span><strong>{label}</strong> — {definition}</span>
+          </div>
+        ))}
+      </div>
       {hasClampedNegative && (
         <div className="flow-legend-note">
           ETF net flow was negative (net redemptions) in one or more years shown; its share
@@ -174,7 +197,7 @@ function RunwayStatCard({ meta }) {
   );
 }
 
-export default function MarketBalancePanel() {
+function useMarketBalance() {
   const [balance, setBalance] = useState(null);
   const [meta, setMeta] = useState(null);
   const [error, setError] = useState(null);
@@ -191,6 +214,12 @@ export default function MarketBalancePanel() {
       })
       .catch((e) => setError(e.message));
   }, []);
+
+  return { balance, meta, error };
+}
+
+export default function MarketBalancePanel() {
+  const { balance, meta, error } = useMarketBalance();
 
   const latestCumulative = balance && balance.length > 0 ? balance.at(-1).cumulative_5y_moz : null;
 
@@ -222,12 +251,27 @@ export default function MarketBalancePanel() {
           )}
 
           <RunwayStatCard meta={meta} />
-
-          <div className="comex-panel-header" style={{ marginTop: 16 }}>
-            Demand Composition Over Time
-          </div>
-          <DemandCompositionChart rows={balance} />
         </>
+      ) : error ? (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">{error}</div>
+        </div>
+      ) : (
+        <div className="comex-empty">Loading…</div>
+      )}
+    </div>
+  );
+}
+
+export function DemandCompositionPanel() {
+  const { balance, error } = useMarketBalance();
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">Demand Composition Over Time</div>
+      {balance && balance.length > 0 ? (
+        <DemandCompositionChart rows={balance} />
       ) : error ? (
         <div className="comex-empty">
           No data available.

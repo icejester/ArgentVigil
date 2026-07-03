@@ -15,10 +15,10 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .app-shell {
   max-width: 960px;
   margin: 0 auto;
-  padding: 24px 20px 48px;
+  padding: 12px 20px;
   display: flex;
   flex-direction: column;
-  gap: 28px;
+  gap: 12px;
 }
 
 /* ── Collapsible pane ── */
@@ -115,31 +115,6 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .chart-note { margin-top: 10px; font-size: 11px; color: #4a5268; }
 
-/* ── Macro watchlist ── */
-.macro-watchlist {
-  background: #141820; border: 1px solid #2e3547;
-  border-radius: 8px; padding: 18px 20px;
-}
-.macro-header {
-  font-size: 11px; font-weight: 600; letter-spacing: 0.1em;
-  text-transform: uppercase; color: #5a6278;
-  margin-bottom: 4px; display: flex; align-items: baseline; gap: 12px;
-}
-.macro-subheader {
-  font-size: 11px; font-weight: 400; text-transform: none;
-  letter-spacing: 0; color: #3e4860;
-}
-.macro-grid { margin-top: 12px; display: flex; flex-direction: column; }
-.macro-row {
-  display: flex; align-items: baseline; gap: 16px;
-  padding: 7px 0; border-bottom: 1px solid #1e2333;
-}
-.macro-row:last-child { border-bottom: none; }
-.macro-label { flex: 0 0 280px; font-size: 12px; color: #6b778d; }
-.macro-value { font-size: 13px; color: #c8d0de; }
-.macro-empty { color: #2e3547; font-style: italic; }
-.macro-note { margin-top: 14px; font-size: 11px; color: #3e4860; line-height: 1.7; }
-
 /* ── Signal Track Record ── */
 .track-record {
   background: #141820; border: 1px solid #2e3547;
@@ -201,36 +176,15 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border-top: 1px solid #1e2333; padding-top: 18px;
 }
 
-/* ── Section divider between CoT and COMEX sections ── */
-.section-divider {
-  display: flex; align-items: center; gap: 14px;
-  margin: 12px 0 0;
-}
-.section-divider::before, .section-divider::after {
-  content: ""; flex: 1; height: 1px; background: #2e3547;
-}
-.section-divider-label {
-  font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
-  text-transform: uppercase; color: #4a5268; white-space: nowrap;
-}
-
 /* ── COMEX Inventory Dashboard ── */
 .comex-shell {
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 0 20px 64px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 12px;
 }
 
 .comex-header {
   display: flex; flex-direction: column; gap: 4px; padding-top: 16px;
-}
-.stock-flow-title {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
-  font-size: 13px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
-  color: #5a6278; border-bottom: 1px solid #1e2333; padding-bottom: 10px;
 }
 .stock-flow-title-source { font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: #3e4860; }
 .comex-title {
@@ -287,6 +241,26 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   font-size: 11px; color: #8a94a6; line-height: 1.5;
 }
 .comex-legend-item strong { color: #c8d0de; }
+.legend-btn-row {
+  background: none; border: none; text-align: left; cursor: pointer;
+  transition: opacity 0.15s;
+}
+.legend-btn-row:hover .comex-legend-item,
+.legend-btn-row:hover { color: #c8d0de; }
+.legend-btn-row.legend-btn--off { opacity: 0.35; }
+.legend-btn-row--baseline .comex-legend-swatch {
+  outline: 1px solid #c8d0de; outline-offset: 2px;
+}
+.metals-legend-baseline-note {
+  color: #3e4860;
+}
+.metals-legend-row {
+  display: flex; align-items: center; gap: 8px;
+}
+.metals-legend-row .legend-btn-row { flex: 1; }
+.metals-legend-checkbox {
+  flex-shrink: 0; cursor: pointer; accent-color: #7b9fff;
+}
 .comex-legend-swatch {
   display: inline-block; width: 12px; height: 3px; flex-shrink: 0;
   transform: translateY(-3px); border-radius: 2px;
@@ -336,7 +310,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 
 /* Leverage card */
 .comex-leverage-card {
-  display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px 16px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px;
   background: #0f1117; border: 1px solid #2e3547;
   border-radius: 6px; padding: 8px 12px;
 }
@@ -447,12 +421,6 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 
 /* Footer */
 .comex-footer {
-  font-size: 11px; color: #2e3547;
-  border-top: 1px solid #1e2333; padding-top: 16px;
-}
-
-/* ── Footer ── */
-.footer {
   font-size: 11px; color: #2e3547;
   border-top: 1px solid #1e2333; padding-top: 16px;
 }

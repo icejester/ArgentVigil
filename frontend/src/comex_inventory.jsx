@@ -12,7 +12,7 @@ import {
   Pie,
   Cell,
 } from "recharts";
-import MarketBalancePanel from "./market_balance";
+import MarketBalancePanel, { DemandCompositionPanel } from "./market_balance";
 import { VAULT_COLORS } from "./palette";
 
 const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
@@ -315,12 +315,7 @@ function VaultSnapshotPanel({ depositories }) {
 // ── Panel 6: Delivery notices MTD ──────────────────────────────────────────
 
 function DeliveryNoticesPanel({ delivery }) {
-  if (!delivery) return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">Delivery Notices MTD</div>
-      <div className="comex-empty">Loading…</div>
-    </div>
-  );
+  if (!delivery) return <div className="comex-empty">Loading…</div>;
 
   const data = delivery.data;
   const isArray = Array.isArray(data);
@@ -356,85 +351,43 @@ function DeliveryNoticesPanel({ delivery }) {
     return String(v);
   }
 
-  return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">Delivery Notices — Month to Date</div>
-      {isArray ? (
-        <div className="comex-delivery-list">
-          {summary.slice(0, 20).map((item, i) => (
-            <div key={i} className="comex-delivery-item">
-              {typeof item === "object"
-                ? Object.entries(item).map(([k, v]) => (
-                    <span key={k} className="comex-delivery-kv">
-                      <span className="comex-delivery-key">{k}:</span>{" "}
-                      <span className="comex-delivery-val">
-                        {typeof v === "number" ? v.toLocaleString() : String(v)}
-                      </span>
-                    </span>
-                  ))
-                : String(item)}
-            </div>
+  if (!isArray) return renderValue(summary);
+  if (summary.length === 0) return <div className="comex-empty">No MTD notices yet</div>;
+
+  // mtdCumulative/ytdCumulative are always 0 in metalcharts' response —
+  // an unpopulated upstream field, not real zero-activity — so they're
+  // dropped rather than shown as misleading data.
+  const HIDDEN_COLUMNS = new Set(["mtdCumulative", "ytdCumulative"]);
+  const rows = summary.slice(0, 20);
+  const isTabular = rows.every((item) => item != null && typeof item === "object");
+  const columns = isTabular
+    ? Object.keys(rows[0]).filter((k) => !HIDDEN_COLUMNS.has(k))
+    : [];
+
+  return isTabular ? (
+    <div className="comex-table-wrap">
+      <table className="comex-table">
+        <thead>
+          <tr>
+            {columns.map((k) => <th key={k}>{k}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((item, i) => (
+            <tr key={i}>
+              {columns.map((k) => (
+                <td key={k}>
+                  {typeof item[k] === "number" ? item[k].toLocaleString() : String(item[k] ?? "—")}
+                </td>
+              ))}
+            </tr>
           ))}
-          {summary.length === 0 && <div className="comex-empty">No MTD notices yet</div>}
-        </div>
-      ) : (
-        renderValue(summary)
-      )}
+        </tbody>
+      </table>
     </div>
-  );
-}
-
-// ── Spot price badge ────────────────────────────────────────────────────────
-
-function spotPrice(entry) {
-  if (entry == null) return null;
-  // entry may be an object {price, change24h, …} or a bare number
-  return typeof entry === "object" ? entry.price : entry;
-}
-
-function SpotPriceBadge({ prices }) {
-  if (!prices) return null;
-  const xagEntry = prices?.XAG ?? prices?.xag ?? prices?.silver;
-  const xauEntry = prices?.XAU ?? prices?.xau ?? prices?.gold;
-  const xag = spotPrice(xagEntry);
-  const xau = spotPrice(xauEntry);
-  if (!xag && !xau) return null;
-
-  function pctColor(pct) {
-    if (pct == null) return "#6b778d";
-    return pct >= 0 ? "#4caf76" : "#e05252";
-  }
-
-  function pctStr(entry) {
-    const pct = typeof entry === "object" ? entry.changePercent24h : null;
-    if (pct == null) return null;
-    return (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
-  }
-
-  return (
-    <div className="comex-spot-row">
-      {xag != null && (
-        <div className="comex-spot-badge">
-          <span className="comex-spot-label">Silver (XAG)</span>
-          <span className="comex-spot-price">${Number(xag).toFixed(2)}</span>
-          {pctStr(xagEntry) && (
-            <span className="comex-spot-change" style={{ color: pctColor(xagEntry?.changePercent24h) }}>
-              {pctStr(xagEntry)} 24h
-            </span>
-          )}
-        </div>
-      )}
-      {xau != null && (
-        <div className="comex-spot-badge">
-          <span className="comex-spot-label">Gold (XAU)</span>
-          <span className="comex-spot-price">${Number(xau).toFixed(2)}</span>
-          {pctStr(xauEntry) && (
-            <span className="comex-spot-change" style={{ color: pctColor(xauEntry?.changePercent24h) }}>
-              {pctStr(xauEntry)} 24h
-            </span>
-          )}
-        </div>
-      )}
+  ) : (
+    <div className="comex-delivery-list">
+      {rows.map((item, i) => <div key={i} className="comex-delivery-item">{String(item)}</div>)}
     </div>
   );
 }
@@ -541,14 +494,13 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
                 labelStyle={{ color: "#c8d0de" }}
                 formatter={(v, name) => [
                   fmt_moz(v),
-                  name === "comex" ? "COMEX (USA) — left axis" : "SHFE (China) — right axis",
+                  name === "comex"
+                    ? "COMEX (USA) — left axis"
+                    : name === "pslv"
+                    ? "PSLV/Sprott (Canada) — left axis, today's snapshot"
+                    : "SHFE (China) — right axis",
                 ]}
               />
-              <Legend formatter={(v) => ({
-                comex: <span style={{color:"#7b9fff"}}>COMEX (USA) — left axis</span>,
-                shfe:  <span style={{color:"#f87171"}}>SHFE (China) — right axis (independent scale)</span>,
-                pslv:  <span style={{color:"#4caf76"}}>PSLV/Sprott (Canada) — left axis, today's snapshot</span>,
-              }[v])} />
               <Line yAxisId="comex" type="monotone" dataKey="comex" stroke="#7b9fff"
                 dot={false} strokeWidth={1.8} connectNulls={false} />
               <Line yAxisId="shfe" type="monotone" dataKey="shfe" stroke="#f87171"
@@ -559,6 +511,20 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
               )}
             </LineChart>
           </ResponsiveContainer>
+          <div className="comex-legend-list">
+            <div className="comex-legend-item">
+              <span className="comex-legend-swatch" style={{ background: "#7b9fff" }} />
+              <span><strong>COMEX (USA)</strong> — left axis, physical silver held in New York COMEX-approved vaults.</span>
+            </div>
+            <div className="comex-legend-item">
+              <span className="comex-legend-swatch" style={{ background: "#f87171" }} />
+              <span><strong>SHFE (China)</strong> — right axis (independent scale), physical silver in Shanghai Futures Exchange warehouses.</span>
+            </div>
+            <div className="comex-legend-item">
+              <span className="comex-legend-swatch comex-legend-swatch--dashed" style={{ borderColor: "#4caf76" }} />
+              <span><strong>PSLV/Sprott (Canada)</strong> — left axis, today's snapshot only (not a historical series), Sprott Physical Silver Trust holdings.</span>
+            </div>
+          </div>
           <div className="comex-dual-axis-note">
             Dual independent axes — each line uses its own scale to show trend movement.
             COMEX is genuinely ~12× larger than SHFE in absolute terms (see bars above).
@@ -728,11 +694,14 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
   const pslvLatest  = pslv?.total_oz ?? null;
   const trackedOz   = (comexLatest ?? 0) + (shfeLatest ?? 0) + (pslvLatest ?? 0);
 
+  function pctOfBase(p) {
+    if (p < 0.0001) return p.toFixed(12).replace(/0+$/, "").replace(/\.$/, "") + "%";
+    return p.toFixed(6) + "%";
+  }
+
   function pctOf(oz) {
     if (!oz || !ABOVE_GROUND_OZ) return "—";
-    const p = oz / ABOVE_GROUND_OZ * 100;
-    if (p < 0.0001) return p.toExponential(3) + "%";
-    return p.toFixed(6) + "%";
+    return pctOfBase(oz / ABOVE_GROUND_OZ * 100);
   }
 
   const barMax = GLOBAL_CATEGORIES[0].oz;
@@ -815,8 +784,8 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
         </div>
         {stack > 0 && (
           <div className="global-stack-context">
-            <span>vs. COMEX registered: <strong>{pctOf(stack / (comexLatest ?? 1) * 100) === "—" ? "—" : (stack / (comexLatest ?? 1) * 100).toFixed(6) + "%"}</strong></span>
-            <span>vs. all exchange vaults (COMEX+SHFE): <strong>{trackedOz > 0 ? (stack / trackedOz * 100).toFixed(6) + "%" : "—"}</strong></span>
+            <span>vs. COMEX registered: <strong>{comexLatest ? pctOfBase(stack / comexLatest * 100) : "—"}</strong></span>
+            <span>vs. all exchange vaults (COMEX+SHFE): <strong>{trackedOz > 0 ? pctOfBase(stack / trackedOz * 100) : "—"}</strong></span>
           </div>
         )}
         <div className="global-stack-note">
@@ -835,7 +804,6 @@ export default function ComexInventoryDashboard() {
   const [history, setHistory] = useState(null);
   const [depositories, setDepositories] = useState(null);
   const [delivery, setDelivery] = useState(null);
-  const [prices, setPrices] = useState(null);
   const [shfeHistory, setShfeHistory] = useState(null);
   const [shfeWarehouses, setShfeWarehouses] = useState(null);
   const [pslv, setPslv] = useState(null);
@@ -862,8 +830,6 @@ export default function ComexInventoryDashboard() {
     // Stagger requests by 300ms each so panels fill in progressively
     await get("/api/silver/db/history",        setHistory,       (j) => j.data ?? null);
     await delay(300);
-    await get("/api/prices",                   setPrices,        (j) => j.data ?? j);
-    await delay(300);
     await get("/api/silver/depositories",      setDepositories,  null);
     await delay(300);
     await get("/api/silver/delivery?type=mtd", setDelivery,      null);
@@ -886,54 +852,95 @@ export default function ComexInventoryDashboard() {
   const stale = lastFetch && Date.now() - lastFetch > STALE_MS;
 
   return (
-    <div className="comex-shell">
-      <div className="comex-header">
-        <div className="stock-flow-title">
-          Stock &amp; Flow
-          <span className="stock-flow-title-source">Source: Silver Institute</span>
-        </div>
-        <div className="comex-title">Silver Inventory — Exchange Reserves</div>
-        <div className="comex-subtitle">
-          COMEX (USA) · SHFE (China) · metalcharts.org proxy · auto-refresh every{" "}
-          {REFRESH_MS / 1000}s
-        </div>
-        {lastFetch && (
-          <div className={`comex-freshness${stale ? " comex-freshness--stale" : ""}`}>
-            {stale ? "⚠ Stale — " : ""}Last updated:{" "}
-            {new Date(lastFetch).toLocaleTimeString()}
+    <details className="collapsible-pane" open>
+      <summary className="collapsible-pane-title">
+        Stock &amp; Flow
+        <span className="stock-flow-title-source"></span>
+      </summary>
+      <div className="collapsible-pane-body">
+        <div className="comex-shell">
+          <div className="comex-header">
+            <div className="comex-title">Silver Inventory — Exchange Reserves</div>
+            <div className="comex-subtitle">
+              COMEX (USA) · SHFE (China) · metalcharts.org proxy · auto-refresh every{" "}
+              {REFRESH_MS / 1000}s
+            </div>
+            {lastFetch && (
+              <div className={`comex-freshness${stale ? " comex-freshness--stale" : ""}`}>
+                {stale ? "⚠ Stale — " : ""}Last updated:{" "}
+                {new Date(lastFetch).toLocaleTimeString()}
+              </div>
+            )}
+            {fetchError && (
+              <div className="comex-error">
+                Error fetching data: {fetchError}. Is the FastAPI proxy running?{" "}
+                <code>uvicorn main:app --reload</code>
+              </div>
+            )}
           </div>
-        )}
-        {fetchError && (
-          <div className="comex-error">
-            Error fetching data: {fetchError}. Is the FastAPI proxy running?{" "}
-            <code>uvicorn main:app --reload</code>
+
+          <CrossExchangePanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">COMEX — New York</summary>
+            <div className="collapsible-pane-body">
+              <VaultSnapshotPanel depositories={depositories} />
+              <details className="collapsible-pane">
+                <summary className="collapsible-pane-title">Registered vs Eligible Silver — % Available for Delivery</summary>
+                <div className="collapsible-pane-body">
+                  <RegEligiblePanel history={history} />
+                </div>
+              </details>
+              <details className="collapsible-pane">
+                <summary className="collapsible-pane-title">Delivery Notices — Month to Date</summary>
+                <div className="collapsible-pane-body">
+                  <DeliveryNoticesPanel delivery={delivery} />
+                </div>
+              </details>
+            </div>
+          </details>
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">SHFE — Shanghai</summary>
+            <div className="collapsible-pane-body">
+              <ShfeWarehousePanel shfeWarehouses={shfeWarehouses} />
+              <details className="collapsible-pane">
+                <summary className="collapsible-pane-title">SHFE Silver Inventory (Shanghai)</summary>
+                <div className="collapsible-pane-body">
+                  <ShfeHistoryPanel shfeHistory={shfeHistory} />
+                </div>
+              </details>
+            </div>
+          </details>
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">Market Demand</summary>
+            <div className="collapsible-pane-body">
+              <MarketBalancePanel />
+            </div>
+          </details>
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">Demand Composition Over Time</summary>
+            <div className="collapsible-pane-body">
+              <DemandCompositionPanel />
+            </div>
+          </details>
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">Global Context</summary>
+            <div className="collapsible-pane-body">
+              <GlobalSilverPanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
+            </div>
+          </details>
+
+          <div className="comex-footer">
+            COMEX data: metalcharts.org proxy (CME Group). SHFE data: metalcharts.org
+            proxy (Shanghai Futures Exchange, converted from kg). LME (London) requires
+            a paid API subscription and is not shown. SQLite persistence in argentvigil.db.
           </div>
-        )}
-        <SpotPriceBadge prices={prices} />
+        </div>
       </div>
-
-      <CrossExchangePanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
-
-      <div className="comex-section-label">COMEX — New York</div>
-      <RegEligiblePanel history={history} />
-      <VaultSnapshotPanel depositories={depositories} />
-      <DeliveryNoticesPanel delivery={delivery} />
-
-      <div className="comex-section-label">SHFE — Shanghai</div>
-      <ShfeHistoryPanel shfeHistory={shfeHistory} />
-      <ShfeWarehousePanel shfeWarehouses={shfeWarehouses} />
-
-      <div className="comex-section-label">Annual Market Balance — Silver Institute</div>
-      <MarketBalancePanel />
-
-      <div className="comex-section-label">Global Context</div>
-      <GlobalSilverPanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
-
-      <div className="comex-footer">
-        COMEX data: metalcharts.org proxy (CME Group). SHFE data: metalcharts.org
-        proxy (Shanghai Futures Exchange, converted from kg). LME (London) requires
-        a paid API subscription and is not shown. SQLite persistence in argentvigil.db.
-      </div>
-    </div>
+    </details>
   );
 }

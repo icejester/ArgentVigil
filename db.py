@@ -25,6 +25,35 @@ CREATE TABLE IF NOT EXISTS inventory_depository (
     PRIMARY KEY (date, depository)
 );
 
+CREATE TABLE IF NOT EXISTS gold_inventory_aggregate (
+    date TEXT PRIMARY KEY,
+    total REAL,
+    registered REAL,
+    eligible REAL,
+    reg_eligible_ratio REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS gold_inventory_depository (
+    date TEXT,
+    depository TEXT,
+    registered REAL,
+    eligible REAL,
+    total REAL,
+    prev_registered REAL,
+    prev_eligible REAL,
+    prev_total REAL,
+    PRIMARY KEY (date, depository)
+);
+
+CREATE TABLE IF NOT EXISTS gold_volume_oi (
+    date TEXT PRIMARY KEY,
+    open_interest REAL,
+    volume REAL,
+    paper_leverage REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS shfe_inventory (
     date TEXT PRIMARY KEY,
     total_kg REAL,
@@ -84,6 +113,55 @@ def upsert_depository_rows(rows: list[dict]):
                VALUES (:date, :depository, :registered, :eligible, :total,
                        :prev_registered, :prev_eligible, :prev_total)""",
             rows,
+        )
+
+
+def upsert_gold_aggregate_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO gold_inventory_aggregate
+               (date, total, registered, eligible, reg_eligible_ratio)
+               VALUES (:date, :total, :registered, :eligible, :reg_eligible_ratio)""",
+            rows,
+        )
+
+
+def upsert_gold_depository_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO gold_inventory_depository
+               (date, depository, registered, eligible, total,
+                prev_registered, prev_eligible, prev_total)
+               VALUES (:date, :depository, :registered, :eligible, :total,
+                       :prev_registered, :prev_eligible, :prev_total)""",
+            rows,
+        )
+
+
+def get_gold_aggregate_history(limit: int | None = None) -> list[dict]:
+    with get_conn() as conn:
+        q = "SELECT date, total, registered, eligible, reg_eligible_ratio FROM gold_inventory_aggregate ORDER BY date"
+        if limit:
+            q += f" DESC LIMIT {limit}"
+        rows = conn.execute(q).fetchall()
+        result = [dict(r) for r in rows]
+        if limit:
+            result.reverse()
+        return result
+
+
+def count_gold_aggregate() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM gold_inventory_aggregate").fetchone()[0]
+
+
+def upsert_gold_volume_oi_row(row: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO gold_volume_oi
+               (date, open_interest, volume, paper_leverage)
+               VALUES (:date, :open_interest, :volume, :paper_leverage)""",
+            row,
         )
 
 
