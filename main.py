@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -14,6 +14,8 @@ load_dotenv()
 
 import db
 from mc_token import authed_headers
+from pipeline import db as cot_db
+from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
     FRED_FETCH_YEARS,
     FRED_M2_YOY_LOOKBACK,
@@ -42,6 +44,20 @@ RECOVERABLE_STOCK_HIGH_OZ = 17_000_000_000
 
 _client: httpx.AsyncClient | None = None
 
+# Tiered background refresh: fast tier = genuinely intraday data (spot prices);
+# slow tier = everything else main.py manages (moves at most daily upstream).
+# Both tiers default OFF — startup does one fetch to populate the DB, then
+# each tier's recurring loop stays idle until the user opts in (or hits
+# Force update). Interval/enabled state is in-memory only — a restart
+# re-triggers the one-time startup refresh anyway.
+_refresh_settings = {
+    "fast_interval_s": 60,
+    "slow_interval_s": 1200,
+    "fast_enabled": False,
+    "slow_enabled": False,
+}
+_refresh_tasks: list[asyncio.Task] = []
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,8 +65,61 @@ async def lifespan(app: FastAPI):
     db.init_db()
     _client = httpx.AsyncClient()
     asyncio.create_task(_backfill_if_needed())
+    asyncio.create_task(_refresh_fast_tier())
+    asyncio.create_task(_refresh_slow_tier())
+    _refresh_tasks.append(asyncio.create_task(_fast_tier_loop()))
+    _refresh_tasks.append(asyncio.create_task(_slow_tier_loop()))
     yield
+    for t in _refresh_tasks:
+        t.cancel()
     await _client.aclose()
+
+
+async def _fast_tier_loop():
+    while True:
+        await asyncio.sleep(_refresh_settings["fast_interval_s"])
+        if _refresh_settings["fast_enabled"]:
+            await _refresh_fast_tier()
+
+
+async def _slow_tier_loop():
+    while True:
+        await asyncio.sleep(_refresh_settings["slow_interval_s"])
+        if _refresh_settings["slow_enabled"]:
+            await _refresh_slow_tier()
+
+
+async def _refresh_fast_tier() -> dict:
+    try:
+        await _fetch_and_persist_prices()
+        return {"succeeded": 1, "failed": 0, "errors": []}
+    except Exception as e:
+        print(f"[refresh:fast] warning: {e}")
+        return {"succeeded": 0, "failed": 1, "errors": [str(e)]}
+
+
+async def _refresh_slow_tier() -> dict:
+    succeeded, failed, errors = 0, 0, []
+    for fn in (
+        _fetch_and_persist_silver_history,
+        _fetch_and_persist_gold_history,
+        _fetch_and_persist_silver_depositories,
+        _fetch_and_persist_gold_depositories,
+        _fetch_and_persist_silver_leverage,
+        _fetch_and_persist_gold_leverage,
+        _fetch_and_persist_delivery,
+        _fetch_and_persist_shfe_history,
+        _fetch_and_persist_shfe_warehouses,
+        _fetch_and_persist_pslv,
+    ):
+        try:
+            await fn()
+            succeeded += 1
+        except Exception as e:
+            print(f"[refresh:slow] warning ({fn.__name__}): {e}")
+            failed += 1
+            errors.append(f"{fn.__name__}: {e}")
+    return {"succeeded": succeeded, "failed": failed, "errors": errors}
 
 
 app = FastAPI(lifespan=lifespan)
@@ -113,20 +182,25 @@ async def _backfill_if_needed():
             print(f"[backfill] warning (gold): {e}")
 
 
+async def _fetch_and_persist_silver_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAG", "range": range},
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
+    db.upsert_aggregate_rows(rows)
+    return rows
+
+
 @app.get("/api/silver/history")
 async def silver_history(range: str = Query("ALL")):
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/inventory",
-            params={"symbol": "XAG", "range": range},
-            headers=hdrs,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
-        db.upsert_aggregate_rows(rows)
+        rows = await _fetch_and_persist_silver_history(range)
         return {"success": True, "data": rows}
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
@@ -138,89 +212,125 @@ async def silver_db_history():
     return {"success": True, "data": rows}
 
 
+def _depository_rows(raw: list[dict]) -> list[dict]:
+    today = str(date.today())
+    return [
+        {
+            "date": today,
+            "depository": r["depository"],
+            "registered": r.get("registered"),
+            "eligible": r.get("eligible"),
+            "total": r.get("total"),
+            "prev_registered": r.get("prevRegistered"),
+            "prev_eligible": r.get("prevEligible"),
+            "prev_total": r.get("prevTotal"),
+        }
+        for r in raw
+    ]
+
+
+async def _fetch_and_persist_silver_depositories() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAG", "type": "depositories"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("data", [])
+    db.upsert_depository_rows(_depository_rows(raw))
+    return raw
+
+
 @app.get("/api/silver/depositories")
 async def silver_depositories():
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/inventory",
-            params={"symbol": "XAG", "type": "depositories"},
-            headers=hdrs,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("data", [])
-        today = str(date.today())
-        rows = [
-            {
-                "date": today,
-                "depository": r["depository"],
-                "registered": r.get("registered"),
-                "eligible": r.get("eligible"),
-                "total": r.get("total"),
-                "prev_registered": r.get("prevRegistered"),
-                "prev_eligible": r.get("prevEligible"),
-                "prev_total": r.get("prevTotal"),
-            }
-            for r in raw
-        ]
-        db.upsert_depository_rows(rows)
+        raw = await _fetch_and_persist_silver_depositories()
         return {"success": True, "data": raw}
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
 
 
+@app.get("/api/silver/db/depositories")
+async def silver_db_depositories():
+    rows = db.get_latest_depositories()
+    return {"success": True, "data": rows}
+
+
+async def _fetch_and_persist_silver_leverage() -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/volume-oi",
+        params={"symbol": "XAG"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    row = raw.get("data") or {}
+    if not isinstance(row, dict):
+        row = {}
+    reg_row = db.get_aggregate_history(limit=1)
+    latest_reg = reg_row[0]["registered"] if reg_row else None
+    oi = row.get("openInterest") or row.get("open_interest")
+    vol = row.get("volume")
+    # OI is in contracts (5,000 oz each); registered is in oz
+    oi_oz = oi * 5000 if oi else None
+    paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
+    enriched = {**row, "paper_leverage": paper_leverage}
+    if oi and vol:
+        db.upsert_volume_oi_row({
+            "date": row.get("date", str(date.today())),
+            "open_interest": oi_oz,
+            "volume": vol,
+            "paper_leverage": paper_leverage,
+        })
+    return {"enriched": enriched, "raw": raw}
+
+
 @app.get("/api/silver/leverage")
 async def silver_leverage():
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/volume-oi",
-            params={"symbol": "XAG"},
-            headers=hdrs,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        raw = resp.json()
-        row = raw.get("data") or {}
-        # data is a single object, not an array
-        if not isinstance(row, dict):
-            row = {}
-        reg_row = db.get_aggregate_history(limit=1)
-        latest_reg = reg_row[0]["registered"] if reg_row else None
-        oi = row.get("openInterest") or row.get("open_interest")
-        vol = row.get("volume")
-        # OI is in contracts (5,000 oz each); registered is in oz
-        oi_oz = oi * 5000 if oi else None
-        paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
-        enriched = {**row, "paper_leverage": paper_leverage}
-        if oi and vol:
-            db.upsert_volume_oi_row({
-                "date": row.get("date", str(date.today())),
-                "open_interest": oi_oz,
-                "volume": vol,
-                "paper_leverage": paper_leverage,
-            })
-        return {"success": True, "data": [enriched], "raw": raw}
+        result = await _fetch_and_persist_silver_leverage()
+        return {"success": True, "data": [result["enriched"]], "raw": result["raw"]}
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/silver/db/leverage")
+async def silver_db_leverage():
+    row = db.get_latest_volume_oi()
+    if row is None:
+        return {"success": True, "data": []}
+    enriched = {
+        "date": row["date"],
+        "openInterest": row["open_interest"] / 5000 if row["open_interest"] else None,
+        "volume": row["volume"],
+        "paper_leverage": row["paper_leverage"],
+    }
+    return {"success": True, "data": [enriched]}
+
+
+async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAU", "range": range},
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
+    db.upsert_gold_aggregate_rows(rows)
+    return rows
 
 
 @app.get("/api/gold/history")
 async def gold_history(range: str = Query("ALL")):
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/inventory",
-            params={"symbol": "XAU", "range": range},
-            headers=hdrs,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
-        db.upsert_gold_aggregate_rows(rows)
+        rows = await _fetch_and_persist_gold_history(range)
         return {"success": True, "data": rows}
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
@@ -232,170 +342,159 @@ async def gold_db_history():
     return {"success": True, "data": rows}
 
 
+async def _fetch_and_persist_gold_depositories() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAU", "type": "depositories"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("data", [])
+    db.upsert_gold_depository_rows(_depository_rows(raw))
+    return raw
+
+
 @app.get("/api/gold/depositories")
 async def gold_depositories():
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/inventory",
-            params={"symbol": "XAU", "type": "depositories"},
-            headers=hdrs,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("data", [])
-        today = str(date.today())
-        rows = [
-            {
-                "date": today,
-                "depository": r["depository"],
-                "registered": r.get("registered"),
-                "eligible": r.get("eligible"),
-                "total": r.get("total"),
-                "prev_registered": r.get("prevRegistered"),
-                "prev_eligible": r.get("prevEligible"),
-                "prev_total": r.get("prevTotal"),
-            }
-            for r in raw
-        ]
-        db.upsert_gold_depository_rows(rows)
+        raw = await _fetch_and_persist_gold_depositories()
         return {"success": True, "data": raw}
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
 
 
+@app.get("/api/gold/db/depositories")
+async def gold_db_depositories():
+    rows = db.get_latest_gold_depositories()
+    return {"success": True, "data": rows}
+
+
+async def _fetch_and_persist_gold_leverage() -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/volume-oi",
+        params={"symbol": "XAU"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    row = raw.get("data") or {}
+    if not isinstance(row, dict):
+        row = {}
+    reg_row = db.get_gold_aggregate_history(limit=1)
+    latest_reg = reg_row[0]["registered"] if reg_row else None
+    oi = row.get("openInterest") or row.get("open_interest")
+    vol = row.get("volume")
+    # OI is in contracts (100 oz each for gold); registered is in oz
+    oi_oz = oi * 100 if oi else None
+    paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
+    enriched = {**row, "paper_leverage": paper_leverage}
+    if oi and vol:
+        db.upsert_gold_volume_oi_row({
+            "date": row.get("date", str(date.today())),
+            "open_interest": oi_oz,
+            "volume": vol,
+            "paper_leverage": paper_leverage,
+        })
+    return {"enriched": enriched, "raw": raw}
+
+
 @app.get("/api/gold/leverage")
 async def gold_leverage():
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/volume-oi",
-            params={"symbol": "XAU"},
-            headers=hdrs,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        raw = resp.json()
-        row = raw.get("data") or {}
-        # data is a single object, not an array
-        if not isinstance(row, dict):
-            row = {}
-        reg_row = db.get_gold_aggregate_history(limit=1)
-        latest_reg = reg_row[0]["registered"] if reg_row else None
-        oi = row.get("openInterest") or row.get("open_interest")
-        vol = row.get("volume")
-        # OI is in contracts (100 oz each for gold); registered is in oz
-        oi_oz = oi * 100 if oi else None
-        paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
-        enriched = {**row, "paper_leverage": paper_leverage}
-        if oi and vol:
-            db.upsert_gold_volume_oi_row({
-                "date": row.get("date", str(date.today())),
-                "open_interest": oi_oz,
-                "volume": vol,
-                "paper_leverage": paper_leverage,
-            })
-        return {"success": True, "data": [enriched], "raw": raw}
+        result = await _fetch_and_persist_gold_leverage()
+        return {"success": True, "data": [result["enriched"]], "raw": result["raw"]}
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/gold/db/leverage")
+async def gold_db_leverage():
+    row = db.get_latest_gold_volume_oi()
+    if row is None:
+        return {"success": True, "data": []}
+    enriched = {
+        "date": row["date"],
+        "openInterest": row["open_interest"] / 100 if row["open_interest"] else None,
+        "volume": row["volume"],
+        "paper_leverage": row["paper_leverage"],
+    }
+    return {"success": True, "data": [enriched]}
+
+
+async def _fetch_and_persist_delivery(type: str = "mtd") -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/delivery-notices",
+        params={"symbol": "XAG", "type": type},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    data = raw.get("data") or []
+    if isinstance(data, dict):
+        data = [data]
+    rows = [
+        {
+            "date": r.get("date", str(date.today())),
+            "type": type,
+            "daily_issued": r.get("dailyIssued"),
+            "daily_stopped": r.get("dailyStopped"),
+        }
+        for r in data
+        if isinstance(r, dict) and (r.get("dailyIssued") is not None or r.get("dailyStopped") is not None)
+    ]
+    if rows:
+        db.upsert_delivery_rows(rows)
+    return raw
 
 
 @app.get("/api/silver/delivery")
 async def silver_delivery(type: str = Query("mtd")):
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/comex/delivery-notices",
-            params={"symbol": "XAG", "type": type},
-            headers=hdrs,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        return await _fetch_and_persist_delivery(type)
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/silver/db/delivery")
+async def silver_db_delivery(type: str = Query("mtd")):
+    rows = db.get_delivery_history(type)
+    return {"success": True, "data": rows}
+
+
+async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AG", "range": range},
+        headers=hdrs,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = []
+    for row in raw.get("data", []):
+        kg = row.get("total")
+        rows.append({
+            "date": row["date"],
+            "total_kg": kg,
+            # SHFE silver is in kg; convert to troy oz (1 kg = 32.1507 troy oz)
+            "total_oz": round(kg * 32.1507, 0) if kg else None,
+        })
+    db.upsert_shfe_rows(rows)
+    return rows
 
 
 @app.get("/api/shfe/history")
 async def shfe_history(range: str = Query("ALL")):
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/shfe/inventory",
-            params={"symbol": "AG", "range": range},
-            headers=hdrs,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        raw = resp.json()
-        rows = []
-        for row in raw.get("data", []):
-            kg = row.get("total")
-            rows.append({
-                "date": row["date"],
-                "total_kg": kg,
-                # SHFE silver is in kg; convert to troy oz (1 kg = 32.1507 troy oz)
-                "total_oz": round(kg * 32.1507, 0) if kg else None,
-            })
-        db.upsert_shfe_rows(rows)
+        rows = await _fetch_and_persist_shfe_history(range)
         return {"success": True, "data": rows}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
-
-
-@app.get("/api/shfe/warehouses")
-async def shfe_warehouses():
-    try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/shfe/inventory",
-            params={"symbol": "AG", "type": "warehouses"},
-            headers=hdrs,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        raw = resp.json()
-        rows = raw.get("data", [])
-        # Convert kg to oz for each warehouse
-        enriched = []
-        for r in rows:
-            kg = r.get("warrant", 0)
-            chg_kg = r.get("warrantChange", 0)
-            enriched.append({
-                **r,
-                "warrant_oz": round(kg * 32.1507, 0) if kg else None,
-                "warrant_change_oz": round(chg_kg * 32.1507, 0) if chg_kg else None,
-            })
-        return {"success": True, "data": enriched}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
-
-
-@app.get("/api/pslv")
-async def pslv():
-    try:
-        resp = await _client.get(
-            "https://sprott.com/api/FinancialData/v1/BullionCalculatorData",
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        entries = [e for e in resp.json() if isinstance(e, dict) and e.get("id") == 4998]
-        if not entries:
-            raise HTTPException(502, "PSLV entry not found in Sprott response")
-        row = entries[0]
-        return {
-            "success": True,
-            "fund": "PSLV",
-            "custodian": "Royal Canadian Mint",
-            "location": "Ottawa, Canada",
-            "date": row.get("dateTimeStamp", "")[:10],
-            "total_oz": row["totalOunces1"],
-            "nav_per_unit": row["nav"],
-            "total_nav": row["totalNav"],
-            "units": row["units"],
-        }
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
 
@@ -404,6 +503,109 @@ async def pslv():
 async def shfe_db_history():
     rows = db.get_shfe_history()
     return {"success": True, "data": rows}
+
+
+async def _fetch_and_persist_shfe_warehouses() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AG", "type": "warehouses"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = raw.get("data", [])
+    today = str(date.today())
+    persisted = []
+    enriched = []
+    for r in rows:
+        kg = r.get("warrant", 0)
+        chg_kg = r.get("warrantChange", 0)
+        enriched.append({
+            **r,
+            "warrant_oz": round(kg * 32.1507, 0) if kg else None,
+            "warrant_change_oz": round(chg_kg * 32.1507, 0) if chg_kg else None,
+        })
+        persisted.append({
+            "date": r.get("date", today),
+            "warehouse": r["warehouse"],
+            "warrant_kg": kg,
+            "warrant_change_kg": chg_kg,
+        })
+    db.upsert_shfe_warehouse_rows(persisted)
+    return enriched
+
+
+@app.get("/api/shfe/warehouses")
+async def shfe_warehouses():
+    try:
+        enriched = await _fetch_and_persist_shfe_warehouses()
+        return {"success": True, "data": enriched}
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/api/shfe/db/warehouses")
+async def shfe_db_warehouses():
+    rows = db.get_latest_shfe_warehouses()
+    enriched = [
+        {
+            **r,
+            "warrant_oz": round(r["warrant_kg"] * 32.1507, 0) if r["warrant_kg"] else None,
+            "warrant_change_oz": round(r["warrant_change_kg"] * 32.1507, 0) if r["warrant_change_kg"] else None,
+        }
+        for r in rows
+    ]
+    return {"success": True, "data": enriched}
+
+
+async def _fetch_and_persist_pslv() -> dict:
+    resp = await _client.get(
+        "https://sprott.com/api/FinancialData/v1/BullionCalculatorData",
+        headers={"Accept": "application/json"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    entries = [e for e in resp.json() if isinstance(e, dict) and e.get("id") == 4998]
+    if not entries:
+        raise HTTPException(502, "PSLV entry not found in Sprott response")
+    row = entries[0]
+    result = {
+        "fund": "PSLV",
+        "custodian": "Royal Canadian Mint",
+        "location": "Ottawa, Canada",
+        "date": row.get("dateTimeStamp", "")[:10],
+        "total_oz": row["totalOunces1"],
+        "nav_per_unit": row["nav"],
+        "total_nav": row["totalNav"],
+        "units": row["units"],
+    }
+    db.upsert_pslv_row(result)
+    return result
+
+
+@app.get("/api/pslv")
+async def pslv():
+    try:
+        result = await _fetch_and_persist_pslv()
+        return {"success": True, **result}
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/api/pslv/db")
+async def pslv_db():
+    row = db.get_latest_pslv()
+    if row is None:
+        return {"success": True}
+    return {
+        "success": True,
+        "fund": "PSLV",
+        "custodian": "Royal Canadian Mint",
+        "location": "Ottawa, Canada",
+        **row,
+    }
 
 
 def _runway_years(deficit_moz: float | None) -> dict | None:
@@ -461,19 +663,142 @@ async def silver_market_balance():
     }
 
 
+def _spot_entry_fields(entry) -> tuple[float | None, float | None]:
+    if isinstance(entry, dict):
+        return entry.get("price"), entry.get("changePercent24h")
+    return entry, None
+
+
+async def _fetch_and_persist_prices() -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/prices",
+        headers=hdrs,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    payload = data.get("data", data) if isinstance(data, dict) else {}
+    today = str(date.today())
+    rows = []
+    for series_id in ("XAG", "XAU"):
+        entry = payload.get(series_id) if isinstance(payload, dict) else None
+        price, pct = _spot_entry_fields(entry)
+        if price is not None:
+            rows.append({
+                "series_id": series_id,
+                "date": today,
+                "price": price,
+                "change_pct_24h": pct,
+            })
+    if rows:
+        db.upsert_spot_price_rows(rows)
+    return data
+
+
+def _cot_gsr_series(gold_spot: dict, silver_spot: dict) -> list[dict]:
+    common_dates = sorted(set(gold_spot) & set(silver_spot))
+    series = []
+    for d in common_dates:
+        g = gold_spot[d]
+        s = silver_spot[d]
+        if s and s > 0:
+            series.append({"date": d, "gsr": round(g / s, 1)})
+    return series
+
+
+@app.get("/api/cot/db")
+async def cot_db_route():
+    silver_series = cot_db.get_silver_series()
+    gold_series = cot_db.get_gold_series()
+    if not silver_series or not gold_series:
+        raise HTTPException(500, "No CoT data persisted yet. Run pipeline/run.py first.")
+
+    silver_result = compute_from_series(silver_series)
+    gold_result = compute_from_series(gold_series)
+
+    slv_prices = cot_db.get_price_series("SLV")
+    gld_prices = cot_db.get_price_series("GLD")
+    gc_prices = cot_db.get_price_series("GC=F")
+    si_prices = cot_db.get_price_series("SI=F")
+
+    silver_track = compute_signal_track_record(silver_result["series"], slv_prices)
+    gold_track = compute_signal_track_record(gold_result["series"], gld_prices)
+    gsr_series = _cot_gsr_series(gc_prices, si_prices)
+
+    last_run_at = cot_db.get_last_run_at()
+    generated_at = (
+        datetime.fromisoformat(last_run_at.replace(" ", "T") + "+00:00").isoformat()
+        if last_run_at else None
+    )
+
+    return {
+        "success": True,
+        "cot_as_of_date": silver_result["latest"]["date"],
+        "generated_at": generated_at,
+        "series": silver_result["series"],
+        "latest": silver_result["latest"],
+        "windows": silver_result["windows"],
+        "signal_track_record": silver_track,
+        "gold": {
+            "series": gold_result["series"],
+            "latest": gold_result["latest"],
+            "windows": gold_result["windows"],
+            "signal_track_record": gold_track,
+        },
+        "gsr_series": gsr_series,
+    }
+
+
 @app.get("/api/prices")
 async def prices():
     try:
-        hdrs = await authed_headers(_client)
-        resp = await _client.get(
-            f"{METALCHARTS}/api/prices",
-            headers=hdrs,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        return await _fetch_and_persist_prices()
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/prices/db")
+async def prices_db():
+    latest = db.get_latest_spot_prices()
+    data = {
+        series_id: {"price": row["price"], "changePercent24h": row["change_pct_24h"], "date": row["date"]}
+        for series_id, row in latest.items()
+    }
+    return {"success": True, "data": data}
+
+
+@app.get("/api/refresh/settings")
+async def refresh_settings_get():
+    return {"success": True, "data": _refresh_settings}
+
+
+@app.post("/api/refresh/settings")
+async def refresh_settings_post(body: dict = Body(...)):
+    if "fast_interval_s" in body:
+        _refresh_settings["fast_interval_s"] = max(5, int(body["fast_interval_s"]))
+    if "slow_interval_s" in body:
+        _refresh_settings["slow_interval_s"] = max(30, int(body["slow_interval_s"]))
+    if "fast_enabled" in body:
+        _refresh_settings["fast_enabled"] = bool(body["fast_enabled"])
+    if "slow_enabled" in body:
+        _refresh_settings["slow_enabled"] = bool(body["slow_enabled"])
+    return {"success": True, "data": _refresh_settings}
+
+
+@app.post("/api/refresh/force")
+async def refresh_force():
+    fast_result = await _refresh_fast_tier()
+    slow_result = await _refresh_slow_tier()
+    total_failed = fast_result["failed"] + slow_result["failed"]
+    total_succeeded = fast_result["succeeded"] + slow_result["succeeded"]
+    return {
+        "success": total_failed == 0,
+        "fast": fast_result,
+        "slow": slow_result,
+        "succeeded": total_succeeded,
+        "failed": total_failed,
+    }
 
 
 async def _fetch_fred_series(series_id: str, observation_start: str) -> list[dict]:

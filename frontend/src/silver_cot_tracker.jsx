@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   LineChart,
   Line,
@@ -10,6 +10,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import RefreshControls, { FORCE_REFRESH_EVENT } from "./refresh_controls";
 
 const CROWDED_THRESHOLD = 90;
 const CAPITULATED_THRESHOLD = 10;
@@ -393,8 +394,8 @@ function ZoneTable({ title, zone, directionLabel }) {
 }
 
 const METAL_CONFIG = {
-  silver: { label: "Silver", leverageUrl: "/api/silver/leverage", contractOz: 5000, spotKey: "XAG" },
-  gold:   { label: "Gold",   leverageUrl: "/api/gold/leverage",   contractOz: 100,  spotKey: "XAU" },
+  silver: { label: "Silver", leverageUrl: "/api/silver/db/leverage", contractOz: 5000, spotKey: "XAG" },
+  gold:   { label: "Gold",   leverageUrl: "/api/gold/db/leverage",   contractOz: 100,  spotKey: "XAU" },
 };
 
 function spotPrice(entry) {
@@ -431,7 +432,7 @@ function PaperLeveragePanel({ metal = "silver" }) {
   const [leverageData, setLeverageData] = useState(null);
   const [prices, setPrices] = useState(null);
 
-  useEffect(() => {
+  const fetchLeverageAndPrices = useCallback(() => {
     fetch(leverageUrl)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -439,7 +440,7 @@ function PaperLeveragePanel({ metal = "silver" }) {
       })
       .then(setLeverageData)
       .catch(() => {});
-    fetch("/api/prices")
+    fetch("/api/prices/db")
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -447,6 +448,12 @@ function PaperLeveragePanel({ metal = "silver" }) {
       .then((j) => setPrices(j.data ?? j))
       .catch(() => {});
   }, [leverageUrl]);
+
+  useEffect(() => {
+    fetchLeverageAndPrices();
+    window.addEventListener(FORCE_REFRESH_EVENT, fetchLeverageAndPrices);
+    return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchLeverageAndPrices);
+  }, [fetchLeverageAndPrices]);
 
   if (!leverageData) return (
     <div className="comex-panel">
@@ -542,7 +549,7 @@ export default function SilverCoTTracker() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    fetch("/cot_data.json")
+    fetch("/api/cot/db")
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -550,7 +557,7 @@ export default function SilverCoTTracker() {
       .then((d) => setData(d))
       .catch((e) =>
         setError(
-          `Could not load CoT data: ${e.message}. Run pipeline/run.py first.`
+          `Could not load CoT data: ${e.message}. Run pipeline/run.py first (writes pipeline/cache/cot_pipeline.db).`
         )
       );
   }, []);
@@ -573,11 +580,19 @@ export default function SilverCoTTracker() {
 
   return (
     <div className="app-shell">
-      <div className="app-header">
-        <div className="app-title">ArgentVigil</div>
-        <div className="app-subtitle">
-          COMEX Silver &amp; Gold · Commitment of Traders · Speculative Positioning Monitor
+      <div className="app-header app-header--split">
+        <div>
+          <div className="app-title">ArgentVigil</div>
+          <div className="app-subtitle">
+            Silver Market Observability Platform
+          </div>
         </div>
+        <details className="collapsible-pane collapsible-pane--config">
+          <summary className="collapsible-pane-title">Configuration</summary>
+          <div className="collapsible-pane-body">
+            <RefreshControls />
+          </div>
+        </details>
       </div>
 
       <details className="collapsible-pane" open>

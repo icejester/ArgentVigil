@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import db
 from fetch import fetch_cot_data, fetch_gold_cot_data
 from price_fetch import fetch_silver_prices, fetch_gold_prices, fetch_spot_prices
 from compute import parse_and_compute, compute_signal_track_record
@@ -19,10 +20,35 @@ _PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
 _CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache", "cot_data.json")
 
 
-def _run_metal(name: str, rows_fn, prices_fn) -> tuple[dict, dict]:
+def _rows_for_db(raw_rows: list[dict]) -> list[dict]:
+    out = []
+    for row in raw_rows:
+        try:
+            date_str = row["report_date_as_yyyy_mm_dd"][:10]
+            nc_long = float(row.get("noncomm_positions_long_all") or 0)
+            nc_short = float(row.get("noncomm_positions_short_all") or 0)
+            oi = float(row.get("open_interest_all") or 0)
+        except (KeyError, ValueError):
+            continue
+        if oi <= 0:
+            continue
+        net_long = nc_long - nc_short
+        out.append({
+            "report_date": date_str,
+            "noncomm_long": nc_long,
+            "noncomm_short": nc_short,
+            "open_interest": oi,
+            "net_long": net_long,
+            "net_long_pct_oi": round(net_long / oi * 100, 4),
+        })
+    return out
+
+
+def _run_metal(name: str, rows_fn, prices_fn, db_insert_fn) -> tuple[dict, dict]:
     print(f"\n  [{name}] Fetching CoT data...")
     rows = rows_fn()
     print(f"  [{name}] {len(rows)} weekly records.")
+    db_insert_fn(_rows_for_db(rows))
 
     print(f"  [{name}] Fetching price data...")
     prices = prices_fn(years=8)
@@ -73,13 +99,18 @@ def _compute_gsr_series(gold_spot: dict, silver_spot: dict) -> list[dict]:
 
 def main():
     print("ArgentVigil pipeline starting...")
+    db.init_db()
 
-    silver, silver_prices = _run_metal("Silver", fetch_cot_data, fetch_silver_prices)
-    gold, gold_prices = _run_metal("Gold", fetch_gold_cot_data, fetch_gold_prices)
+    silver, silver_prices = _run_metal("Silver", fetch_cot_data, fetch_silver_prices, db.insert_silver_rows)
+    gold, gold_prices = _run_metal("Gold", fetch_gold_cot_data, fetch_gold_prices, db.insert_gold_rows)
+    db.upsert_prices("SLV", silver_prices)
+    db.upsert_prices("GLD", gold_prices)
 
     print("\n  [GSR] Fetching spot prices (GC=F, SI=F)...")
     gold_spot = fetch_spot_prices("GC=F", years=8)
     silver_spot = fetch_spot_prices("SI=F", years=8)
+    db.upsert_prices("GC=F", gold_spot)
+    db.upsert_prices("SI=F", silver_spot)
     gsr_series = _compute_gsr_series(gold_spot, silver_spot)
 
     output = {

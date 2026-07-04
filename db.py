@@ -75,6 +75,38 @@ CREATE TABLE IF NOT EXISTS fred_observations (
     value     REAL,
     PRIMARY KEY (series_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS delivery_notices (
+    date TEXT,
+    type TEXT,
+    daily_issued REAL,
+    daily_stopped REAL,
+    PRIMARY KEY (date, type)
+);
+
+CREATE TABLE IF NOT EXISTS shfe_warehouse (
+    date TEXT,
+    warehouse TEXT,
+    warrant_kg REAL,
+    warrant_change_kg REAL,
+    PRIMARY KEY (date, warehouse)
+);
+
+CREATE TABLE IF NOT EXISTS pslv_snapshot (
+    date TEXT PRIMARY KEY,
+    total_oz REAL,
+    nav_per_unit REAL,
+    total_nav REAL,
+    units REAL
+);
+
+CREATE TABLE IF NOT EXISTS spot_price_snapshot (
+    series_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    price REAL,
+    change_pct_24h REAL,
+    PRIMARY KEY (series_id, date)
+);
 """
 
 
@@ -224,6 +256,116 @@ def upsert_fred_observations(series_id: str, rows: list[dict]):
                VALUES (?, ?, ?)""",
             [(series_id, r["date"], r["value"]) for r in rows],
         )
+
+
+def get_latest_depositories() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, depository, registered, eligible, total,
+                      prev_registered, prev_eligible, prev_total
+               FROM inventory_depository
+               WHERE date = (SELECT MAX(date) FROM inventory_depository)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_latest_gold_depositories() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, depository, registered, eligible, total,
+                      prev_registered, prev_eligible, prev_total
+               FROM gold_inventory_depository
+               WHERE date = (SELECT MAX(date) FROM gold_inventory_depository)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_latest_volume_oi() -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT date, open_interest, volume, paper_leverage FROM volume_oi ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_gold_volume_oi() -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT date, open_interest, volume, paper_leverage FROM gold_volume_oi ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_delivery_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO delivery_notices (date, type, daily_issued, daily_stopped)
+               VALUES (:date, :type, :daily_issued, :daily_stopped)""",
+            rows,
+        )
+
+
+def get_delivery_history(type: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, type, daily_issued, daily_stopped FROM delivery_notices WHERE type = ? ORDER BY date",
+            (type,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_shfe_warehouse_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO shfe_warehouse (date, warehouse, warrant_kg, warrant_change_kg)
+               VALUES (:date, :warehouse, :warrant_kg, :warrant_change_kg)""",
+            rows,
+        )
+
+
+def get_latest_shfe_warehouses() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, warehouse, warrant_kg, warrant_change_kg
+               FROM shfe_warehouse
+               WHERE date = (SELECT MAX(date) FROM shfe_warehouse)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_pslv_row(row: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO pslv_snapshot (date, total_oz, nav_per_unit, total_nav, units)
+               VALUES (:date, :total_oz, :nav_per_unit, :total_nav, :units)""",
+            row,
+        )
+
+
+def get_latest_pslv() -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT date, total_oz, nav_per_unit, total_nav, units FROM pslv_snapshot ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_spot_price_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO spot_price_snapshot (series_id, date, price, change_pct_24h)
+               VALUES (:series_id, :date, :price, :change_pct_24h)""",
+            rows,
+        )
+
+
+def get_latest_spot_prices() -> dict[str, dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT series_id, date, price, change_pct_24h FROM spot_price_snapshot s1
+               WHERE date = (SELECT MAX(date) FROM spot_price_snapshot s2 WHERE s2.series_id = s1.series_id)"""
+        ).fetchall()
+        return {r["series_id"]: dict(r) for r in rows}
 
 
 def get_fred_observations(series_id: str, since: str) -> list[dict]:
