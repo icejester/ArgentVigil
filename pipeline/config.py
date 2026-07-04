@@ -21,6 +21,10 @@ CAPITULATED_THRESHOLD = 10  # bottom decile → specs capitulated
 # Cache file location (relative to repo root)
 CACHE_FILE = "pipeline/cache/cot_data.json"
 
+# SQLite archive (append-only CoT rows + price history), keyed relative to this file's dir
+import os as _os
+COT_DB_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "cache", "cot_pipeline.db")
+
 # FRED Money Supply
 FRED_SERIES_M2 = "M2SL"
 FRED_SERIES_WALCL = "WALCL"

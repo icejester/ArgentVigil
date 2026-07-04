@@ -3,7 +3,10 @@ Transforms raw CoT API rows into net_long_pct_oi time series, computes
 trailing percentiles, and joins price data to produce signal hit-rate stats.
 """
 
-from config import WINDOW_2YR, WINDOW_5YR, CROWDED_THRESHOLD, CAPITULATED_THRESHOLD
+try:
+    from .config import WINDOW_2YR, WINDOW_5YR, CROWDED_THRESHOLD, CAPITULATED_THRESHOLD
+except ImportError:
+    from config import WINDOW_2YR, WINDOW_5YR, CROWDED_THRESHOLD, CAPITULATED_THRESHOLD
 
 LOOKAHEAD_WEEKS = [4, 8]
 MIN_SAMPLE_FOR_CONCLUSIONS = 5
@@ -79,6 +82,43 @@ def parse_and_compute(rows: list[dict]) -> dict:
     }
 
 
+def compute_from_series(series: list[dict]) -> dict:
+    """
+    Same percentile/window/classification logic as parse_and_compute, but for
+    a series already normalized to {date, net_long, open_interest,
+    net_long_pct_oi} (e.g. read back from SQLite) rather than raw CFTC rows.
+    """
+    if not series:
+        raise ValueError("No usable rows in series.")
+
+    pct_series = [r["net_long_pct_oi"] for r in series]
+    latest = series[-1]
+    current_val = latest["net_long_pct_oi"]
+
+    def window_stats(n: int) -> dict:
+        window = pct_series[-(n + 1):-1] if len(pct_series) > n else pct_series[:-1]
+        pct = _percentile_rank(window, current_val)
+        return {
+            "percentile": pct,
+            "window_size": len(window),
+            "classification": classify_signal(pct),
+        }
+
+    windows = {
+        "2yr": window_stats(WINDOW_2YR),
+        "5yr": window_stats(WINDOW_5YR),
+    }
+    windows["disagree"] = (
+        windows["2yr"]["classification"] != windows["5yr"]["classification"]
+    )
+
+    return {
+        "series": series,
+        "latest": latest,
+        "windows": windows,
+    }
+
+
 def compute_signal_track_record(series: list[dict], prices: dict[str, float]) -> dict:
     """
     Joins CoT series with price data and computes historical hit rates for
@@ -92,7 +132,10 @@ def compute_signal_track_record(series: list[dict], prices: dict[str, float]) ->
     Crowded signal "correct" = price lower at +Nw (downside flush materialized).
     Capitulated signal "correct" = price higher at +Nw (recovery materialized).
     """
-    from price_fetch import align_price_to_cot_week
+    try:
+        from .price_fetch import align_price_to_cot_week
+    except ImportError:
+        from price_fetch import align_price_to_cot_week
 
     n = len(series)
     results = {"crowded": {}, "capitulated": {}, "thin_sample_warning": False}

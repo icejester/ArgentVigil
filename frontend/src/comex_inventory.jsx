@@ -14,6 +14,7 @@ import {
 } from "recharts";
 import MarketBalancePanel, { DemandCompositionPanel } from "./market_balance";
 import { VAULT_COLORS } from "./palette";
+import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 
 const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
 const STALE_MS = 5 * 60 * 1000;
@@ -827,18 +828,20 @@ export default function ComexInventoryDashboard() {
 
     const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
-    // Stagger requests by 300ms each so panels fill in progressively
-    await get("/api/silver/db/history",        setHistory,       (j) => j.data ?? null);
+    // Stagger requests by 300ms each so panels fill in progressively.
+    // All reads are local DB reads now — upstream refresh is handled
+    // server-side by the tiered background refresh (see RefreshControls).
+    await get("/api/silver/db/history",           setHistory,       (j) => j.data ?? null);
     await delay(300);
-    await get("/api/silver/depositories",      setDepositories,  null);
+    await get("/api/silver/db/depositories",      setDepositories,  null);
     await delay(300);
-    await get("/api/silver/delivery?type=mtd", setDelivery,      null);
+    await get("/api/silver/db/delivery?type=mtd", setDelivery,      null);
     await delay(300);
-    await get("/api/shfe/db/history",          setShfeHistory,   (j) => j.data ?? null);
+    await get("/api/shfe/db/history",             setShfeHistory,   (j) => j.data ?? null);
     await delay(300);
-    await get("/api/shfe/warehouses",          setShfeWarehouses, null);
+    await get("/api/shfe/db/warehouses",          setShfeWarehouses, null);
     await delay(300);
-    await get("/api/pslv",                     setPslv,           null);
+    await get("/api/pslv/db",                     setPslv,           null);
 
     setLastFetch(Date.now());
   }, []);
@@ -846,7 +849,11 @@ export default function ComexInventoryDashboard() {
   useEffect(() => {
     fetchAll();
     timerRef.current = setInterval(fetchAll, REFRESH_MS);
-    return () => clearInterval(timerRef.current);
+    window.addEventListener(FORCE_REFRESH_EVENT, fetchAll);
+    return () => {
+      clearInterval(timerRef.current);
+      window.removeEventListener(FORCE_REFRESH_EVENT, fetchAll);
+    };
   }, [fetchAll]);
 
   const stale = lastFetch && Date.now() - lastFetch > STALE_MS;
@@ -862,8 +869,8 @@ export default function ComexInventoryDashboard() {
           <div className="comex-header">
             <div className="comex-title">Silver Inventory — Exchange Reserves</div>
             <div className="comex-subtitle">
-              COMEX (USA) · SHFE (China) · metalcharts.org proxy · auto-refresh every{" "}
-              {REFRESH_MS / 1000}s
+              COMEX (USA) · SHFE (China) · reads from AV's own database, refreshed{" "}
+              from metalcharts.org/Sprott on a server-side schedule
             </div>
             {lastFetch && (
               <div className={`comex-freshness${stale ? " comex-freshness--stale" : ""}`}>

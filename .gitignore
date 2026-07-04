@@ -219,6 +219,7 @@ __marimo__/
 
 # ArgentVigil
 pipeline/cache/cot_data.json
+pipeline/cache/cot_pipeline.db
 argentvigil.db
 frontend/node_modules/
 frontend/dist/
