@@ -9,14 +9,19 @@ import os
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_PIPELINE_DIR)
+sys.path.insert(0, _PIPELINE_DIR)   # for bare `from fetch import ...` etc. (this file's own siblings)
+sys.path.insert(0, _REPO_ROOT)      # for `from backend import db` — backend/ is pure-stdlib (sqlite3/os/
+                                     # contextlib only), so importing it does not require fastapi/httpx/
+                                     # dotenv or the venv being active; this pipeline stays runnable with
+                                     # bare `python3`.
 
-import db
+from backend import db
 from fetch import fetch_cot_data, fetch_gold_cot_data
 from price_fetch import fetch_silver_prices, fetch_gold_prices, fetch_spot_prices
 from compute import parse_and_compute, compute_signal_track_record
 
-_PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
 _CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache", "cot_data.json")
 
 
@@ -135,6 +140,8 @@ def main():
     os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
     with open(_CACHE_PATH, "w") as f:
         json.dump(output, f, indent=2)
+
+    db.record_pipeline_run(output["generated_at"])
 
     print(f"\n  Cache written to {_CACHE_PATH}")
 

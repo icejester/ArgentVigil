@@ -301,6 +301,10 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-legend-swatch--dashed {
   background: none; border-top: 2px dashed; height: 0; width: 14px;
 }
+.comex-legend-swatch--diamond {
+  width: 10px; height: 10px; transform: translateY(-1px) rotate(45deg);
+  border-radius: 2px;
+}
 
 /* Range selector */
 .comex-range-selector { display: flex; gap: 4px; }

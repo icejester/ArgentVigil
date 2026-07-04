@@ -8,11 +8,13 @@ ArgentVigil is not a trading system and produces no price targets. It is a posit
 
 ## What it does
 
-ArgentVigil has two layers:
+ArgentVigil has three layers:
 
-**CoT Positioning Pipeline** — fetches CFTC Commitment of Traders data for COMEX Silver (084691) and COMEX Gold (088691), computes a normalized positioning metric (`net_long_pct_oi`), and ranks it against rolling 2-year and 5-year historical windows.
+**CoT Positioning Pipeline** — fetches CFTC Commitment of Traders data for COMEX Silver (084691) and COMEX Gold (088691), computes a normalized positioning metric (`net_long_pct_oi`), and ranks it against rolling 2-year and 5-year historical windows. Persists to the shared SQLite database; the frontend reads it back via the FastAPI backend, never the pipeline's own JSON cache directly.
 
 **Exchange Inventory Dashboard** — a live physical inventory view across COMEX (silver and gold), SHFE (Shanghai), and PSLV (Sprott), served by a FastAPI backend that proxies metalcharts.org and persists results to SQLite. The same backend also serves a Money Supply panel (M2, Fed balance sheet, CPI-derived purchasing power) sourced from FRED, and a metals-vs-purchasing-power comparison sourced from Yahoo Finance.
+
+**CATCOR (Catalyst Correlation)** — an event/reaction spine answering "which catalysts actually move silver and gold" with observed data, no interpretation layer. Tracks a macro-event calendar (FOMC, CPI, NFP), sources actual/consensus values from ALFRED and ForexFactory, and captures price reactions at fixed windows (T-30min/T+5min/T+30min/T+2hr) around each event.
 
 ---
 
@@ -81,6 +83,21 @@ A separate collapsible panel (rendered above Stock & Flow) tracking the supply o
 
 ---
 
+## CATCOR (Catalyst Correlation)
+
+A separate frontend tab answering "did this catalyst actually move the metal" with real observed data — no sentiment, no prediction, no ingestion.
+
+- **Event calendar** — a manually-maintained FOMC/CPI/NFP schedule (dates cross-checked against ALFRED and the Fed's own calendar), auto-seeded and kept idempotent across restarts
+- **Actual values** — sourced from ALFRED (FRED's point-in-time vintage API), not today's revised numbers — a raw CPI/NFP print as it actually stood on the day it was released
+- **Consensus values** — sourced from ForexFactory's free calendar feed, cached per-calendar-week to avoid its aggressive rate limiting
+- **Price reaction capture** — silver and gold price snapshots at T-30min/T+5min/T+30min/T+2hr around each event's scheduled release, backed by Yahoo Finance 5-minute intraday bars (falling back to daily closes for events older than ~72 days)
+- **Catalyst Timeline** — scatter chart plotting every captured catalyst by calendar date over a selectable lookback window
+- **Surprise Magnitude vs. Price Reaction** — scatter chart plotting surprise (actual − consensus) against price reaction, only for events where both are known; hovering a point in either chart highlights the same event in the other
+
+Known, disclosed limitations (not bugs): consensus values can only be captured for events within the current Sun–Sat calendar week (ForexFactory's feed has no historical or future window); intraday-precision reactions only exist for the ~72 most recent days of the backfill window (Yahoo Finance's 5-minute-interval cap).
+
+---
+
 ## Explicit non-goals
 
 - No price targets
@@ -92,25 +109,25 @@ A separate collapsible panel (rendered above Stock & Flow) tracking the supply o
 
 ## Stack
 
-**Pipeline** (CoT data, no server required):
+**Pipeline** (CoT data):
 
-- Python 3, standard library only (no third-party deps)
+- Python 3, standard library only (no third-party deps) — runnable with bare `python3`, no venv required
 - Fetches from CFTC PRE Socrata API and Yahoo Finance
-- Output: `pipeline/cache/cot_data.json`
+- Persists to the shared SQLite database (`runtime/argentvigil.db`) via `backend/db.py` (itself pure stdlib, so importing it doesn't pull in FastAPI/httpx); also writes `pipeline/cache/cot_data.json` for standalone-CLI usability, though the frontend no longer reads that file
 
-**Backend** (Exchange inventory, Money Supply, and metals-vs-purchasing-power server):
+**Backend** (Exchange inventory, Money Supply, CATCOR, and metals-vs-purchasing-power server):
 
 - FastAPI + uvicorn
-- httpx for async proxying of metalcharts.org, FRED, and Yahoo Finance
-- SQLite via `db.py` for persistence (`argentvigil.db`) — a generic `fred_observations` table stores both FRED series and resampled Yahoo Finance metal-price history
-- Authenticated requests to metalcharts.org via `mc_token.py`
-- Requires `FRED_API_KEY` in the environment for the Money Supply refresh endpoint (`.env` file, loaded via `python-dotenv`, or shell-exported)
+- httpx for async proxying of metalcharts.org, FRED, ForexFactory, and Yahoo Finance
+- SQLite via `backend/db.py` for persistence (`runtime/argentvigil.db`) — one shared database for the whole app, including the CoT pipeline's tables; a generic `fred_observations` table stores both FRED series and resampled Yahoo Finance metal-price history
+- Authenticated requests to metalcharts.org via `backend/mc_token.py`
+- Requires `FRED_API_KEY` in the environment for the Money Supply refresh endpoint and CATCOR's ALFRED actuals (`.env` file, loaded via `python-dotenv`, or shell-exported)
 
 **Frontend**:
 
 - React + Vite 5 + Recharts
-- Sections: CoT positioning (reads `cot_data.json`), Money Supply, and Exchange Inventory (both call the FastAPI backend)
-- Auto-refresh on the inventory dashboard (configurable via `VITE_AV_REFRESH_INTERVAL`, default 60s); Money Supply and metals price history refresh on-demand via a Refresh button
+- Sections: CoT positioning, Money Supply, Exchange Inventory, and CATCOR — all read from `/db`-suffixed FastAPI routes, never a live upstream fetch or the pipeline's JSON cache
+- Auto-refresh on the inventory dashboard (configurable via `VITE_AV_REFRESH_INTERVAL`, default 60s); Money Supply, metals price history, and CATCOR refresh on-demand via their respective controls
 
 ---
 
@@ -122,18 +139,18 @@ A separate collapsible panel (rendered above Stock & Flow) tracking the supply o
 python3 pipeline/run.py
 ```
 
-Output: `pipeline/cache/cot_data.json`
+Persists to `runtime/argentvigil.db` (and also writes `pipeline/cache/cot_data.json` for standalone-CLI use). Run this at least once before the frontend — the CoT tab reads from the backend's `/api/cot/db` route, which reads the tables this populates.
 
 CoT data is as of Tuesday each week, published by the CFTC on Friday (~3-day lag). The staleness label in the UI makes this explicit.
 
-### Exchange inventory backend
+### Exchange inventory / CATCOR backend
 
 ```bash
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn backend.main:app --reload
 ```
 
-The backend proxies metalcharts.org and serves from `http://localhost:8000`. On first start it backfills the full COMEX history if the local SQLite database is empty.
+The backend proxies metalcharts.org, FRED/ALFRED, ForexFactory, and Yahoo Finance, and serves from `http://localhost:8000`. On first start it backfills exchange inventory history and CATCOR's event calendar/reactions if the local SQLite database is empty.
 
 ### Frontend dev server
 
@@ -143,7 +160,7 @@ npm install
 npm run dev
 ```
 
-The dev server reads `cot_data.json` from `pipeline/cache/` via Vite's `publicDir` config, and proxies `/api/*` requests to the FastAPI backend. Run the pipeline at least once and start the backend before launching the frontend.
+The dev server proxies `/api/*` requests to the FastAPI backend; every panel reads its data through those routes. Run the pipeline at least once and start the backend before launching the frontend.
 
 ### Convenience script
 
@@ -170,5 +187,8 @@ Starts the backend and frontend dev server together.
 | PSLV holdings | Sprott direct API | Daily |
 | Spot prices (XAG / XAU) | metalcharts.org | Intraday |
 | M2 Money Stock, Fed Balance Sheet, CPI | FRED (Federal Reserve Bank of St. Louis) — M2SL, WALCL, CPIAUCSL | Monthly / Weekly |
+| Macro event actuals (CPI, NFP) | ALFRED (FRED's point-in-time vintage API) | Per release |
+| Macro event consensus | ForexFactory free calendar feed | Cached weekly (current Sun–Sat week only) |
+| Event-window price reactions (XAG / XAU) | Yahoo Finance intraday (5-min bars) / daily close fallback | Per event |
 
 LME (London) requires a paid subscription and is not tracked.

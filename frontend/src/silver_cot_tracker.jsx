@@ -21,6 +21,10 @@ function signalColor(classification) {
   return "#b0b8c4";
 }
 
+const WEEKDAY_NAMES = [
+  "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+];
+
 function StalenessLabel({ cotAsOfDate, generatedAt }) {
   const asOf = cotAsOfDate ?? "unknown";
   // CoT report: data as of Tuesday, published ~3 days later (Friday)
@@ -28,6 +32,8 @@ function StalenessLabel({ cotAsOfDate, generatedAt }) {
   const publishedDate = asOfDate
     ? new Date(asOfDate.getTime() + 3 * 24 * 60 * 60 * 1000)
     : null;
+  const asOfWeekday = asOfDate ? WEEKDAY_NAMES[asOfDate.getUTCDay()] : null;
+  const publishedWeekday = publishedDate ? WEEKDAY_NAMES[publishedDate.getUTCDay()] : null;
   const publishedStr = publishedDate
     ? publishedDate.toISOString().slice(0, 10)
     : "unknown";
@@ -38,8 +44,10 @@ function StalenessLabel({ cotAsOfDate, generatedAt }) {
   return (
     <div className="staleness-label">
       <span>
-        CoT data as of <strong>{asOf}</strong> (Tuesday) · published ~
-        <strong>{publishedStr}</strong> (Friday) · pipeline run{" "}
+        CoT data as of <strong>{asOf}</strong>
+        {asOfWeekday ? ` (${asOfWeekday})` : ""} · published ~
+        <strong>{publishedStr}</strong>
+        {publishedWeekday ? ` (${publishedWeekday})` : ""} · pipeline run{" "}
         <strong>{fetchedStr}</strong>
       </span>
     </div>
