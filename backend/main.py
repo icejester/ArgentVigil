@@ -12,9 +12,9 @@ from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
-import db
-from mc_token import authed_headers
-from pipeline import db as cot_db
+from . import catcor
+from . import db
+from .mc_token import authed_headers
 from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
     FRED_FETCH_YEARS,
@@ -30,8 +30,10 @@ from pipeline.config import (
     XAU_TICKER,
 )
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 METALCHARTS = "https://metalcharts.org"
-MARKET_BALANCE_PATH = "silver_market_balance.json"
+MARKET_BALANCE_PATH = os.path.join(_REPO_ROOT, "seed_data", "silver_market_balance.json")
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 METAL_PRICE_TICKERS = {XAG_SERIES_ID: XAG_TICKER, XAU_SERIES_ID: XAU_TICKER}
@@ -67,12 +69,93 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_backfill_if_needed())
     asyncio.create_task(_refresh_fast_tier())
     asyncio.create_task(_refresh_slow_tier())
+    asyncio.create_task(_catcor_startup())
     _refresh_tasks.append(asyncio.create_task(_fast_tier_loop()))
     _refresh_tasks.append(asyncio.create_task(_slow_tier_loop()))
+    _refresh_tasks.append(asyncio.create_task(_event_tier_loop()))
+    _refresh_tasks.append(asyncio.create_task(_consensus_tier_loop()))
     yield
     for t in _refresh_tasks:
         t.cancel()
     await _client.aclose()
+
+
+async def _catcor_startup():
+    """One-shot on every startup: reseed the event calendar, pull Yahoo
+    intraday ticks, and backfill any missing reactions. Cheap on repeat
+    runs — backfill_reactions/capture_snapshot are idempotent (skip
+    windows that already have a reaction row), so this is safe whether
+    the app was offline 14 minutes or 14 days."""
+    try:
+        n = catcor.seed_events()
+        print(f"[catcor] seeded {n} events")
+    except Exception as e:
+        print(f"[catcor] warning: seed_events failed: {e}")
+        return
+
+    try:
+        await catcor.backfill_intraday_ticks(_client)
+    except Exception as e:
+        print(f"[catcor] warning: backfill_intraday_ticks failed: {e}")
+
+    try:
+        await catcor.backfill_daily_closes(_client)
+    except Exception as e:
+        print(f"[catcor] warning: backfill_daily_closes failed: {e}")
+
+    try:
+        # Fetch consensus first: fetch_and_persist_actuals computes
+        # surprise_delta immediately if consensus is already on the row.
+        await catcor.fetch_and_persist_consensus(_client)
+    except Exception as e:
+        print(f"[catcor] warning: fetch_and_persist_consensus failed: {e}")
+
+    try:
+        await catcor.fetch_and_persist_actuals(_client)
+    except Exception as e:
+        print(f"[catcor] warning: fetch_and_persist_actuals failed: {e}")
+
+    try:
+        catcor.backfill_reactions()
+    except Exception as e:
+        print(f"[catcor] warning: backfill_reactions failed: {e}")
+
+
+CATCOR_CONSENSUS_INTERVAL_S = 1800  # how often to re-check for newly-in-window events; catcor.py caches the actual ForexFactory fetch per calendar week, so most of these ticks do zero network I/O
+
+
+async def _event_tier_loop():
+    """Snapshot capture needs a tight interval (real T+5m precision
+    requires it) — always on, not gated by an enabled flag, since a missed
+    snapshot window is a real, permanent data loss (no tick existed at
+    that instant), unlike fast/slow tier data which is always
+    re-fetchable on the next cycle."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for event_id, window in catcor.due_snapshots():
+                catcor.capture_snapshot(event_id, window)
+        except Exception as e:
+            print(f"[catcor] warning: event tier loop: {e}")
+
+
+async def _consensus_tier_loop():
+    """Separate, much slower loop for ForexFactory consensus + ALFRED
+    actuals. catcor.fetch_and_persist_consensus caches the raw ForexFactory
+    response per calendar week (confirmed live that repeat hits trip its
+    rate limit — 429 — so the actual network fetch happens at most once a
+    week; every other call here is a cache read matching already-fetched
+    entries against event_calendar). ALFRED actuals are cheap/infrequent by
+    nature (one real print per event per month) and share this loop rather
+    than getting their own, since there's no benefit to checking more often
+    than consensus does anyway."""
+    while True:
+        try:
+            await catcor.fetch_and_persist_consensus(_client)
+            await catcor.fetch_and_persist_actuals(_client)
+        except Exception as e:
+            print(f"[catcor] warning: consensus tier loop: {e}")
+        await asyncio.sleep(CATCOR_CONSENSUS_INTERVAL_S)
 
 
 async def _fast_tier_loop():
@@ -693,6 +776,11 @@ async def _fetch_and_persist_prices() -> dict:
             })
     if rows:
         db.upsert_spot_price_rows(rows)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.append_price_tick([
+            {"series_id": r["series_id"], "ts": now_iso, "price": r["price"]}
+            for r in rows
+        ])
     return data
 
 
@@ -709,24 +797,24 @@ def _cot_gsr_series(gold_spot: dict, silver_spot: dict) -> list[dict]:
 
 @app.get("/api/cot/db")
 async def cot_db_route():
-    silver_series = cot_db.get_silver_series()
-    gold_series = cot_db.get_gold_series()
+    silver_series = db.get_silver_series()
+    gold_series = db.get_gold_series()
     if not silver_series or not gold_series:
         raise HTTPException(500, "No CoT data persisted yet. Run pipeline/run.py first.")
 
     silver_result = compute_from_series(silver_series)
     gold_result = compute_from_series(gold_series)
 
-    slv_prices = cot_db.get_price_series("SLV")
-    gld_prices = cot_db.get_price_series("GLD")
-    gc_prices = cot_db.get_price_series("GC=F")
-    si_prices = cot_db.get_price_series("SI=F")
+    slv_prices = db.get_price_series("SLV")
+    gld_prices = db.get_price_series("GLD")
+    gc_prices = db.get_price_series("GC=F")
+    si_prices = db.get_price_series("SI=F")
 
     silver_track = compute_signal_track_record(silver_result["series"], slv_prices)
     gold_track = compute_signal_track_record(gold_result["series"], gld_prices)
     gsr_series = _cot_gsr_series(gc_prices, si_prices)
 
-    last_run_at = cot_db.get_last_run_at()
+    last_run_at = db.get_last_run_at()
     generated_at = (
         datetime.fromisoformat(last_run_at.replace(" ", "T") + "+00:00").isoformat()
         if last_run_at else None
@@ -1007,8 +1095,39 @@ async def fred_money_supply_db(window: str = Query("5y")):
     }
 
 
+@app.get("/api/catcor/events/db")
+async def catcor_events_db(limit: int = Query(20)):
+    return {"success": True, "data": db.get_upcoming_events(limit=limit)}
+
+
+@app.get("/api/catcor/reactions/db")
+async def catcor_reactions_db():
+    return {"success": True, "data": db.get_event_reaction_series()}
+
+
+@app.post("/api/catcor/refresh")
+async def catcor_refresh():
+    if "FRED_API_KEY" not in os.environ:
+        raise HTTPException(500, "FRED_API_KEY environment variable is not set")
+    try:
+        n_seeded = catcor.seed_events()
+        await catcor.backfill_intraday_ticks(_client)
+        await catcor.backfill_daily_closes(_client)
+        consensus_result = await catcor.fetch_and_persist_consensus(_client)
+        actuals_result = await catcor.fetch_and_persist_actuals(_client)
+        catcor.backfill_reactions()
+        return {
+            "success": True,
+            "seeded": n_seeded,
+            "consensus": consensus_result,
+            "actuals": actuals_result,
+        }
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+
+
 # Serve built frontend; keep last so API routes take priority
 try:
-    app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="static")
+    app.mount("/", StaticFiles(directory=os.path.join(_REPO_ROOT, "frontend", "dist"), html=True), name="static")
 except Exception:
     pass

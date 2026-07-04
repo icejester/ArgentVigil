@@ -1,7 +1,10 @@
+import os
 import sqlite3
 from contextlib import contextmanager
 
-DB_PATH = "argentvigil.db"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(_REPO_ROOT, "runtime", "argentvigil.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # sqlite3.connect does not create parent dirs
 
 DDL = """
 CREATE TABLE IF NOT EXISTS inventory_aggregate (
@@ -107,6 +110,67 @@ CREATE TABLE IF NOT EXISTS spot_price_snapshot (
     change_pct_24h REAL,
     PRIMARY KEY (series_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS event_calendar (
+    event_id TEXT PRIMARY KEY,
+    event_name TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    scheduled_time TEXT NOT NULL,
+    consensus_value REAL,
+    actual_value REAL,
+    surprise_delta REAL,
+    source_url TEXT,
+    source_tier TEXT
+);
+
+CREATE TABLE IF NOT EXISTS macro_price_reaction (
+    event_id TEXT NOT NULL,
+    metal TEXT NOT NULL,
+    window TEXT NOT NULL,
+    price REAL,
+    price_delta_pct REAL,
+    surprise_magnitude REAL,
+    PRIMARY KEY (event_id, metal, window)
+);
+
+CREATE TABLE IF NOT EXISTS spot_price_tick (
+    series_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    price REAL,
+    PRIMARY KEY (series_id, ts)
+);
+
+CREATE TABLE IF NOT EXISTS cot_silver (
+    report_date TEXT PRIMARY KEY,
+    noncomm_long REAL,
+    noncomm_short REAL,
+    open_interest REAL,
+    net_long REAL,
+    net_long_pct_oi REAL,
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cot_gold (
+    report_date TEXT PRIMARY KEY,
+    noncomm_long REAL,
+    noncomm_short REAL,
+    open_interest REAL,
+    net_long REAL,
+    net_long_pct_oi REAL,
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cot_prices (
+    ticker TEXT NOT NULL,
+    date TEXT NOT NULL,
+    price REAL,
+    PRIMARY KEY (ticker, date)
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    ran_at TEXT NOT NULL
+);
 """
 
 
@@ -124,6 +188,16 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(DDL)
+        # CREATE TABLE IF NOT EXISTS doesn't retroactively add columns to an
+        # already-existing table — source_tier was added to event_calendar
+        # after that table was already deployed, so a plain ALTER TABLE
+        # (guarded, since SQLite has no ADD COLUMN IF NOT EXISTS) is needed
+        # for databases created before this column existed. No-op on a
+        # fresh DB, where the DDL above already includes the column.
+        try:
+            conn.execute("ALTER TABLE event_calendar ADD COLUMN source_tier TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def upsert_aggregate_rows(rows: list[dict]):
@@ -377,3 +451,179 @@ def get_fred_observations(series_id: str, since: str) -> list[dict]:
             (series_id, since),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def upsert_event_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO event_calendar
+               (event_id, event_name, event_type, scheduled_time,
+                consensus_value, actual_value, surprise_delta, source_url, source_tier)
+               VALUES (:event_id, :event_name, :event_type, :scheduled_time,
+                       :consensus_value, :actual_value, :surprise_delta, :source_url, :source_tier)""",
+            rows,
+        )
+
+
+def update_event_actuals(event_id: str, actual_value: float | None, surprise_delta: float | None):
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE event_calendar SET actual_value = ?, surprise_delta = ?
+               WHERE event_id = ?""",
+            (actual_value, surprise_delta, event_id),
+        )
+
+
+def get_upcoming_events(limit: int = 20) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT event_id, event_name, event_type, scheduled_time,
+                      consensus_value, actual_value, surprise_delta, source_url, source_tier
+               FROM event_calendar
+               WHERE scheduled_time >= datetime('now')
+               ORDER BY scheduled_time ASC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_event(event_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT event_id, event_name, event_type, scheduled_time,
+                      consensus_value, actual_value, surprise_delta, source_url, source_tier
+               FROM event_calendar WHERE event_id = ?""",
+            (event_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_events_needing_actuals() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT event_id, event_name, event_type, scheduled_time, source_url
+               FROM event_calendar
+               WHERE scheduled_time < datetime('now') AND actual_value IS NULL"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_price_reaction_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO macro_price_reaction
+               (event_id, metal, window, price, price_delta_pct, surprise_magnitude)
+               VALUES (:event_id, :metal, :window, :price, :price_delta_pct, :surprise_magnitude)""",
+            rows,
+        )
+
+
+def get_event_reaction_series() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT e.event_id, e.event_name, e.event_type, e.scheduled_time,
+                      e.surprise_delta, r.metal, r.window, r.price, r.price_delta_pct,
+                      r.surprise_magnitude
+               FROM event_calendar e
+               JOIN macro_price_reaction r ON r.event_id = e.event_id
+               ORDER BY e.scheduled_time ASC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def append_price_tick(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO spot_price_tick (series_id, ts, price)
+               VALUES (:series_id, :ts, :price)""",
+            rows,
+        )
+
+
+def get_ticks_near(series_id: str, ts: str, tolerance_s: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT series_id, ts, price FROM spot_price_tick
+               WHERE series_id = ?
+                 AND ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?
+               ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC
+               LIMIT 1""",
+            (series_id, ts, tolerance_s, ts),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def insert_silver_rows(rows: list[dict]):
+    """Append-only: a CFTC report for a given date is never overwritten."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO cot_silver
+               (report_date, noncomm_long, noncomm_short, open_interest, net_long, net_long_pct_oi)
+               VALUES (:report_date, :noncomm_long, :noncomm_short, :open_interest, :net_long, :net_long_pct_oi)""",
+            rows,
+        )
+
+
+def insert_gold_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO cot_gold
+               (report_date, noncomm_long, noncomm_short, open_interest, net_long, net_long_pct_oi)
+               VALUES (:report_date, :noncomm_long, :noncomm_short, :open_interest, :net_long, :net_long_pct_oi)""",
+            rows,
+        )
+
+
+def upsert_prices(ticker: str, prices: dict[str, float]):
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO cot_prices (ticker, date, price) VALUES (?, ?, ?)",
+            [(ticker, date, price) for date, price in prices.items()],
+        )
+
+
+def get_silver_series() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT report_date AS date, noncomm_long, noncomm_short, open_interest, "
+            "net_long, net_long_pct_oi FROM cot_silver ORDER BY report_date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_gold_series() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT report_date AS date, noncomm_long, noncomm_short, open_interest, "
+            "net_long, net_long_pct_oi FROM cot_gold ORDER BY report_date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_price_series(ticker: str) -> dict[str, float]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, price FROM cot_prices WHERE ticker = ? ORDER BY date", (ticker,)
+        ).fetchall()
+        return {r["date"]: r["price"] for r in rows}
+
+
+def record_pipeline_run(ran_at: str):
+    """Stamps the single 'last pipeline run' row, regardless of whether any
+    new CoT report rows were actually inserted this run."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO pipeline_runs (id, ran_at) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET ran_at = excluded.ran_at",
+            (ran_at,),
+        )
+
+
+def get_last_run_at() -> str | None:
+    """When pipeline/run.py last completed, independent of whether that run
+    inserted any new CoT rows (CFTC only publishes ~weekly, so most runs are
+    no-ops on cot_silver/cot_gold)."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT ran_at FROM pipeline_runs WHERE id = 1").fetchone()
+        return row["ran_at"] if row else None

@@ -130,7 +130,7 @@ CoT data is as of Tuesday each week, published by the CFTC on Friday (~3-day lag
 
 ```bash
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn backend.main:app --reload
 ```
 
 The backend proxies metalcharts.org and serves from `http://localhost:8000`. On first start it backfills the full COMEX history if the local SQLite database is empty.

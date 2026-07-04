@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:www.silverwars.com)",
-      "WebFetch(domain:www.silverinstitute.org)"
+      "WebFetch(domain:www.silverinstitute.org)",
+      "Bash(bash -n utils/dev.sh)",
+      "WebFetch(domain:www.federalreserve.gov)",
+      "WebFetch(domain:www.bls.gov)"
     ]
   }
 }
