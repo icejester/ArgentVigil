@@ -219,5 +219,8 @@ __marimo__/
 
 # ArgentVigil
 pipeline/cache/cot_data.json
+argentvigil.db
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
+SPEC.MD

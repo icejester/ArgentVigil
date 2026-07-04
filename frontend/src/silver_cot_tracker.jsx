@@ -55,7 +55,7 @@ function SignalBanner({ latest, windows, metal }) {
     <div className="signal-banner">
       <div className="banner-header">CoT Positioning Signal{metal ? ` — ${metal}` : ""}</div>
       <div className="banner-value">
-        Net Long % of OI:{" "}
+        Net Long % of Open Interest:{" "}
         <strong>{latest.net_long_pct_oi?.toFixed(2)}%</strong>
       </div>
       <div className="banner-windows">
@@ -99,9 +99,27 @@ function SignalBanner({ latest, windows, metal }) {
 }
 
 const LINES = [
-  { key: "silver", label: "Silver Net Long % OI", color: "#7b9fff", yAxis: "left" },
-  { key: "gold",   label: "Gold Net Long % OI",   color: "#c9a227", yAxis: "left" },
-  { key: "gsr",    label: "Gold/Silver Ratio",     color: "#8a94a6", yAxis: "right" },
+  {
+    key: "silver",
+    label: "Silver Net Long % Open Interest",
+    color: "#7b9fff",
+    yAxis: "left",
+    definition: "Speculative traders' net long position as a percentage of total open interest, silver futures. Left axis.",
+  },
+  {
+    key: "gold",
+    label: "Gold Net Long % Open Interest",
+    color: "#c9a227",
+    yAxis: "left",
+    definition: "Same calculation as above, for gold futures. Left axis.",
+  },
+  {
+    key: "gsr",
+    label: "Gold/Silver Ratio",
+    color: "#8a94a6",
+    yAxis: "right",
+    definition: "How many ounces of silver it takes to buy one ounce of gold (GC=F ÷ SI=F spot). Right axis.",
+  },
 ];
 
 function CombinedChart({ silverSeries, goldSeries, gsrSeries }) {
@@ -186,19 +204,6 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries }) {
       <div className="chart-title">
         CoT Positioning &amp; Gold/Silver Ratio — 5-Year View
       </div>
-      <div className="chart-legend">
-        {LINES.map(({ key, label, color }) => (
-          <button
-            key={key}
-            className={`legend-btn${hidden[key] ? " legend-btn--off" : ""}`}
-            style={{ "--legend-color": color }}
-            onClick={() => toggle(key)}
-          >
-            <span className="legend-swatch" />
-            {label}
-          </button>
-        ))}
-      </div>
       <ResponsiveContainer width="100%" height={360}>
         <LineChart data={chartData} margin={{ top: 8, right: 56, left: 8, bottom: 8 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
@@ -226,8 +231,8 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries }) {
             labelStyle={{ color: "#c8d0de" }}
             formatter={(v, name) => {
               if (name === "gsr") return [`${v.toFixed(1)}:1`, "Gold/Silver Ratio"];
-              if (name === "silver") return [`${v.toFixed(2)}%`, "Silver Net Long % OI"];
-              if (name === "gold") return [`${v.toFixed(2)}%`, "Gold Net Long % OI"];
+              if (name === "silver") return [`${v.toFixed(2)}%`, "Silver Net Long % Open Interest"];
+              if (name === "gold") return [`${v.toFixed(2)}%`, "Gold Net Long % Open Interest"];
               return [v, name];
             }}
           />
@@ -271,60 +276,21 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries }) {
           />
         </LineChart>
       </ResponsiveContainer>
+      <div className="comex-legend-list">
+        {LINES.map(({ key, label, color, definition }) => (
+          <button
+            key={key}
+            className={`comex-legend-item legend-btn-row${hidden[key] ? " legend-btn--off" : ""}`}
+            style={{ "--legend-color": color }}
+            onClick={() => toggle(key)}
+          >
+            <span className="comex-legend-swatch" style={{ background: color }} />
+            <span><strong>{label}</strong> — {definition}</span>
+          </button>
+        ))}
+      </div>
       <div className="chart-note">
-        Left axis: Net long % of open interest (CoT positioning). Right axis: Gold/Silver Ratio (GC=F ÷ SI=F spot).
         Signal percentiles in the banners below are computed against rolling history, not this window.
-      </div>
-    </div>
-  );
-}
-
-function MacroWatchlist({ watchlist }) {
-  if (!watchlist) return null;
-
-  const fields = [
-    { key: "fed_policy_stance", label: "Fed Policy Stance (Chair Warsh era)", type: "text" },
-    { key: "dxy", label: "DXY (US Dollar Index)", type: "number" },
-    { key: "core_pce", label: "Core PCE (BEA, %)", type: "number" },
-    { key: "fed_balance_sheet_note", label: "Fed H.4.1 Balance Sheet Note", type: "text" },
-    { key: "comex_registered_inventory_note", label: "COMEX Registered Silver Inventory", type: "text" },
-    { key: "shanghai_comex_spread_note", label: "Shanghai–COMEX Spread Note", type: "text" },
-    { key: "gold_silver_ratio", label: "Gold/Silver Ratio", type: "number" },
-    { key: "silver_institute_note", label: "Silver Institute (supply/demand, solar/PV trend)", type: "text" },
-  ];
-
-  return (
-    <div className="macro-watchlist">
-      <div className="macro-header">
-        Macro Context
-        <span className="macro-subheader">
-          Supporting context only — not additional signals. Manually updated.
-        </span>
-      </div>
-      <div className="macro-grid">
-        {fields.map(({ key, label, type }) => {
-          const val = watchlist[key];
-          const display =
-            val === null || val === undefined || val === ""
-              ? <span className="macro-empty">— not set —</span>
-              : type === "number"
-              ? <strong>{Number(val).toLocaleString()}</strong>
-              : <span>{String(val)}</span>;
-          return (
-            <div className="macro-row" key={key}>
-              <div className="macro-label">{label}</div>
-              <div className="macro-value">{display}</div>
-            </div>
-          );
-        })}
-      </div>
-      <div className="macro-note">
-        Run the pipeline (pipeline/run.py) to refresh CoT data. Edit{" "}
-        <code>pipeline/cache/cot_data.json</code> → <code>macro_watchlist</code>{" "}
-        to update these fields; they are preserved across pipeline runs.
-        <br />
-        Explicitly excluded: "hidden demand" / defense-aerospace dealer estimates —
-        these are not falsifiable and are not counted here.
       </div>
     </div>
   );
@@ -426,6 +392,118 @@ function ZoneTable({ title, zone, directionLabel }) {
   );
 }
 
+const METAL_CONFIG = {
+  silver: { label: "Silver", leverageUrl: "/api/silver/leverage", contractOz: 5000, spotKey: "XAG" },
+  gold:   { label: "Gold",   leverageUrl: "/api/gold/leverage",   contractOz: 100,  spotKey: "XAU" },
+};
+
+function spotPrice(entry) {
+  if (entry == null) return null;
+  // entry may be an object {price, change24h, …} or a bare number
+  return typeof entry === "object" ? entry.price : entry;
+}
+
+function LeverageSpotBadge({ prices, spotKey, label }) {
+  if (!prices) return null;
+  const entry = prices?.[spotKey] ?? prices?.[spotKey.toLowerCase()];
+  const price = spotPrice(entry);
+  if (price == null) return null;
+
+  const pct = typeof entry === "object" ? entry.changePercent24h : null;
+  const pctColor = pct == null ? "#6b778d" : pct >= 0 ? "#4caf76" : "#e05252";
+  const pctStr = pct == null ? null : (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
+
+  return (
+    <div className="comex-spot-badge">
+      <span className="comex-spot-label">{label} ({spotKey})</span>
+      <span className="comex-spot-price">${Number(price).toFixed(2)}</span>
+      {pctStr && (
+        <span className="comex-spot-change" style={{ color: pctColor }}>
+          {pctStr} 24h
+        </span>
+      )}
+    </div>
+  );
+}
+
+function PaperLeveragePanel({ metal = "silver" }) {
+  const { label, leverageUrl, contractOz, spotKey } = METAL_CONFIG[metal];
+  const [leverageData, setLeverageData] = useState(null);
+  const [prices, setPrices] = useState(null);
+
+  useEffect(() => {
+    fetch(leverageUrl)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(setLeverageData)
+      .catch(() => {});
+    fetch("/api/prices")
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((j) => setPrices(j.data ?? j))
+      .catch(() => {});
+  }, [leverageUrl]);
+
+  if (!leverageData) return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">{label} Paper Leverage Ratio</div>
+      <div className="comex-empty">Loading…</div>
+    </div>
+  );
+
+  const row = (leverageData.data || [])[0];
+  const leverage = row?.paper_leverage;
+  const oi = row?.openInterest;
+  const vol = row?.volume;
+  const date = row?.date;
+
+  const alertLevel = leverage == null ? null
+    : leverage >= 10 ? "high"
+    : leverage >= 5  ? "med"
+    : "low";
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        {label} Paper Leverage Ratio — Open Interest × {contractOz.toLocaleString()} oz / Registered
+      </div>
+      <div className="comex-panel-note">
+        Above 1.0 = more paper claims than registered metal available for delivery.
+        Open Interest is in contracts ({contractOz.toLocaleString()} troy oz each). Positioning context alongside CoT.
+      </div>
+      {leverage != null ? (
+        <div className="comex-leverage-card">
+          <LeverageSpotBadge prices={prices} spotKey={spotKey} label={label} />
+          <div className={`comex-leverage-value comex-leverage--${alertLevel}`}>
+            {leverage.toFixed(2)}x
+          </div>
+          <div className="comex-leverage-meta">
+            <span>Open interest: <strong>{oi?.toLocaleString()} contracts</strong> ({(oi * contractOz)?.toLocaleString()} oz)</span>
+            <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
+            <span>As of: <strong>{date}</strong></span>
+          </div>
+          <div className="comex-leverage-note">
+            {leverage >= 10
+              ? "⚠ Extreme paper leverage — registered inventory is thinly covered."
+              : leverage >= 5
+              ? "Elevated paper leverage — watch registered inventory levels."
+              : "Paper leverage within normal range."}
+          </div>
+        </div>
+      ) : (
+        <div className="comex-empty">
+          <LeverageSpotBadge prices={prices} spotKey={spotKey} label={label} />
+          No leverage data available.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SignalTrackRecord({ trackRecord }) {
   const [open, setOpen] = useState(false);
   if (!trackRecord) return null;
@@ -469,7 +547,7 @@ export default function SilverCoTTracker() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then(setData)
+      .then((d) => setData(d))
       .catch((e) =>
         setError(
           `Could not load CoT data: ${e.message}. Run pipeline/run.py first.`
@@ -500,33 +578,34 @@ export default function SilverCoTTracker() {
         <div className="app-subtitle">
           COMEX Silver &amp; Gold · Commitment of Traders · Speculative Positioning Monitor
         </div>
-        <StalenessLabel
-          cotAsOfDate={data.cot_as_of_date}
-          generatedAt={data.generated_at}
-        />
       </div>
 
-      <CombinedChart
-        silverSeries={data.series}
-        goldSeries={data.gold?.series}
-        gsrSeries={data.gsr_series}
-      />
+      <details className="collapsible-pane" open>
+        <summary className="collapsible-pane-title">
+          Positioning Extremes / Speculative Crowding
+        </summary>
+        <div className="collapsible-pane-body">
+          <StalenessLabel
+            cotAsOfDate={data.cot_as_of_date}
+            generatedAt={data.generated_at}
+          />
+          <CombinedChart
+            silverSeries={data.series}
+            goldSeries={data.gold?.series}
+            gsrSeries={data.gsr_series}
+          />
 
-      <div className="metal-section-label">Silver</div>
-      <SignalBanner latest={data.latest} windows={data.windows} metal="Silver" />
-      <SignalTrackRecord trackRecord={data.signal_track_record} />
+          <div className="metal-section-label">Silver</div>
+          <PaperLeveragePanel metal="silver" />
+          <SignalBanner latest={data.latest} windows={data.windows} metal="Silver" />
+          <SignalTrackRecord trackRecord={data.signal_track_record} />
 
-      <div className="metal-section-label">Gold</div>
-      <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
-      <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
-
-      <MacroWatchlist watchlist={data.macro_watchlist} />
-
-      <div className="footer">
-        CoT source: CFTC Public Reporting Environment (PRE), Legacy Futures-Only,
-        Silver 084691 · Gold 088691. Price source: SLV/GLD ETF via Yahoo Finance (spot proxy).
-        No price targets. Positioning data only.
-      </div>
+          <div className="metal-section-label">Gold</div>
+          <PaperLeveragePanel metal="gold" />
+          <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
+          <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
+        </div>
+      </details>
     </div>
   );
 }
