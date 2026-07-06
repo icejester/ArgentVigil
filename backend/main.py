@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 load_dotenv()
 
 from . import catcor
+from . import catcor_research
 from . import db
 from . import delivery_behavior
 from .mc_token import authed_headers
@@ -849,7 +850,17 @@ async def cot_db_route():
     gsr_series = _cot_gsr_series(gc_prices, si_prices)
 
     last_run_at = db.get_last_run_at()
-    generated_at = datetime.fromisoformat(last_run_at).isoformat() if last_run_at else None
+    generated_at = None
+    if last_run_at:
+        # pipeline/run.py stamps this via datetime.now(timezone.utc).isoformat(),
+        # which already carries a UTC offset — only naive/space-separated
+        # timestamps (e.g. a legacy row, or SQLite's own datetime('now'))
+        # need "+00:00" appended.
+        iso_str = last_run_at.replace(" ", "T")
+        has_offset = iso_str[-6] in "+-" or iso_str.endswith("Z")
+        if not has_offset:
+            iso_str += "+00:00"
+        generated_at = datetime.fromisoformat(iso_str).isoformat()
 
     return {
         "success": True,
@@ -1155,6 +1166,57 @@ async def catcor_refresh():
         }
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+# CATCOR Iteration 2 — Research Pane. Deliverable 1 scope only: session +
+# message CRUD, no Claude integration (see backend/catcor_research.py).
+@app.post("/api/catcor/research/sessions")
+async def catcor_research_create_session(body: dict = Body(...)):
+    claim_text = body.get("claim_text")
+    if not claim_text:
+        raise HTTPException(400, "claim_text is required")
+    session_id = catcor_research.create_session(claim_text, body.get("source_url"))
+    return {"success": True, "data": {"session_id": session_id}}
+
+
+@app.get("/api/catcor/research/evidence/db")
+async def catcor_research_evidence_dump():
+    """Every evidence tool's exact output, no Anthropic call involved — all
+    four tools are zero-argument reads of AV's own state, so this just runs
+    them directly. Lets you see exactly what data Claude has access to
+    before/without holding a conversation, at zero cost."""
+    return {"success": True, "data": catcor_research.dump_all_evidence()}
+
+
+@app.get("/api/catcor/research/sessions/db")
+async def catcor_research_list_sessions():
+    return {"success": True, "data": catcor_research.list_sessions()}
+
+
+@app.get("/api/catcor/research/sessions/{session_id}/db")
+async def catcor_research_get_session(session_id: str):
+    detail = catcor_research.get_session_detail(session_id)
+    if detail is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    return {"success": True, "data": detail}
+
+
+@app.post("/api/catcor/research/sessions/{session_id}/messages")
+async def catcor_research_send_message(session_id: str, body: dict = Body(...)):
+    if "ANTHROPIC_API_KEY" not in os.environ:
+        raise HTTPException(500, "ANTHROPIC_API_KEY environment variable is not set")
+    content = body.get("content")
+    if not content:
+        raise HTTPException(400, "content is required")
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        result = await catcor_research.send_message(_client, session_id, content)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {"success": True, "data": result}
 
 
 # Serve built frontend; keep last so API routes take priority

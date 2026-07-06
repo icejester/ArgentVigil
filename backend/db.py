@@ -193,6 +193,34 @@ CREATE TABLE IF NOT EXISTS forexfactory_calendar (
     previous TEXT,
     PRIMARY KEY (week_key, title, country, event_date)
 );
+
+CREATE TABLE IF NOT EXISTS research_sessions (
+    session_id TEXT PRIMARY KEY,
+    claim_text TEXT NOT NULL,
+    source_url TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    user_read TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    source_url TEXT,
+    user_read TEXT NOT NULL,
+    dismissed_at TEXT NOT NULL,
+    validation_status TEXT
+);
 """
 
 
@@ -218,6 +246,22 @@ def init_db():
         # fresh DB, where the DDL above already includes the column.
         try:
             conn.execute("ALTER TABLE event_calendar ADD COLUMN source_tier TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # research_session_id: set only when source_tier = "discovered" (a
+        # promoted research session), NULL for government-seeded events —
+        # the backlink from a promoted catalyst to the session that produced it.
+        try:
+            conn.execute("ALTER TABLE event_calendar ADD COLUMN research_session_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # direction: expected market direction of a promoted catalyst (e.g.
+        # "bullish"/"bearish" for silver/gold), distinct from a research
+        # session's own user_read (credibility of the claim, not the
+        # catalyst's expected price effect). Always NULL for government-seeded
+        # events.
+        try:
+            conn.execute("ALTER TABLE event_calendar ADD COLUMN direction TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -721,3 +765,67 @@ def get_last_run_at() -> str | None:
     with get_conn() as conn:
         row = conn.execute("SELECT ran_at FROM pipeline_runs WHERE id = 1").fetchone()
         return row["ran_at"] if row else None
+
+
+def create_research_session(session_id: str, claim_text: str, source_url: str | None, now_iso: str):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO research_sessions
+               (session_id, claim_text, source_url, status, user_read, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', NULL, ?, ?)""",
+            (session_id, claim_text, source_url, now_iso, now_iso),
+        )
+
+
+def list_research_sessions() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT session_id, claim_text, status, updated_at
+               FROM research_sessions ORDER BY updated_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_research_session(session_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT session_id, claim_text, source_url, status, user_read, created_at, updated_at
+               FROM research_sessions WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_research_messages(session_id: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, session_id, role, content, created_at
+               FROM research_messages WHERE session_id = ? ORDER BY id ASC""",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def append_research_message(session_id: str, role: str, content: str, now_iso: str):
+    """Appends a turn and bumps the parent session's updated_at in the same
+    connection block — no triggers, matching this module's existing
+    multi-statement-per-block style (e.g. catcor.py's
+    fetch_and_persist_consensus updates a child row then touches the parent)."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO research_messages (session_id, role, content, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, role, content, now_iso),
+        )
+        conn.execute(
+            "UPDATE research_sessions SET updated_at = ? WHERE session_id = ?",
+            (now_iso, session_id),
+        )
+
+
+def touch_research_session(session_id: str, now_iso: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE research_sessions SET updated_at = ? WHERE session_id = ?",
+            (now_iso, session_id),
+        )

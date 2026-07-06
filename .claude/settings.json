@@ -11,7 +11,8 @@
       "Bash(npm init *)",
       "Bash(npm install *)",
       "Bash(npx playwright *)",
-      "Bash(node screenshot.mjs)"
+      "Bash(node screenshot.mjs)",
+      "Read(//Users/jrmallas/.gitRepos/amp-dev/**)"
     ]
   }
 }
