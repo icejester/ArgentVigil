@@ -7,13 +7,21 @@ import json
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from config import CFTC_API_BASE, SILVER_CONTRACT_CODE, GOLD_CONTRACT_CODE, FETCH_YEARS
+from config import (
+    CFTC_API_BASE,
+    CFTC_DISAGGREGATED_API_BASE,
+    SILVER_CONTRACT_CODE,
+    GOLD_CONTRACT_CODE,
+    FETCH_YEARS,
+)
 
 
-def _fetch_cot_for_contract(contract_code: str) -> list[dict]:
+def _fetch_cot_for_contract(api_base: str, contract_code: str) -> list[dict]:
     """
-    Pull Legacy Futures-Only CoT records for a given contract code going back
-    FETCH_YEARS years. Returns a list of raw API row dicts sorted oldest-first.
+    Pull CoT records for a given contract code going back FETCH_YEARS years,
+    from whichever Socrata dataset api_base points at (Legacy or Disaggregated
+    Futures-Only — same query shape, different dataset/columns). Returns a
+    list of raw API row dicts sorted oldest-first.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=365 * FETCH_YEARS)
     cutoff_str = cutoff.strftime("%Y-%m-%dT00:00:00.000")
@@ -31,7 +39,7 @@ def _fetch_cot_for_contract(contract_code: str) -> list[dict]:
 
     rows: list[dict] = []
     while True:
-        url = CFTC_API_BASE + "?" + urllib.parse.urlencode(params)
+        url = api_base + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             page = json.loads(resp.read().decode())
@@ -50,8 +58,16 @@ def _fetch_cot_for_contract(contract_code: str) -> list[dict]:
 
 
 def fetch_cot_data() -> list[dict]:
-    return _fetch_cot_for_contract(SILVER_CONTRACT_CODE)
+    return _fetch_cot_for_contract(CFTC_API_BASE, SILVER_CONTRACT_CODE)
 
 
 def fetch_gold_cot_data() -> list[dict]:
-    return _fetch_cot_for_contract(GOLD_CONTRACT_CODE)
+    return _fetch_cot_for_contract(CFTC_API_BASE, GOLD_CONTRACT_CODE)
+
+
+def fetch_disaggregated_cot_data() -> list[dict]:
+    return _fetch_cot_for_contract(CFTC_DISAGGREGATED_API_BASE, SILVER_CONTRACT_CODE)
+
+
+def fetch_gold_disaggregated_cot_data() -> list[dict]:
+    return _fetch_cot_for_contract(CFTC_DISAGGREGATED_API_BASE, GOLD_CONTRACT_CODE)

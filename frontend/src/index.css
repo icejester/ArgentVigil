@@ -256,6 +256,17 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border-radius: 8px; padding: 18px 20px;
   display: flex; flex-direction: column; gap: 10px;
 }
+/* Locks the panel's frame to its tallest state (pie + full depository table)
+   so hovering a Delivery Behavior row to pin a date doesn't shrink this panel
+   while its fetch is in flight — a shrink shifts everything below it,
+   including the very row being hovered, which knocks the pin right back off. */
+.comex-panel--vault-snapshot { min-height: 780px; }
+.comex-vault-snapshot-body { position: relative; }
+.comex-vault-snapshot-overlay {
+  position: absolute; inset: 0; z-index: 1;
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  background: rgba(20, 24, 32, 0.92); border-radius: 6px; padding: 20px;
+}
 .comex-panel-header {
   display: flex; align-items: center; justify-content: space-between;
   flex-wrap: wrap; gap: 8px;
@@ -377,10 +388,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   font-weight: 500; border-bottom: 1px solid #1e2333; font-size: 11px;
 }
 .comex-table th.right, .comex-table td.right { text-align: right; }
+.comex-th-hint { cursor: help; color: #5a6278; }
 .comex-table td {
   padding: 7px 10px; border-bottom: 1px solid #1a1f2b; color: #c8d0de;
 }
 .comex-table tr:last-child td { border-bottom: none; }
+.comex-row-hoverable { cursor: pointer; }
+.comex-row-hoverable:hover td { background: #1c2231; }
 .comex-table-total td { border-top: 1px solid #2e3547; color: #e8ecf4; }
 .comex-vault-name { color: #7b8fa6; font-size: 12px; }
 .comex-total-col { font-weight: 600; color: #e8ecf4; }

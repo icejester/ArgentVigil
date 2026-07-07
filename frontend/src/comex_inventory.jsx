@@ -199,17 +199,31 @@ function shortName(name) {
 
 // ── Panel 5: Per-vault snapshot table + pie chart ──────────────────────────
 
-function VaultSnapshotPanel({ depositories }) {
+function VaultSnapshotPanel({ depositories, pinnedDate, pinnedDepositories, pinnedLoading }) {
   const [pieMetric, setPieMetric] = useState("total");
 
-  if (!depositories) return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">Per-Vault Snapshot (Today)</div>
-      <div className="comex-empty">Loading…</div>
-    </div>
-  );
+  const headerLabel = pinnedDate ? `Per-Vault Snapshot — ${pinnedDate}` : "Per-Vault Snapshot — Today";
 
-  const rows = [...(depositories.data || [])].sort(
+  // While a pinned-date fetch is in flight, keep showing today's rows in the
+  // background rather than swapping them out — this component always renders
+  // the exact same tree (header/note/pie-slot/table-slot never disappear),
+  // with only an overlay message toggled inside those fixed-height slots when
+  // there's nothing to show for the pinned date. Any branch that removes the
+  // ResponsiveContainer/table from the tree entirely forces Recharts to
+  // remount and briefly measure 0×0, which visibly collapses the pie — and
+  // the resulting reflow shifts the Delivery Behavior table below it, which
+  // knocks the mouse off the very row being hovered and fires a spurious
+  // mouseleave that cancels the pin.
+  const showingPinned = pinnedDate && !pinnedLoading;
+  const pinnedHasData = (pinnedDepositories?.data?.length ?? 0) > 0;
+  const effectiveDepositories = showingPinned && pinnedHasData ? pinnedDepositories : depositories;
+  const overlayMessage = showingPinned && !pinnedHasData
+    ? `No per-vault snapshot persisted for ${pinnedDate} yet — history only goes back to whenever this data first started being recorded.`
+    : !effectiveDepositories
+    ? "Loading…"
+    : null;
+
+  const rows = [...(effectiveDepositories?.data || [])].sort(
     (a, b) => (b.total ?? 0) - (a.total ?? 0)
   );
 
@@ -225,90 +239,99 @@ function VaultSnapshotPanel({ depositories }) {
   const METRIC_LABELS = { total: "Total", registered: "Registered", eligible: "Eligible" };
 
   return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">Per-Vault Snapshot — Today</div>
+    <div className="comex-panel comex-panel--vault-snapshot">
+      <div className="comex-panel-header">{headerLabel}</div>
       <div className="comex-panel-note">
         Sorted by total descending. Δ columns vs previous day. Green = increase, red = decrease.
+        {pinnedDate && " Pinned from a hovered Delivery Behavior date — hover away to return to today."}
       </div>
 
-      {/* Pie chart */}
-      <div className="comex-vault-pie-row">
-        <div className="comex-pie-metric-selector">
-          {Object.entries(METRIC_LABELS).map(([k, label]) => (
-            <button
-              key={k}
-              className={`comex-range-btn${pieMetric === k ? " comex-range-btn--active" : ""}`}
-              onClick={() => setPieMetric(k)}
-            >
-              {label}
-            </button>
-          ))}
+      <div className="comex-vault-snapshot-body">
+        {overlayMessage && (
+          <div className="comex-vault-snapshot-overlay">
+            <div className="comex-empty">{overlayMessage}</div>
+          </div>
+        )}
+
+        {/* Pie chart */}
+        <div className="comex-vault-pie-row">
+          <div className="comex-pie-metric-selector">
+            {Object.entries(METRIC_LABELS).map(([k, label]) => (
+              <button
+                key={k}
+                className={`comex-range-btn${pieMetric === k ? " comex-range-btn--active" : ""}`}
+                onClick={() => setPieMetric(k)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <ResponsiveContainer width="100%" height={300}>
+            <PieChart>
+              <Pie
+                data={pieData}
+                dataKey="value"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                outerRadius={110}
+                innerRadius={54}
+                paddingAngle={1}
+              >
+                {pieData.map((entry) => (
+                  <Cell key={entry.fullName} fill={entry.color} />
+                ))}
+              </Pie>
+              <Tooltip
+                contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                formatter={(v, _, props) => [fmt_oz(v), props.payload.fullName]}
+              />
+              <Legend
+                formatter={(_, entry) => (
+                  <span style={{ color: "#8a94a6", fontSize: 11 }}>{entry.payload.name}</span>
+                )}
+              />
+            </PieChart>
+          </ResponsiveContainer>
         </div>
-        <ResponsiveContainer width="100%" height={300}>
-          <PieChart>
-            <Pie
-              data={pieData}
-              dataKey="value"
-              nameKey="name"
-              cx="50%"
-              cy="50%"
-              outerRadius={110}
-              innerRadius={54}
-              paddingAngle={1}
-            >
-              {pieData.map((entry) => (
-                <Cell key={entry.fullName} fill={entry.color} />
-              ))}
-            </Pie>
-            <Tooltip
-              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-              formatter={(v, _, props) => [fmt_oz(v), props.payload.fullName]}
-            />
-            <Legend
-              formatter={(_, entry) => (
-                <span style={{ color: "#8a94a6", fontSize: 11 }}>{entry.payload.name}</span>
-              )}
-            />
-          </PieChart>
-        </ResponsiveContainer>
-      </div>
 
-      {/* Table */}
-      <div className="comex-table-wrap">
-        <table className="comex-table">
-          <thead>
-            <tr>
-              <th>Depository</th>
-              <th className="right">Registered</th>
-              <th className="right">Eligible</th>
-              <th className="right">Total</th>
-              <th className="right">Δ Registered</th>
-              <th className="right">Δ Eligible</th>
-              <th className="right">Δ Total</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => {
-              const dReg = r.registered != null && r.prevRegistered != null
-                ? r.registered - r.prevRegistered : null;
-              const dElig = r.eligible != null && r.prevEligible != null
-                ? r.eligible - r.prevEligible : null;
-              const dTotal = r.total != null && r.prevTotal != null
-                ? r.total - r.prevTotal : null;
-              return (
-                <tr key={r.depository}>
-                  <td className="comex-vault-name">{r.depository}</td>
-                  <td className="right">{fmt_oz(r.registered)}</td>
-                  <td className="right">{fmt_oz(r.eligible)}</td>
-                  <td className="right comex-total-col">{fmt_oz(r.total)}</td>
-                  <td className={`right ${delta_class(dReg)}`}>{delta_str(dReg)}</td>
-                  <td className={`right ${delta_class(dElig)}`}>{delta_str(dElig)}</td>
-                  <td className={`right ${delta_class(dTotal)}`}>{delta_str(dTotal)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        {/* Table */}
+        <div className="comex-table-wrap">
+          <table className="comex-table">
+            <thead>
+              <tr>
+                <th>Depository</th>
+                <th className="right">Registered</th>
+                <th className="right">Eligible</th>
+                <th className="right">Total</th>
+                <th className="right">Δ Registered</th>
+                <th className="right">Δ Eligible</th>
+                <th className="right">Δ Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const dReg = r.registered != null && r.prevRegistered != null
+                  ? r.registered - r.prevRegistered : null;
+                const dElig = r.eligible != null && r.prevEligible != null
+                  ? r.eligible - r.prevEligible : null;
+                const dTotal = r.total != null && r.prevTotal != null
+                  ? r.total - r.prevTotal : null;
+                return (
+                  <tr key={r.depository}>
+                    <td className="comex-vault-name">{r.depository}</td>
+                    <td className="right">{fmt_oz(r.registered)}</td>
+                    <td className="right">{fmt_oz(r.eligible)}</td>
+                    <td className="right comex-total-col">{fmt_oz(r.total)}</td>
+                    <td className={`right ${delta_class(dReg)}`}>{delta_str(dReg)}</td>
+                    <td className={`right ${delta_class(dElig)}`}>{delta_str(dElig)}</td>
+                    <td className={`right ${delta_class(dTotal)}`}>{delta_str(dTotal)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -813,6 +836,39 @@ export default function ComexInventoryDashboard() {
   const [fetchError, setFetchError] = useState(null);
   const timerRef = useRef(null);
 
+  // Hovering a Delivery Behavior reclassification row pins VaultSnapshotPanel
+  // to that date's per-depository snapshot instead of today's. Separate from
+  // `depositories` (today's data, polled) so returning to "today" doesn't
+  // require a re-fetch.
+  const [pinnedDate, setPinnedDate] = useState(null);
+  const [pinnedDepositories, setPinnedDepositories] = useState(null);
+  const [pinnedLoading, setPinnedLoading] = useState(false);
+  const pinnedRequestRef = useRef(0);
+
+  const handleHoverDate = useCallback((date) => {
+    setPinnedDate(date);
+    if (!date) {
+      setPinnedLoading(false);
+      return;
+    }
+    const requestId = ++pinnedRequestRef.current;
+    setPinnedLoading(true);
+    fetch(`/api/silver/db/depositories?date=${date}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((json) => {
+        if (pinnedRequestRef.current === requestId) {
+          setPinnedDepositories(json);
+          setPinnedLoading(false);
+        }
+      })
+      .catch(() => {
+        if (pinnedRequestRef.current === requestId) {
+          setPinnedDepositories({ data: [] });
+          setPinnedLoading(false);
+        }
+      });
+  }, []);
+
   const fetchAll = useCallback(async () => {
     setFetchError(null);
 
@@ -892,7 +948,18 @@ export default function ComexInventoryDashboard() {
           <details className="collapsible-pane">
             <summary className="collapsible-pane-title">COMEX — New York</summary>
             <div className="collapsible-pane-body">
-              <VaultSnapshotPanel depositories={depositories} />
+              <VaultSnapshotPanel
+                depositories={depositories}
+                pinnedDate={pinnedDate}
+                pinnedDepositories={pinnedDepositories}
+                pinnedLoading={pinnedLoading}
+              />
+              <details className="collapsible-pane">
+                <summary className="collapsible-pane-title">Delivery Behavior</summary>
+                <div className="collapsible-pane-body">
+                  <DeliveryBehaviorPanel onHoverDate={handleHoverDate} />
+                </div>
+              </details>
               <details className="collapsible-pane">
                 <summary className="collapsible-pane-title">Registered vs Eligible Silver — % Available for Delivery</summary>
                 <div className="collapsible-pane-body">
@@ -903,12 +970,6 @@ export default function ComexInventoryDashboard() {
                 <summary className="collapsible-pane-title">Delivery Notices — Month to Date</summary>
                 <div className="collapsible-pane-body">
                   <DeliveryNoticesPanel delivery={delivery} />
-                </div>
-              </details>
-              <details className="collapsible-pane">
-                <summary className="collapsible-pane-title">Delivery Behavior</summary>
-                <div className="collapsible-pane-body">
-                  <DeliveryBehaviorPanel />
                 </div>
               </details>
             </div>

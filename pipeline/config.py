@@ -3,7 +3,8 @@ Central configuration — tune thresholds here without touching pipeline logic.
 """
 
 # CFTC Socrata API
-CFTC_API_BASE = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+CFTC_API_BASE = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"  # Legacy Futures-Only
+CFTC_DISAGGREGATED_API_BASE = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"  # Disaggregated Futures-Only
 SILVER_CONTRACT_CODE = "084691"
 GOLD_CONTRACT_CODE = "088691"
 

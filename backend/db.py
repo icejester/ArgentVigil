@@ -171,6 +171,17 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     ran_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cot_disaggregated (
+    report_date TEXT NOT NULL,
+    metal TEXT NOT NULL,
+    category TEXT NOT NULL,
+    long REAL,
+    short REAL,
+    spreading REAL,
+    open_interest REAL,
+    PRIMARY KEY (report_date, metal, category)
+);
 """
 
 
@@ -339,6 +350,21 @@ def get_latest_depositories() -> list[dict]:
                       prev_registered, prev_eligible, prev_total
                FROM inventory_depository
                WHERE date = (SELECT MAX(date) FROM inventory_depository)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_depositories_on_date(date: str) -> list[dict]:
+    """Per-depository snapshot for an exact persisted date, or [] if none was
+    ever persisted for it (inventory_depository only accumulates from whenever
+    the depositories fetch first ran, no historical backfill)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, depository, registered, eligible, total,
+                      prev_registered, prev_eligible, prev_total
+               FROM inventory_depository
+               WHERE date = ?""",
+            (date,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -573,6 +599,28 @@ def insert_gold_rows(rows: list[dict]):
                VALUES (:report_date, :noncomm_long, :noncomm_short, :open_interest, :net_long, :net_long_pct_oi)""",
             rows,
         )
+
+
+def insert_disaggregated_rows(rows: list[dict]):
+    """Append-only: a CFTC report for a given (date, metal, category) is never
+    overwritten, same convention as insert_silver_rows/insert_gold_rows."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO cot_disaggregated
+               (report_date, metal, category, long, short, spreading, open_interest)
+               VALUES (:report_date, :metal, :category, :long, :short, :spreading, :open_interest)""",
+            rows,
+        )
+
+
+def get_disaggregated_series(metal: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT report_date, category, long, short, spreading, open_interest
+               FROM cot_disaggregated WHERE metal = ? ORDER BY report_date""",
+            (metal,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def upsert_prices(ticker: str, prices: dict[str, float]):

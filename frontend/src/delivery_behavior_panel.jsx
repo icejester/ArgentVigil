@@ -12,6 +12,21 @@ import {
 } from "recharts";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 
+function fmt_oz(v) {
+  if (v == null) return "—";
+  return v.toLocaleString(undefined, { maximumFractionDigits: 0 }) + " oz";
+}
+
+function TotalDeltaCell({ delta }) {
+  if (delta == null || delta === 0) return <span className="comex-delta-flat">—</span>;
+  const up = delta > 0;
+  return (
+    <span className={up ? "comex-delta-pos" : "comex-delta-neg"}>
+      {up ? "▲" : "▼"} {fmt_oz(Math.abs(delta))}
+    </span>
+  );
+}
+
 function DeficitContextChart({ rows }) {
   return (
     <ResponsiveContainer width="100%" height={220}>
@@ -38,7 +53,7 @@ function DeficitContextChart({ rows }) {
   );
 }
 
-function ReclassificationTable({ reclassification }) {
+function ReclassificationTable({ reclassification, hoverable, onHoverDate }) {
   if (!reclassification.available) {
     return (
       <div className="comex-empty">
@@ -67,22 +82,41 @@ function ReclassificationTable({ reclassification }) {
         stopped) covered less than 10% of that increase — consistent with reclassification
         of existing eligible stock rather than fresh metal arriving. Structural fact, not an
         implication of wrongdoing. {coverageNote}
+        {hoverable && " Hover a row to see the COMEX per-vault snapshot as of that date."}
       </div>
       <div className="comex-table-wrap">
         <table className="comex-table">
           <thead>
             <tr>
               <th>Date</th>
-              <th>Registered Δ (oz)</th>
-              <th>Delivery volume (oz)</th>
+              <th className="right">Total in vault — yesterday (oz)</th>
+              <th className="right">Total in vault — today (oz)</th>
+              <th className="right">Change</th>
+              <th className="right">
+                Delivery volume (oz)
+                <span
+                  className="comex-th-hint"
+                  title="COMEX delivery notices issued + stopped that day, converted from contracts to troy oz (5,000 oz/contract). This is what the registered-inventory increase is being checked against — a small delivery volume relative to that increase is what makes a day flagged."
+                >
+                  {" "}ⓘ
+                </span>
+              </th>
             </tr>
           </thead>
-          <tbody>
+          <tbody
+            onMouseLeave={hoverable ? () => onHoverDate(null) : undefined}
+          >
             {flagged.map((d) => (
-              <tr key={d.date}>
+              <tr
+                key={d.date}
+                onMouseEnter={hoverable ? () => onHoverDate(d.date) : undefined}
+                className={hoverable ? "comex-row-hoverable" : undefined}
+              >
                 <td>{d.date}</td>
-                <td>{d.registered_delta.toLocaleString()}</td>
-                <td>{d.delivery_volume_oz.toLocaleString()}</td>
+                <td className="right">{fmt_oz(d.prev_total_oz)}</td>
+                <td className="right">{fmt_oz(d.total_oz)}</td>
+                <td className="right"><TotalDeltaCell delta={d.total_delta} /></td>
+                <td className="right">{d.delivery_volume_oz.toLocaleString()}</td>
               </tr>
             ))}
           </tbody>
@@ -117,9 +151,19 @@ function useDeliveryBehavior(metal) {
   return { data, error };
 }
 
-export default function DeliveryBehaviorPanel() {
+export default function DeliveryBehaviorPanel({ onHoverDate }) {
   const [metal, setMetal] = useState("XAG");
   const { data, error } = useDeliveryBehavior(metal);
+
+  // The COMEX per-vault snapshot panel this hover pins is silver-only (see
+  // VaultSnapshotPanel/inventory_depository) — only wire up hovering while
+  // viewing XAG, and clear any pin left over from a previous hover when the
+  // metal switches away from XAG or this panel unmounts.
+  const hoverable = Boolean(onHoverDate) && metal === "XAG";
+  useEffect(() => {
+    if (!hoverable) return;
+    return () => onHoverDate(null);
+  }, [hoverable, onHoverDate]);
 
   return (
     <>
@@ -133,7 +177,11 @@ export default function DeliveryBehaviorPanel() {
         </div>
 
         {data ? (
-          <ReclassificationTable reclassification={data.reclassification} />
+          <ReclassificationTable
+            reclassification={data.reclassification}
+            hoverable={hoverable}
+            onHoverDate={onHoverDate}
+          />
         ) : error ? (
           <div className="comex-empty">
             No data available.

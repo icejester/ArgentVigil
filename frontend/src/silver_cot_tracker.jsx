@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from "react";
 import {
   LineChart,
   Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -11,6 +13,23 @@ import {
   Legend,
 } from "recharts";
 import RefreshControls, { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import { VAULT_COLORS } from "./palette";
+
+const CATEGORY_LABELS = {
+  producer_merchant: "Producer/Merchant",
+  swap_dealer: "Swap Dealer",
+  managed_money: "Managed Money",
+  other_reportable: "Other Reportable",
+};
+
+const CATEGORY_DEFINITIONS = {
+  producer_merchant: "Commercial hedgers — mining/refining/fabricating firms hedging physical exposure. Routine.",
+  swap_dealer: "Dealers/brokers managing swap-related risk, often on behalf of clients. Mixed commercial/speculative.",
+  managed_money: "CTAs, hedge funds, and similar — the speculative-positioning crowd this app otherwise tracks.",
+  other_reportable: "Large traders not classified into the other three categories.",
+};
+
+const CATEGORY_ORDER = ["producer_merchant", "swap_dealer", "managed_money", "other_reportable"];
 
 const CROWDED_THRESHOLD = 90;
 const CAPITULATED_THRESHOLD = 10;
@@ -435,6 +454,116 @@ function LeverageSpotBadge({ prices, spotKey, label }) {
   );
 }
 
+function CategoryCompositionChart({ weeks }) {
+  const rows = weeks.map((w) => ({
+    report_date: w.report_date,
+    ...Object.fromEntries(CATEGORY_ORDER.map((c) => [c, w.long_share_pct[c] ?? null])),
+  }));
+
+  return (
+    <>
+      <ResponsiveContainer width="100%" height={260}>
+        <AreaChart data={rows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+          <XAxis
+            dataKey="report_date"
+            tickFormatter={(d) => new Date(d).toLocaleString(undefined, { month: "short", year: "2-digit" })}
+            interval="preserveStartEnd"
+            minTickGap={40}
+            tick={{ fill: "#8a94a6", fontSize: 11 }}
+          />
+          <YAxis
+            domain={[0, 100]}
+            tickFormatter={(v) => `${v}%`}
+            tick={{ fill: "#8a94a6", fontSize: 11 }}
+          />
+          <Tooltip
+            contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+            labelStyle={{ color: "#c8d0de" }}
+            formatter={(v, name) => [v != null ? v.toFixed(1) + "%" : "—", CATEGORY_LABELS[name] ?? name]}
+          />
+          {CATEGORY_ORDER.map((c, i) => (
+            <Area
+              key={c}
+              type="monotone"
+              dataKey={c}
+              stackId="1"
+              stroke={VAULT_COLORS[i]}
+              fill={VAULT_COLORS[i]}
+              fillOpacity={0.65}
+              connectNulls={false}
+            />
+          ))}
+        </AreaChart>
+      </ResponsiveContainer>
+      <div className="comex-legend-list">
+        {CATEGORY_ORDER.map((c, i) => (
+          <div className="comex-legend-item" key={c}>
+            <span className="comex-legend-swatch" style={{ background: VAULT_COLORS[i] }} />
+            <span><strong>{CATEGORY_LABELS[c]}</strong> — {CATEGORY_DEFINITIONS[c]}</span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function CategoryCompositionPanel() {
+  const [metal, setMetal] = useState("XAG");
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  const fetchData = useCallback(() => {
+    setError(null);
+    fetch(`/api/delivery-behavior/db?metal=${metal}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((j) => setData(j.data ?? null))
+      .catch((e) => setError(e.message));
+  }, [metal]);
+
+  useEffect(() => {
+    fetchData();
+    window.addEventListener(FORCE_REFRESH_EVENT, fetchData);
+    return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchData);
+  }, [fetchData]);
+
+  const composition = data?.category_composition;
+
+  return (
+    <div className="comex-panel">
+      <div className="comex-panel-header">
+        Who's Holding Long Positions
+        <select value={metal} onChange={(e) => setMetal(e.target.value)}>
+          <option value="XAG">Silver</option>
+          <option value="XAU">Gold</option>
+        </select>
+      </div>
+      <div className="flow-panel-note">
+        Share of total long open interest by CFTC trader category (Disaggregated CoT,
+        weekly). Managed Money and Other Reportable are the speculative-positioning
+        crowd; Producer/Merchant is routine commercial hedging. This does not yet cross-
+        reference First Notice Day proximity — it's a composition-over-time view, not
+        yet a "who's standing for delivery" signal.
+      </div>
+      {composition?.available === false ? (
+        <div className="comex-empty">{composition.reason}</div>
+      ) : composition?.weeks?.length > 0 ? (
+        <CategoryCompositionChart weeks={composition.weeks} />
+      ) : error ? (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">{error}</div>
+        </div>
+      ) : (
+        <div className="comex-empty">Loading…</div>
+      )}
+    </div>
+  );
+}
+
 function PaperLeveragePanel({ metal = "silver" }) {
   const { label, leverageUrl, contractOz, spotKey } = METAL_CONFIG[metal];
   const [leverageData, setLeverageData] = useState(null);
@@ -618,15 +747,30 @@ export default function SilverCoTTracker() {
             gsrSeries={data.gsr_series}
           />
 
-          <div className="metal-section-label">Silver</div>
-          <PaperLeveragePanel metal="silver" />
-          <SignalBanner latest={data.latest} windows={data.windows} metal="Silver" />
-          <SignalTrackRecord trackRecord={data.signal_track_record} />
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">Who's Holding Long Positions</summary>
+            <div className="collapsible-pane-body">
+              <CategoryCompositionPanel />
+            </div>
+          </details>
 
-          <div className="metal-section-label">Gold</div>
-          <PaperLeveragePanel metal="gold" />
-          <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
-          <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
+          <details className="collapsible-pane" open>
+            <summary className="collapsible-pane-title">Silver</summary>
+            <div className="collapsible-pane-body">
+              <PaperLeveragePanel metal="silver" />
+              <SignalBanner latest={data.latest} windows={data.windows} metal="Silver" />
+              <SignalTrackRecord trackRecord={data.signal_track_record} />
+            </div>
+          </details>
+
+          <details className="collapsible-pane" open>
+            <summary className="collapsible-pane-title">Gold</summary>
+            <div className="collapsible-pane-body">
+              <PaperLeveragePanel metal="gold" />
+              <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
+              <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
+            </div>
+          </details>
         </div>
       </details>
     </div>

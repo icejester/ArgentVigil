@@ -347,8 +347,8 @@ async def silver_depositories():
 
 
 @app.get("/api/silver/db/depositories")
-async def silver_db_depositories():
-    rows = db.get_latest_depositories()
+async def silver_db_depositories(date: str | None = Query(None)):
+    rows = db.get_depositories_on_date(date) if date else db.get_latest_depositories()
     return {"success": True, "data": rows}
 
 
@@ -761,6 +761,7 @@ async def silver_market_balance():
 async def delivery_behavior_db(metal: str = Query("XAG")):
     metal = metal.upper()
     reclassification = delivery_behavior.compute_reclassification_signal(metal, limit=180)
+    category_composition = delivery_behavior.compute_category_composition(metal, limit=104)
 
     try:
         with open(MARKET_BALANCE_PATH) as f:
@@ -773,6 +774,7 @@ async def delivery_behavior_db(metal: str = Query("XAG")):
         "success": True,
         "data": {
             "reclassification": reclassification,
+            "category_composition": category_composition,
             "deficit_context": deficit_context,
         },
     }

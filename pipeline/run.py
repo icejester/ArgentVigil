@@ -18,11 +18,50 @@ sys.path.insert(0, _REPO_ROOT)      # for `from backend import db` — backend/ 
                                      # bare `python3`.
 
 from backend import db
-from fetch import fetch_cot_data, fetch_gold_cot_data
+from fetch import (
+    fetch_cot_data,
+    fetch_gold_cot_data,
+    fetch_disaggregated_cot_data,
+    fetch_gold_disaggregated_cot_data,
+)
 from price_fetch import fetch_silver_prices, fetch_gold_prices, fetch_spot_prices
 from compute import parse_and_compute, compute_signal_track_record
 
 _CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache", "cot_data.json")
+
+# Disaggregated report's four trader categories, and the raw column-name
+# suffixes CFTC uses for each (long/short are shared across categories;
+# spreading only applies to swap/managed-money/other-reportable, not
+# producer/merchant, which never carries a spread position).
+_DISAGGREGATED_CATEGORIES = {
+    "producer_merchant": ("prod_merc_positions_long", "prod_merc_positions_short", None),
+    "swap_dealer": ("swap_positions_long_all", "swap__positions_short_all", "swap__positions_spread_all"),
+    "managed_money": ("m_money_positions_long_all", "m_money_positions_short_all", "m_money_positions_spread"),
+    "other_reportable": ("other_rept_positions_long", "other_rept_positions_short", "other_rept_positions_spread"),
+}
+
+
+def _disaggregated_rows_for_db(metal: str, raw_rows: list[dict]) -> list[dict]:
+    out = []
+    for row in raw_rows:
+        try:
+            date_str = row["report_date_as_yyyy_mm_dd"][:10]
+            oi = float(row.get("open_interest_all") or 0)
+        except (KeyError, ValueError):
+            continue
+        if oi <= 0:
+            continue
+        for category, (long_key, short_key, spread_key) in _DISAGGREGATED_CATEGORIES.items():
+            out.append({
+                "report_date": date_str,
+                "metal": metal,
+                "category": category,
+                "long": float(row.get(long_key) or 0),
+                "short": float(row.get(short_key) or 0),
+                "spreading": float(row.get(spread_key) or 0) if spread_key else None,
+                "open_interest": oi,
+            })
+    return out
 
 
 def _rows_for_db(raw_rows: list[dict]) -> list[dict]:
@@ -110,6 +149,13 @@ def main():
     gold, gold_prices = _run_metal("Gold", fetch_gold_cot_data, fetch_gold_prices, db.insert_gold_rows)
     db.upsert_prices("SLV", silver_prices)
     db.upsert_prices("GLD", gold_prices)
+
+    print("\n  [Disaggregated] Fetching silver...")
+    silver_disagg = fetch_disaggregated_cot_data()
+    db.insert_disaggregated_rows(_disaggregated_rows_for_db("XAG", silver_disagg))
+    print(f"  [Disaggregated] Fetching gold...")
+    gold_disagg = fetch_gold_disaggregated_cot_data()
+    db.insert_disaggregated_rows(_disaggregated_rows_for_db("XAU", gold_disagg))
 
     print("\n  [GSR] Fetching spot prices (GC=F, SI=F)...")
     gold_spot = fetch_spot_prices("GC=F", years=8)
