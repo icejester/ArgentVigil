@@ -14,6 +14,7 @@ load_dotenv()
 
 from . import catcor
 from . import db
+from . import delivery_behavior
 from .mc_token import authed_headers
 from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
@@ -183,6 +184,16 @@ async def _refresh_fast_tier() -> dict:
 
 async def _refresh_slow_tier() -> dict:
     succeeded, failed, errors = 0, 0, []
+    # _fetch_and_persist_delivery defaults to type="mtd", but confirmed live
+    # against metalcharts.org that type="ytd" returns a superset (~85 days
+    # back to the start of the year vs. mtd's handful of days-in-month) at
+    # no extra cost — using ytd here means delivery_notices actually
+    # accumulates useful history instead of resetting to a few days every
+    # month, which is what the Delivery Behavior reclassification signal
+    # (backend/delivery_behavior.py) needs to have any real coverage.
+    async def _fetch_and_persist_delivery_ytd():
+        return await _fetch_and_persist_delivery(type="ytd")
+
     for fn in (
         _fetch_and_persist_silver_history,
         _fetch_and_persist_gold_history,
@@ -190,7 +201,7 @@ async def _refresh_slow_tier() -> dict:
         _fetch_and_persist_gold_depositories,
         _fetch_and_persist_silver_leverage,
         _fetch_and_persist_gold_leverage,
-        _fetch_and_persist_delivery,
+        _fetch_and_persist_delivery_ytd,
         _fetch_and_persist_shfe_history,
         _fetch_and_persist_shfe_warehouses,
         _fetch_and_persist_pslv,
@@ -746,6 +757,27 @@ async def silver_market_balance():
     }
 
 
+@app.get("/api/delivery-behavior/db")
+async def delivery_behavior_db(metal: str = Query("XAG")):
+    metal = metal.upper()
+    reclassification = delivery_behavior.compute_reclassification_signal(metal, limit=180)
+
+    try:
+        with open(MARKET_BALANCE_PATH) as f:
+            balance_rows = json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(500, "silver_market_balance.json not found")
+    deficit_context = delivery_behavior.compute_deficit_context(balance_rows)
+
+    return {
+        "success": True,
+        "data": {
+            "reclassification": reclassification,
+            "deficit_context": deficit_context,
+        },
+    }
+
+
 def _spot_entry_fields(entry) -> tuple[float | None, float | None]:
     if isinstance(entry, dict):
         return entry.get("price"), entry.get("changePercent24h")
@@ -815,10 +847,7 @@ async def cot_db_route():
     gsr_series = _cot_gsr_series(gc_prices, si_prices)
 
     last_run_at = db.get_last_run_at()
-    generated_at = (
-        datetime.fromisoformat(last_run_at.replace(" ", "T") + "+00:00").isoformat()
-        if last_run_at else None
-    )
+    generated_at = datetime.fromisoformat(last_run_at).isoformat() if last_run_at else None
 
     return {
         "success": True,

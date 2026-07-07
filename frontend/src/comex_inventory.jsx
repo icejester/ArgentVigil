@@ -13,6 +13,7 @@ import {
   Cell,
 } from "recharts";
 import MarketBalancePanel, { DemandCompositionPanel } from "./market_balance";
+import DeliveryBehaviorPanel from "./delivery_behavior_panel";
 import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 
@@ -902,6 +903,12 @@ export default function ComexInventoryDashboard() {
                 <summary className="collapsible-pane-title">Delivery Notices — Month to Date</summary>
                 <div className="collapsible-pane-body">
                   <DeliveryNoticesPanel delivery={delivery} />
+                </div>
+              </details>
+              <details className="collapsible-pane">
+                <summary className="collapsible-pane-title">Delivery Behavior</summary>
+                <div className="collapsible-pane-body">
+                  <DeliveryBehaviorPanel />
                 </div>
               </details>
             </div>

@@ -565,7 +565,7 @@ export default function SilverCoTTracker() {
       .then((d) => setData(d))
       .catch((e) =>
         setError(
-          `Could not load CoT data: ${e.message}. Run pipeline/run.py first (writes pipeline/cache/cot_pipeline.db).`
+          `Could not load CoT data: ${e.message}. Run pipeline/run.py first (persists to runtime/argentvigil.db).`
         )
       );
   }, []);
