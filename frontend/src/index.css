@@ -29,7 +29,9 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   cursor: pointer; list-style: none; user-select: none;
   padding: 12px 16px; font-size: 13px; font-weight: 700;
   letter-spacing: 0.08em; text-transform: uppercase; color: #c8d0de;
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
 }
+.collapsible-pane-title .staleness-label { margin-left: auto; }
 .collapsible-pane-title::-webkit-details-marker { display: none; }
 .collapsible-pane-title::before {
   content: "▸"; display: inline-block; margin-right: 8px; color: #5a6278;
@@ -41,29 +43,44 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   padding: 0 16px 16px;
 }
 
+/* ── Section nav ── */
+.section-hidden { display: none; }
+.section-nav {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+.section-nav-button {
+  background: none; border: 1px solid #2e3547; border-radius: 4px;
+  padding: 6px 14px; font-size: 12px; font-weight: 600; color: #8a94a6;
+  cursor: pointer; letter-spacing: 0.05em; text-transform: uppercase;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.section-nav-button:hover { border-color: #4a5268; color: #c8d0de; }
+.section-nav-button--active {
+  border-color: #7b9fff; color: #7b9fff; background: #0d1428;
+}
+
 /* ── Header ── */
 .app-header { display: flex; flex-direction: column; gap: 4px; }
 .app-header--split {
-  flex-direction: row; align-items: flex-start; justify-content: space-between;
+  flex-direction: row; align-items: center; justify-content: space-between;
   gap: 16px; flex-wrap: wrap;
 }
 .app-title { font-size: 26px; font-weight: 700; letter-spacing: 0.03em; color: #e8ecf4; }
 .app-subtitle { font-size: 13px; color: #6b778d; }
 
-.collapsible-pane--config {
-  width: auto; margin-left: auto; text-align: right;
-}
-.collapsible-pane--config .collapsible-pane-body {
-  text-align: right; display: flex; flex-direction: column; align-items: flex-end;
-}
 .staleness-label {
-  margin-top: 6px;
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
   color: #8a6d3b;
   background: #1e1a10;
   border: 1px solid #3a2f14;
   border-radius: 5px;
-  padding: 6px 10px;
+  padding: 4px 8px;
   display: inline-block;
 }
 
@@ -414,6 +431,14 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-delivery-val { color: #c8d0de; font-weight: 500; }
 .comex-delivery-table { font-size: 12px; }
 .comex-delivery-table td { padding: 3px 8px; }
+
+/* Data source curl blocks */
+.data-curl-block {
+  background: #0f1117; border: 1px solid #1e2333; border-radius: 5px;
+  padding: 10px 12px; overflow-x: auto; font-size: 11px; line-height: 1.6;
+  color: #a8b4c8;
+}
+.data-curl-block code { font-size: 11px; white-space: pre; }
 
 /* Empty states */
 .comex-empty { color: #3e4860; font-size: 12px; padding: 20px 0; text-align: center; }

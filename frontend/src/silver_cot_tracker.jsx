@@ -12,7 +12,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import RefreshControls, { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
 
 const CATEGORY_LABELS = {
@@ -44,7 +44,7 @@ const WEEKDAY_NAMES = [
   "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 ];
 
-function StalenessLabel({ cotAsOfDate, generatedAt }) {
+function StalenessLabel({ cotAsOfDate }) {
   const asOf = cotAsOfDate ?? "unknown";
   // CoT report: data as of Tuesday, published ~3 days later (Friday)
   const asOfDate = asOf !== "unknown" ? new Date(asOf + "T00:00:00Z") : null;
@@ -56,20 +56,14 @@ function StalenessLabel({ cotAsOfDate, generatedAt }) {
   const publishedStr = publishedDate
     ? publishedDate.toISOString().slice(0, 10)
     : "unknown";
-  const fetchedStr = generatedAt
-    ? new Date(generatedAt).toISOString().slice(0, 16).replace("T", " ") + " UTC"
-    : "unknown";
 
   return (
-    <div className="staleness-label">
-      <span>
-        CoT data as of <strong>{asOf}</strong>
-        {asOfWeekday ? ` (${asOfWeekday})` : ""} · published ~
-        <strong>{publishedStr}</strong>
-        {publishedWeekday ? ` (${publishedWeekday})` : ""} · pipeline run{" "}
-        <strong>{fetchedStr}</strong>
-      </span>
-    </div>
+    <span className="staleness-label">
+      CoT data as of <strong>{asOf}</strong>
+      {asOfWeekday ? ` (${asOfWeekday})` : ""} · published ~
+      <strong>{publishedStr}</strong>
+      {publishedWeekday ? ` (${publishedWeekday})` : ""}
+    </span>
   );
 }
 
@@ -717,44 +711,26 @@ export default function SilverCoTTracker() {
 
   return (
     <div className="app-shell">
-      <div className="app-header app-header--split">
-        <div>
-          <div className="app-title">ArgentVigil</div>
-          <div className="app-subtitle">
-            Silver Market Observability Platform
-          </div>
-        </div>
-        <details className="collapsible-pane collapsible-pane--config">
-          <summary className="collapsible-pane-title">Configuration</summary>
-          <div className="collapsible-pane-body">
-            <RefreshControls />
-          </div>
-        </details>
-      </div>
-
       <details className="collapsible-pane" open>
         <summary className="collapsible-pane-title">
-          Positioning Extremes / Speculative Crowding
+          <span>Positioning Extremes / Speculative Crowding</span>
+          <StalenessLabel cotAsOfDate={data.cot_as_of_date} />
         </summary>
         <div className="collapsible-pane-body">
-          <StalenessLabel
-            cotAsOfDate={data.cot_as_of_date}
-            generatedAt={data.generated_at}
-          />
           <CombinedChart
             silverSeries={data.series}
             goldSeries={data.gold?.series}
             gsrSeries={data.gsr_series}
           />
 
-          <details className="collapsible-pane">
+          <details className="collapsible-pane" open>
             <summary className="collapsible-pane-title">Who's Holding Long Positions</summary>
             <div className="collapsible-pane-body">
               <CategoryCompositionPanel />
             </div>
           </details>
 
-          <details className="collapsible-pane" open>
+          <details className="collapsible-pane">
             <summary className="collapsible-pane-title">Silver</summary>
             <div className="collapsible-pane-body">
               <PaperLeveragePanel metal="silver" />
@@ -763,7 +739,7 @@ export default function SilverCoTTracker() {
             </div>
           </details>
 
-          <details className="collapsible-pane" open>
+          <details className="collapsible-pane">
             <summary className="collapsible-pane-title">Gold</summary>
             <div className="collapsible-pane-body">
               <PaperLeveragePanel metal="gold" />
