@@ -182,6 +182,17 @@ CREATE TABLE IF NOT EXISTS cot_disaggregated (
     open_interest REAL,
     PRIMARY KEY (report_date, metal, category)
 );
+
+CREATE TABLE IF NOT EXISTS forexfactory_calendar (
+    week_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    country TEXT NOT NULL,
+    event_date TEXT NOT NULL,
+    impact TEXT,
+    forecast TEXT,
+    previous TEXT,
+    PRIMARY KEY (week_key, title, country, event_date)
+);
 """
 
 
@@ -619,6 +630,41 @@ def get_disaggregated_series(metal: str) -> list[dict]:
             """SELECT report_date, category, long, short, spreading, open_interest
                FROM cot_disaggregated WHERE metal = ? ORDER BY report_date""",
             (metal,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def insert_forexfactory_rows(rows: list[dict]):
+    """Append-only: ForexFactory's "this week" feed for a given calendar week
+    is a historical fact once fetched (the live endpoint only ever serves the
+    CURRENT week, so once a week_key has passed there's no way to re-fetch it
+    even if we wanted to — capture it once and keep it)."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO forexfactory_calendar
+               (week_key, title, country, event_date, impact, forecast, previous)
+               VALUES (:week_key, :title, :country, :event_date, :impact, :forecast, :previous)""",
+            rows,
+        )
+
+
+def has_forexfactory_week(week_key: str) -> bool:
+    """Whether the feed has already been fetched for this calendar week —
+    used to decide whether fetch_and_persist_consensus needs to hit
+    ForexFactory's rate-limited endpoint at all."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM forexfactory_calendar WHERE week_key = ? LIMIT 1", (week_key,)
+        ).fetchone()
+        return row is not None
+
+
+def get_forexfactory_week(week_key: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT title, country, event_date, impact, forecast, previous
+               FROM forexfactory_calendar WHERE week_key = ?""",
+            (week_key,),
         ).fetchall()
         return [dict(r) for r in rows]
 
