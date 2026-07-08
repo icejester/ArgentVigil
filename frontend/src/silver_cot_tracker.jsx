@@ -12,7 +12,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import RefreshControls, { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
 
 const CATEGORY_LABELS = {
@@ -44,7 +44,7 @@ const WEEKDAY_NAMES = [
   "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 ];
 
-function StalenessLabel({ cotAsOfDate, generatedAt }) {
+function StalenessLabel({ cotAsOfDate }) {
   const asOf = cotAsOfDate ?? "unknown";
   // CoT report: data as of Tuesday, published ~3 days later (Friday)
   const asOfDate = asOf !== "unknown" ? new Date(asOf + "T00:00:00Z") : null;
@@ -56,20 +56,14 @@ function StalenessLabel({ cotAsOfDate, generatedAt }) {
   const publishedStr = publishedDate
     ? publishedDate.toISOString().slice(0, 10)
     : "unknown";
-  const fetchedStr = generatedAt
-    ? new Date(generatedAt).toISOString().slice(0, 16).replace("T", " ") + " UTC"
-    : "unknown";
 
   return (
-    <div className="staleness-label">
-      <span>
-        CoT data as of <strong>{asOf}</strong>
-        {asOfWeekday ? ` (${asOfWeekday})` : ""} · published ~
-        <strong>{publishedStr}</strong>
-        {publishedWeekday ? ` (${publishedWeekday})` : ""} · pipeline run{" "}
-        <strong>{fetchedStr}</strong>
-      </span>
-    </div>
+    <span className="staleness-label">
+      CoT data as of <strong>{asOf}</strong>
+      {asOfWeekday ? ` (${asOfWeekday})` : ""} · published ~
+      <strong>{publishedStr}</strong>
+      {publishedWeekday ? ` (${publishedWeekday})` : ""}
+    </span>
   );
 }
 
@@ -564,6 +558,115 @@ function CategoryCompositionPanel() {
   );
 }
 
+const PRICE_HISTORY_WINDOWS = [
+  { label: "6H", hours: 6 },
+  { label: "12H", hours: 12 },
+  { label: "24H", hours: 24 },
+  { label: "48H", hours: 48 },
+  { label: "1M", hours: 24 * 30 },
+  { label: "3M", hours: 24 * 90 },
+  { label: "6M", hours: 24 * 180 },
+  { label: "12M", hours: 24 * 365 },
+];
+// ticks are date-only past this many hours — hour:minute stops being
+// meaningful once the window spans multiple days.
+const DATE_ONLY_TICKS_ABOVE_HOURS = 48;
+
+function PriceHistoryChart({ spotKey, label }) {
+  const [hours, setHours] = useState(6);
+  const [ticks, setTicks] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTicks(null);
+    fetch(`/api/prices/db/ticks?series_id=${spotKey}&hours=${hours}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((j) => {
+        if (!cancelled) setTicks(j.data ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setTicks([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [spotKey, hours]);
+
+  const windowButtons = (
+    <div className="comex-range-selector">
+      {PRICE_HISTORY_WINDOWS.map((w) => (
+        <button
+          key={w.hours}
+          type="button"
+          className={`comex-range-btn${hours === w.hours ? " comex-range-btn--active" : ""}`}
+          onClick={() => setHours(w.hours)}
+        >
+          {w.label}
+        </button>
+      ))}
+    </div>
+  );
+
+  const activeWindowLabel = PRICE_HISTORY_WINDOWS.find((w) => w.hours === hours)?.label ?? `${hours}h`;
+  const dateOnly = hours > DATE_ONLY_TICKS_ABOVE_HOURS;
+
+  if (ticks == null) return null;
+  if (ticks.length < 2) {
+    return (
+      <div className="comex-chart-block">
+        <div className="comex-chart-subheader">{label} — Last {activeWindowLabel} ({spotKey})</div>
+        {windowButtons}
+        <div className="comex-empty comex-empty-note">
+          Not enough intraday history yet to chart {label}'s {activeWindowLabel} price — this
+          fills in as the background price refresh runs (every 60s).
+        </div>
+      </div>
+    );
+  }
+
+  const rows = ticks.map((t) => ({ ts: new Date(t.ts).getTime(), price: t.price }));
+
+  return (
+    <div className="comex-chart-block">
+      <div className="comex-chart-subheader">{label} — Last {activeWindowLabel} ({spotKey})</div>
+      {windowButtons}
+      <ResponsiveContainer width="100%" height={160}>
+        <LineChart data={rows} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1e2333" />
+          <XAxis
+            dataKey="ts"
+            type="number"
+            domain={["dataMin", "dataMax"]}
+            tickFormatter={(v) =>
+              dateOnly
+                ? new Date(v).toLocaleDateString([], { month: "short", day: "numeric" })
+                : new Date(v).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            }
+            stroke="#5a6278"
+            fontSize={11}
+          />
+          <YAxis
+            domain={["auto", "auto"]}
+            tickFormatter={(v) => `$${v.toFixed(2)}`}
+            stroke="#5a6278"
+            fontSize={11}
+            width={60}
+          />
+          <Tooltip
+            labelFormatter={(v) => new Date(v).toLocaleString()}
+            formatter={(v) => [`$${Number(v).toFixed(2)}`, label]}
+            contentStyle={{ background: "#141820", border: "1px solid #2e3547", fontSize: 12 }}
+          />
+          <Line type="monotone" dataKey="price" stroke="#7b9fff" dot={false} strokeWidth={1.5} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 function PaperLeveragePanel({ metal = "silver" }) {
   const { label, leverageUrl, contractOz, spotKey } = METAL_CONFIG[metal];
   const [leverageData, setLeverageData] = useState(null);
@@ -630,13 +733,7 @@ function PaperLeveragePanel({ metal = "silver" }) {
             <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
             <span>As of: <strong>{date}</strong></span>
           </div>
-          <div className="comex-leverage-note">
-            {leverage >= 10
-              ? "⚠ Extreme paper leverage — registered inventory is thinly covered."
-              : leverage >= 5
-              ? "Elevated paper leverage — watch registered inventory levels."
-              : "Paper leverage within normal range."}
-          </div>
+          <PriceHistoryChart spotKey={spotKey} label={label} />
         </div>
       ) : (
         <div className="comex-empty">
@@ -717,30 +814,12 @@ export default function SilverCoTTracker() {
 
   return (
     <div className="app-shell">
-      <div className="app-header app-header--split">
-        <div>
-          <div className="app-title">ArgentVigil</div>
-          <div className="app-subtitle">
-            Silver Market Observability Platform
-          </div>
-        </div>
-        <details className="collapsible-pane collapsible-pane--config">
-          <summary className="collapsible-pane-title">Configuration</summary>
-          <div className="collapsible-pane-body">
-            <RefreshControls />
-          </div>
-        </details>
-      </div>
-
       <details className="collapsible-pane" open>
         <summary className="collapsible-pane-title">
-          Positioning Extremes / Speculative Crowding
+          <span>Positioning Extremes / Speculative Crowding</span>
+          <StalenessLabel cotAsOfDate={data.cot_as_of_date} />
         </summary>
         <div className="collapsible-pane-body">
-          <StalenessLabel
-            cotAsOfDate={data.cot_as_of_date}
-            generatedAt={data.generated_at}
-          />
           <CombinedChart
             silverSeries={data.series}
             goldSeries={data.gold?.series}
@@ -748,13 +827,6 @@ export default function SilverCoTTracker() {
           />
 
           <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">Who's Holding Long Positions</summary>
-            <div className="collapsible-pane-body">
-              <CategoryCompositionPanel />
-            </div>
-          </details>
-
-          <details className="collapsible-pane" open>
             <summary className="collapsible-pane-title">Silver</summary>
             <div className="collapsible-pane-body">
               <PaperLeveragePanel metal="silver" />
@@ -763,12 +835,19 @@ export default function SilverCoTTracker() {
             </div>
           </details>
 
-          <details className="collapsible-pane" open>
+          <details className="collapsible-pane">
             <summary className="collapsible-pane-title">Gold</summary>
             <div className="collapsible-pane-body">
               <PaperLeveragePanel metal="gold" />
               <SignalBanner latest={data.gold?.latest} windows={data.gold?.windows} metal="Gold" />
               <SignalTrackRecord trackRecord={data.gold?.signal_track_record} />
+            </div>
+          </details>
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">Who's Holding Long Positions</summary>
+            <div className="collapsible-pane-body">
+              <CategoryCompositionPanel />
             </div>
           </details>
         </div>

@@ -3,6 +3,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from typing import Awaitable, Callable
 
 import httpx
 from dotenv import load_dotenv
@@ -13,9 +14,11 @@ from fastapi.staticfiles import StaticFiles
 load_dotenv()
 
 from . import catcor
+from . import catcor_research
 from . import db
 from . import delivery_behavior
 from .mc_token import authed_headers
+from pipeline import run as pipeline_run
 from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
     FRED_FETCH_YEARS,
@@ -49,14 +52,15 @@ _client: httpx.AsyncClient | None = None
 
 # Tiered background refresh: fast tier = genuinely intraday data (spot prices);
 # slow tier = everything else main.py manages (moves at most daily upstream).
-# Both tiers default OFF — startup does one fetch to populate the DB, then
-# each tier's recurring loop stays idle until the user opts in (or hits
-# Force update). Interval/enabled state is in-memory only — a restart
-# re-triggers the one-time startup refresh anyway.
+# Fast tier defaults ON at 60s (spot prices are cheap and genuinely move
+# intraday); slow tier defaults OFF — startup does one fetch to populate the
+# DB either way, then slow tier's recurring loop stays idle until the user
+# opts in (or hits Force update). Interval/enabled state is in-memory only —
+# a restart re-triggers the one-time startup refresh anyway.
 _refresh_settings = {
     "fast_interval_s": 60,
     "slow_interval_s": 1200,
-    "fast_enabled": False,
+    "fast_enabled": True,
     "slow_enabled": False,
 }
 _refresh_tasks: list[asyncio.Task] = []
@@ -136,8 +140,10 @@ async def _event_tier_loop():
         try:
             for event_id, window in catcor.due_snapshots():
                 catcor.capture_snapshot(event_id, window)
+            db.record_fetch_attempt("catcor_snapshot", success=True)
         except Exception as e:
             print(f"[catcor] warning: event tier loop: {e}")
+            db.record_fetch_attempt("catcor_snapshot", success=False, error=str(e))
 
 
 async def _consensus_tier_loop():
@@ -154,8 +160,10 @@ async def _consensus_tier_loop():
         try:
             await catcor.fetch_and_persist_consensus(_client)
             await catcor.fetch_and_persist_actuals(_client)
+            db.record_fetch_attempt("catcor_consensus_actuals", success=True)
         except Exception as e:
             print(f"[catcor] warning: consensus tier loop: {e}")
+            db.record_fetch_attempt("catcor_consensus_actuals", success=False, error=str(e))
         await asyncio.sleep(CATCOR_CONSENSUS_INTERVAL_S)
 
 
@@ -173,46 +181,45 @@ async def _slow_tier_loop():
             await _refresh_slow_tier()
 
 
+# _fetch_and_persist_delivery defaults to type="mtd", but confirmed live
+# against metalcharts.org that type="ytd" returns a superset (~85 days back
+# to the start of the year vs. mtd's handful of days-in-month) at no extra
+# cost — using ytd here means delivery_notices actually accumulates useful
+# history instead of resetting to a few days every month, which is what the
+# Delivery Behavior reclassification signal (backend/delivery_behavior.py)
+# needs to have any real coverage. Module-level (not a closure inside
+# _refresh_slow_tier) so _SOURCE_REGISTRY can reference it directly.
+async def _fetch_and_persist_delivery_ytd():
+    return await _fetch_and_persist_delivery(type="ytd")
+
+
 async def _refresh_fast_tier() -> dict:
-    try:
-        await _fetch_and_persist_prices()
-        return {"succeeded": 1, "failed": 0, "errors": []}
-    except Exception as e:
-        print(f"[refresh:fast] warning: {e}")
-        return {"succeeded": 0, "failed": 1, "errors": [str(e)]}
+    succeeded, failed, errors = 0, 0, []
+    for source_key, fn in _FAST_TIER_REGISTRY.items():
+        try:
+            await fn()
+            db.record_fetch_attempt(source_key, success=True)
+            succeeded += 1
+        except Exception as e:
+            print(f"[refresh:fast] warning ({source_key}): {e}")
+            db.record_fetch_attempt(source_key, success=False, error=str(e))
+            failed += 1
+            errors.append(f"{source_key}: {e}")
+    return {"succeeded": succeeded, "failed": failed, "errors": errors}
 
 
 async def _refresh_slow_tier() -> dict:
     succeeded, failed, errors = 0, 0, []
-    # _fetch_and_persist_delivery defaults to type="mtd", but confirmed live
-    # against metalcharts.org that type="ytd" returns a superset (~85 days
-    # back to the start of the year vs. mtd's handful of days-in-month) at
-    # no extra cost — using ytd here means delivery_notices actually
-    # accumulates useful history instead of resetting to a few days every
-    # month, which is what the Delivery Behavior reclassification signal
-    # (backend/delivery_behavior.py) needs to have any real coverage.
-    async def _fetch_and_persist_delivery_ytd():
-        return await _fetch_and_persist_delivery(type="ytd")
-
-    for fn in (
-        _fetch_and_persist_silver_history,
-        _fetch_and_persist_gold_history,
-        _fetch_and_persist_silver_depositories,
-        _fetch_and_persist_gold_depositories,
-        _fetch_and_persist_silver_leverage,
-        _fetch_and_persist_gold_leverage,
-        _fetch_and_persist_delivery_ytd,
-        _fetch_and_persist_shfe_history,
-        _fetch_and_persist_shfe_warehouses,
-        _fetch_and_persist_pslv,
-    ):
+    for source_key, fn in _SLOW_TIER_REGISTRY.items():
         try:
             await fn()
+            db.record_fetch_attempt(source_key, success=True)
             succeeded += 1
         except Exception as e:
-            print(f"[refresh:slow] warning ({fn.__name__}): {e}")
+            print(f"[refresh:slow] warning ({source_key}): {e}")
+            db.record_fetch_attempt(source_key, success=False, error=str(e))
             failed += 1
-            errors.append(f"{fn.__name__}: {e}")
+            errors.append(f"{source_key}: {e}")
     return {"succeeded": succeeded, "failed": failed, "errors": errors}
 
 
@@ -849,7 +856,17 @@ async def cot_db_route():
     gsr_series = _cot_gsr_series(gc_prices, si_prices)
 
     last_run_at = db.get_last_run_at()
-    generated_at = datetime.fromisoformat(last_run_at).isoformat() if last_run_at else None
+    generated_at = None
+    if last_run_at:
+        # pipeline/run.py stamps this via datetime.now(timezone.utc).isoformat(),
+        # which already carries a UTC offset — only naive/space-separated
+        # timestamps (e.g. a legacy row, or SQLite's own datetime('now'))
+        # need "+00:00" appended.
+        iso_str = last_run_at.replace(" ", "T")
+        has_offset = iso_str[-6] in "+-" or iso_str.endswith("Z")
+        if not has_offset:
+            iso_str += "+00:00"
+        generated_at = datetime.fromisoformat(iso_str).isoformat()
 
     return {
         "success": True,
@@ -885,6 +902,20 @@ async def prices_db():
         for series_id, row in latest.items()
     }
     return {"success": True, "data": data}
+
+
+@app.get("/api/prices/db/ticks")
+async def prices_db_ticks(series_id: str = Query("XAG"), hours: int = Query(24)):
+    """Price history for the leverage panel's price chart, spanning
+    windows from 6H to 12M. Stitches three resolutions (see
+    db.get_price_history): real 60s spot_price_tick ticks where they exist
+    (only from whenever the fast-tier refresh loop started running),
+    CATCOR's daily closes further back (~120 days), and Money Supply's
+    month-end closes beyond that (back to 2006) — so long windows show real,
+    if coarser, history instead of a gap before the tick table existed."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = db.get_price_history(series_id, since)
+    return {"success": True, "data": rows}
 
 
 @app.get("/api/refresh/settings")
@@ -969,6 +1000,7 @@ async def fred_money_supply_refresh():
         db.upsert_fred_observations(FRED_SERIES_M2, m2_rows)
         db.upsert_fred_observations(FRED_SERIES_WALCL, walcl_rows)
         db.upsert_fred_observations(FRED_SERIES_CPI, cpi_rows)
+        db.record_fetch_attempt("money_supply", success=True)
         return {
             "success": True,
             "data": {
@@ -978,6 +1010,7 @@ async def fred_money_supply_refresh():
             },
         }
     except httpx.HTTPError as e:
+        db.record_fetch_attempt("money_supply", success=False, error=str(e))
         raise HTTPException(502, str(e))
 
 
@@ -1027,9 +1060,112 @@ async def metals_prices_refresh():
             monthly = _resample_month_end(daily)
             db.upsert_fred_observations(series_id, monthly)
             result[series_id] = monthly
+        db.record_fetch_attempt("metals_prices", success=True)
         return {"success": True, "data": result}
     except httpx.HTTPError as e:
+        db.record_fetch_attempt("metals_prices", success=False, error=str(e))
         raise HTTPException(502, str(e))
+
+
+COT_MIN_REFRESH_DAYS = 7  # CFTC only publishes a new report ~weekly — no point re-pulling more often
+
+
+async def _refresh_cot_pipeline():
+    """cot_pipeline's registry entry — the only one that's a rate-limit gate
+    wrapping a call rather than a bare fetch-and-persist function. Skips
+    entirely (no CFTC request at all) if the latest persisted report is
+    still within COT_MIN_REFRESH_DAYS, recording a 'skipped' attempt rather
+    than a failure. Otherwise runs the real pipeline in a thread (it's a
+    blocking, stdlib-only sync call) via asyncio.to_thread — run_pipeline_once
+    records its own success/failure to source_health itself (see
+    pipeline/run.py), so this wrapper doesn't duplicate that."""
+    latest_report_date = db.get_latest_cot_report_date()
+    if latest_report_date:
+        days_since = (date.today() - date.fromisoformat(latest_report_date)).days
+        if days_since < COT_MIN_REFRESH_DAYS:
+            db.record_fetch_attempt(
+                "cot_pipeline",
+                success=False,
+                skipped=True,
+                error="Latest report is less than 7 days old — skipped to respect CFTC's publish cadence.",
+            )
+            return
+    await asyncio.to_thread(pipeline_run.run_pipeline_once)
+
+
+# Single source of truth for "what gets fetched, on which tier, under which
+# source_health key" — both the tiered background loops (_refresh_fast_tier/
+# _refresh_slow_tier above) and the on-demand per-source health-refresh
+# route (POST /api/health/refresh/{source_key}, below) read from this
+# registry rather than each owning their own hardcoded function list, so the
+# two paths can't drift apart. Defined here (not near the top of the file)
+# since every function it references — including the on-demand-only ones —
+# must already exist as a real name by this point.
+_FAST_TIER_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
+    "spot_prices": _fetch_and_persist_prices,
+}
+_SLOW_TIER_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
+    "comex_silver_history": _fetch_and_persist_silver_history,
+    "comex_gold_history": _fetch_and_persist_gold_history,
+    "comex_silver_depositories": _fetch_and_persist_silver_depositories,
+    "comex_gold_depositories": _fetch_and_persist_gold_depositories,
+    "silver_leverage": _fetch_and_persist_silver_leverage,
+    "gold_leverage": _fetch_and_persist_gold_leverage,
+    "delivery_notices": _fetch_and_persist_delivery_ytd,
+    "shfe_silver_history": _fetch_and_persist_shfe_history,
+    "shfe_warehouses": _fetch_and_persist_shfe_warehouses,
+    "pslv": _fetch_and_persist_pslv,
+}
+# On-demand-only sources (not part of either recurring tier), added to the
+# same registry the health-refresh route reads from, per Decision 6's "one
+# generic route, not one bespoke route per source."
+_ON_DEMAND_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
+    "money_supply": fred_money_supply_refresh,
+    "metals_prices": metals_prices_refresh,
+    "cot_pipeline": _refresh_cot_pipeline,
+}
+_SOURCE_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
+    **_FAST_TIER_REGISTRY,
+    **_SLOW_TIER_REGISTRY,
+    **_ON_DEMAND_REGISTRY,
+}
+# cot_pipeline is the one entry whose self-recording health_refresh must not
+# clobber: a skip is deliberately not a failure (see _refresh_cot_pipeline),
+# and the real run's outcome is recorded inside run_pipeline_once itself
+# (used by the CLI/cron path too, not just this route) — an outer generic
+# record_fetch_attempt call here would overwrite a genuine "skipped" with a
+# blanket "success" once _refresh_cot_pipeline returns normally either way.
+# money_supply/metals_prices also record internally, but that's a harmless
+# duplicate of the identical outcome (and skipping the record here would
+# leave their FRED_API_KEY-missing pre-check, which raises before its own
+# try/except, unrecorded) — only cot_pipeline is exempted.
+_SELF_RECORDING_KEYS = {"cot_pipeline"}
+
+
+@app.get("/api/health/db")
+async def health_db():
+    rows = {r["source_key"]: dict(r) for r in db.get_all_source_health()}
+    for source_key in rows:
+        rows[source_key].pop("source_key", None)
+    if "cot_pipeline" in rows:
+        rows["cot_pipeline"]["last_report_date"] = db.get_latest_cot_report_date()
+    return {"success": True, "sources": rows}
+
+
+@app.post("/api/health/refresh/{source_key}")
+async def health_refresh(source_key: str):
+    fn = _SOURCE_REGISTRY.get(source_key)
+    if fn is None:
+        raise HTTPException(404, f"Unknown source_key: {source_key}")
+    try:
+        await fn()
+        if source_key not in _SELF_RECORDING_KEYS:
+            db.record_fetch_attempt(source_key, success=True)
+        return {"success": True, "error": None}
+    except Exception as e:
+        if source_key not in _SELF_RECORDING_KEYS:
+            db.record_fetch_attempt(source_key, success=False, error=str(e))
+        return {"success": False, "error": str(e)}
 
 
 def _index_to_100(rows: list[dict]) -> list[dict]:
@@ -1155,6 +1291,76 @@ async def catcor_refresh():
         }
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
+
+
+# CATCOR Iteration 2 — Research Pane (backend/catcor_research.py).
+def _require_backend_credentials():
+    """Only Anthropic needs a key on AV's side — Forge is a local, unauthed
+    LAN service. Gate on the backend that will actually be used
+    (catcor_research.DEFAULT_BACKEND, driven by AI_BACKEND) rather than
+    unconditionally requiring ANTHROPIC_API_KEY, which would block the
+    Forge-default path for no reason."""
+    if catcor_research.DEFAULT_BACKEND == "anthropic" and "ANTHROPIC_API_KEY" not in os.environ:
+        raise HTTPException(500, "ANTHROPIC_API_KEY environment variable is not set")
+
+
+@app.post("/api/catcor/research/sessions")
+async def catcor_research_create_session(body: dict = Body(...)):
+    """Creates the session, then immediately runs the claim text through
+    send_message as the first turn — so this one call returns both a
+    session_id and a real first reply, matching a chat UI's expectation
+    that submitting the first message produces a response."""
+    claim_text = body.get("claim_text")
+    if not claim_text:
+        raise HTTPException(400, "claim_text is required")
+    _require_backend_credentials()
+    session_id = catcor_research.create_session(claim_text, body.get("source_url"))
+    try:
+        result = await catcor_research.send_message(_client, session_id, claim_text)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {"success": True, "data": {"session_id": session_id, **result}}
+
+
+@app.get("/api/catcor/research/evidence/db")
+async def catcor_research_evidence_dump():
+    """Every evidence tool's exact output, no Anthropic call involved — all
+    four tools are zero-argument reads of AV's own state, so this just runs
+    them directly. Lets you see exactly what data Claude has access to
+    before/without holding a conversation, at zero cost."""
+    return {"success": True, "data": catcor_research.dump_all_evidence()}
+
+
+@app.get("/api/catcor/research/sessions/db")
+async def catcor_research_list_sessions():
+    return {"success": True, "data": catcor_research.list_sessions()}
+
+
+@app.get("/api/catcor/research/sessions/{session_id}/db")
+async def catcor_research_get_session(session_id: str):
+    detail = catcor_research.get_session_detail(session_id)
+    if detail is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    return {"success": True, "data": detail}
+
+
+@app.post("/api/catcor/research/sessions/{session_id}/messages")
+async def catcor_research_send_message(session_id: str, body: dict = Body(...)):
+    _require_backend_credentials()
+    content = body.get("content")
+    if not content:
+        raise HTTPException(400, "content is required")
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        result = await catcor_research.send_message(_client, session_id, content)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {"success": True, "data": result}
 
 
 # Serve built frontend; keep last so API routes take priority

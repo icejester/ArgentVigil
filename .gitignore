@@ -223,6 +223,7 @@ runtime/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
-SPEC.MD
-SPEC.md
+*SPEC.MD
+*SPEC.md
+*spec.md
 *-spec.md

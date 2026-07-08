@@ -118,12 +118,13 @@ def seed_events(days_back: int = 90, days_forward: int = 60):
     return len(rows)
 
 
-async def _fetch_alfred_values(client: httpx.AsyncClient, series_id: str, vintage_date: str, limit: int = 1) -> list[float | None]:
+async def _fetch_alfred_observations(client: httpx.AsyncClient, series_id: str, vintage_date: str, limit: int = 1) -> list[dict]:
     """The `limit` most recent observations of series_id as known/published
     on vintage_date (ALFRED semantics: realtime_start/realtime_end pin the
-    vintage), newest first. Used with limit=2 for month-over-month change
-    series (NFP/CPI) so we can diff two consecutive vintage prints rather
-    than compare a raw level against a ForexFactory change/percent figure."""
+    vintage), newest first, as {"date": ..., "value": float | None} dicts.
+    Used with limit=2 for month-over-month change series (NFP/CPI) so we can
+    diff two consecutive vintage prints rather than compare a raw level
+    against a ForexFactory change/percent figure."""
     api_key = os.environ["FRED_API_KEY"]
     resp = await client.get(
         FRED_BASE,
@@ -141,15 +142,18 @@ async def _fetch_alfred_values(client: httpx.AsyncClient, series_id: str, vintag
     resp.raise_for_status()
     data = resp.json()
     obs = data.get("observations", [])
-    return [None if o.get("value") in (None, ".") else float(o["value"]) for o in obs]
+    return [
+        {"date": o["date"], "value": None if o.get("value") in (None, ".") else float(o["value"])}
+        for o in obs
+    ]
 
 
 async def _fetch_alfred_value(client: httpx.AsyncClient, series_id: str, vintage_date: str) -> float | None:
     """Single most recent vintage value — used where the raw level (not a
     period-over-period change) is the right comparison, if that's ever
-    needed again. Kept as a thin wrapper around _fetch_alfred_values."""
-    values = await _fetch_alfred_values(client, series_id, vintage_date, limit=1)
-    return values[0] if values else None
+    needed again. Kept as a thin wrapper around _fetch_alfred_observations."""
+    obs = await _fetch_alfred_observations(client, series_id, vintage_date, limit=1)
+    return obs[0]["value"] if obs else None
 
 
 async def _fetch_alfred_change(client: httpx.AsyncClient, series_id: str, vintage_date: str, as_percent: bool) -> float | None:
@@ -160,11 +164,20 @@ async def _fetch_alfred_change(client: httpx.AsyncClient, series_id: str, vintag
     as_percent=True computes (latest/prior - 1) * 100 (for CPIAUCSL, an
     index level where % change is the meaningful quantity); False returns
     the raw difference (for PAYEMS, already in thousands of persons, where
-    ForexFactory's "K" consensus is a raw count difference, not a percent)."""
-    values = await _fetch_alfred_values(client, series_id, vintage_date, limit=2)
-    if len(values) < 2 or values[0] is None or values[1] is None:
+    ForexFactory's "K" consensus is a raw count difference, not a percent).
+
+    Persists both raw vintage prints to fred_observations before returning
+    the diff — previously these were fetched and discarded, leaving
+    data_map.js's claim that PAYEMS/CPIAUCSL vintage data lives in
+    fred_observations false (only the *computed* actual_value survived, on
+    the event_calendar row, not the underlying observations)."""
+    obs = await _fetch_alfred_observations(client, series_id, vintage_date, limit=2)
+    real_obs = [o for o in obs if o["value"] is not None]
+    if real_obs:
+        db.upsert_fred_observations(series_id, real_obs)
+    if len(obs) < 2 or obs[0]["value"] is None or obs[1]["value"] is None:
         return None
-    latest, prior = values[0], values[1]
+    latest, prior = obs[0]["value"], obs[1]["value"]
     if as_percent:
         if prior == 0:
             return None

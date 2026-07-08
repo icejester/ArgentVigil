@@ -16,15 +16,24 @@ from config import (
 )
 
 
-def _fetch_cot_for_contract(api_base: str, contract_code: str) -> list[dict]:
+def _fetch_cot_for_contract(api_base: str, contract_code: str, since: str | None = None) -> list[dict]:
     """
-    Pull CoT records for a given contract code going back FETCH_YEARS years,
-    from whichever Socrata dataset api_base points at (Legacy or Disaggregated
-    Futures-Only — same query shape, different dataset/columns). Returns a
-    list of raw API row dicts sorted oldest-first.
+    Pull CoT records for a given contract code, from whichever Socrata
+    dataset api_base points at (Legacy or Disaggregated Futures-Only — same
+    query shape, different dataset/columns). Returns a list of raw API row
+    dicts sorted oldest-first.
+
+    since, if given (an already-persisted report_date, e.g. from
+    db.get_latest_cot_report_date()), becomes the cutoff instead of the
+    wall-clock FETCH_YEARS-back calculation — so a repeat run (including the
+    on-demand health-refresh button) fetches only what's new rather than
+    re-pulling the full multi-year history every time.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=365 * FETCH_YEARS)
-    cutoff_str = cutoff.strftime("%Y-%m-%dT00:00:00.000")
+    if since:
+        cutoff_str = f"{since}T00:00:00.000"
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=365 * FETCH_YEARS)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT00:00:00.000")
 
     # Socrata SoQL: filter by contract code and date, page through with $limit/$offset
     params = {
@@ -57,17 +66,17 @@ def _fetch_cot_for_contract(api_base: str, contract_code: str) -> list[dict]:
     return rows
 
 
-def fetch_cot_data() -> list[dict]:
-    return _fetch_cot_for_contract(CFTC_API_BASE, SILVER_CONTRACT_CODE)
+def fetch_cot_data(since: str | None = None) -> list[dict]:
+    return _fetch_cot_for_contract(CFTC_API_BASE, SILVER_CONTRACT_CODE, since=since)
 
 
-def fetch_gold_cot_data() -> list[dict]:
-    return _fetch_cot_for_contract(CFTC_API_BASE, GOLD_CONTRACT_CODE)
+def fetch_gold_cot_data(since: str | None = None) -> list[dict]:
+    return _fetch_cot_for_contract(CFTC_API_BASE, GOLD_CONTRACT_CODE, since=since)
 
 
-def fetch_disaggregated_cot_data() -> list[dict]:
-    return _fetch_cot_for_contract(CFTC_DISAGGREGATED_API_BASE, SILVER_CONTRACT_CODE)
+def fetch_disaggregated_cot_data(since: str | None = None) -> list[dict]:
+    return _fetch_cot_for_contract(CFTC_DISAGGREGATED_API_BASE, SILVER_CONTRACT_CODE, since=since)
 
 
-def fetch_gold_disaggregated_cot_data() -> list[dict]:
-    return _fetch_cot_for_contract(CFTC_DISAGGREGATED_API_BASE, GOLD_CONTRACT_CODE)
+def fetch_gold_disaggregated_cot_data(since: str | None = None) -> list[dict]:
+    return _fetch_cot_for_contract(CFTC_DISAGGREGATED_API_BASE, GOLD_CONTRACT_CODE, since=since)

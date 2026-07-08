@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(_REPO_ROOT, "runtime", "argentvigil.db")
@@ -172,6 +173,15 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     ran_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS source_health (
+    source_key          TEXT PRIMARY KEY,
+    last_attempt_at     TEXT,
+    last_attempt_status TEXT,
+    last_success_at     TEXT,
+    last_error          TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS cot_disaggregated (
     report_date TEXT NOT NULL,
     metal TEXT NOT NULL,
@@ -192,6 +202,34 @@ CREATE TABLE IF NOT EXISTS forexfactory_calendar (
     forecast TEXT,
     previous TEXT,
     PRIMARY KEY (week_key, title, country, event_date)
+);
+
+CREATE TABLE IF NOT EXISTS research_sessions (
+    session_id TEXT PRIMARY KEY,
+    claim_text TEXT NOT NULL,
+    source_url TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    user_read TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    source_url TEXT,
+    user_read TEXT NOT NULL,
+    dismissed_at TEXT NOT NULL,
+    validation_status TEXT
 );
 """
 
@@ -218,6 +256,22 @@ def init_db():
         # fresh DB, where the DDL above already includes the column.
         try:
             conn.execute("ALTER TABLE event_calendar ADD COLUMN source_tier TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # research_session_id: set only when source_tier = "discovered" (a
+        # promoted research session), NULL for government-seeded events —
+        # the backlink from a promoted catalyst to the session that produced it.
+        try:
+            conn.execute("ALTER TABLE event_calendar ADD COLUMN research_session_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # direction: expected market direction of a promoted catalyst (e.g.
+        # "bullish"/"bearish" for silver/gold), distinct from a research
+        # session's own user_read (credibility of the claim, not the
+        # catalyst's expected price effect). Always NULL for government-seeded
+        # events.
+        try:
+            conn.execute("ALTER TABLE event_calendar ADD COLUMN direction TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -578,6 +632,61 @@ def append_price_tick(rows: list[dict]):
         )
 
 
+def get_ticks_since(series_id: str, since_ts: str) -> list[dict]:
+    """Full intraday tick history for series_id at/after since_ts, ordered
+    oldest-first — for a 24h price chart, not a nearest-tick lookup like
+    get_ticks_near (CATCOR's use case). Ticks only exist from whenever the
+    fast-tier refresh loop started actually running at its 60s cadence; a
+    freshly-enabled instance will have a short/empty history until it
+    accumulates."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT ts, price FROM spot_price_tick
+               WHERE series_id = ? AND ts >= ?
+               ORDER BY ts ASC""",
+            (series_id, since_ts),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_price_history(series_id: str, since_ts: str) -> list[dict]:
+    """Tiered price history for a lookback window, stitching three
+    resolutions since none alone covers every window the frontend offers
+    (6H..12M): real spot_price_tick ticks (60s resolution, but only exist
+    from whenever the fast-tier refresh loop actually started running —
+    see get_ticks_since), then CATCOR's XAG_DAILY_CLOSE/XAU_DAILY_CLOSE
+    (daily, ~120 days back — catcor.DAILY_CLOSE_FETCH_DAYS), then the
+    month-end-resampled XAG_CLOSE/XAU_CLOSE used by Money Supply (monthly,
+    back to 2006). Each tier only contributes points strictly older than
+    the tier above it already covers, so the stitched series never has two
+    sources double-covering the same date. Returned oldest-first, each row
+    {"ts": <ISO string>, "price": <float>}."""
+    daily_series_id = f"{series_id}_DAILY_CLOSE"
+    monthly_series_id = f"{series_id}_CLOSE"
+
+    ticks = get_ticks_since(series_id, since_ts)
+    earliest_tick_date = ticks[0]["ts"][:10] if ticks else None
+
+    daily_cutoff = earliest_tick_date or datetime.now(timezone.utc).date().isoformat()
+    daily_rows = [
+        r for r in get_fred_observations(daily_series_id, since=since_ts[:10])
+        if r["value"] is not None and r["date"] < daily_cutoff
+    ]
+    earliest_daily_date = daily_rows[0]["date"] if daily_rows else daily_cutoff
+
+    monthly_rows = [
+        r for r in get_fred_observations(monthly_series_id, since=since_ts[:10])
+        if r["value"] is not None and r["date"] < earliest_daily_date
+    ]
+
+    combined = (
+        [{"ts": r["date"], "price": r["value"]} for r in monthly_rows]
+        + [{"ts": r["date"], "price": r["value"]} for r in daily_rows]
+        + [{"ts": t["ts"], "price": t["price"]} for t in ticks]
+    )
+    return combined
+
+
 def get_ticks_near(series_id: str, ts: str, tolerance_s: int) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
@@ -721,3 +830,125 @@ def get_last_run_at() -> str | None:
     with get_conn() as conn:
         row = conn.execute("SELECT ran_at FROM pipeline_runs WHERE id = 1").fetchone()
         return row["ran_at"] if row else None
+
+
+def record_fetch_attempt(source_key: str, success: bool, error: str | None = None, skipped: bool = False):
+    """Upserts source_health's current-state row for source_key. A skip
+    (rate-limit gate declined to even attempt the fetch) only touches
+    last_attempt_at/last_attempt_status — it is neither a success nor a
+    failure, so consecutive_failures and last_success_at are left alone."""
+    with get_conn() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        if skipped:
+            conn.execute(
+                """INSERT INTO source_health (source_key, last_attempt_at, last_attempt_status)
+                   VALUES (?, ?, 'skipped')
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       last_attempt_at = excluded.last_attempt_at,
+                       last_attempt_status = 'skipped'""",
+                (source_key, now),
+            )
+        elif success:
+            conn.execute(
+                """INSERT INTO source_health
+                       (source_key, last_attempt_at, last_attempt_status, last_success_at, last_error, consecutive_failures)
+                   VALUES (?, ?, 'success', ?, NULL, 0)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       last_attempt_at = excluded.last_attempt_at,
+                       last_attempt_status = 'success',
+                       last_success_at = excluded.last_success_at,
+                       last_error = NULL,
+                       consecutive_failures = 0""",
+                (source_key, now, now),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO source_health
+                       (source_key, last_attempt_at, last_attempt_status, last_error, consecutive_failures)
+                   VALUES (?, ?, 'error', ?, 1)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       last_attempt_at = excluded.last_attempt_at,
+                       last_attempt_status = 'error',
+                       last_error = excluded.last_error,
+                       consecutive_failures = source_health.consecutive_failures + 1""",
+                (source_key, now, error),
+            )
+
+
+def get_all_source_health() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM source_health").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_latest_cot_report_date() -> str | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(report_date) AS d FROM (SELECT report_date FROM cot_silver "
+            "UNION ALL SELECT report_date FROM cot_gold)"
+        ).fetchone()
+        return row["d"] if row else None
+
+
+def create_research_session(session_id: str, claim_text: str, source_url: str | None, now_iso: str):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO research_sessions
+               (session_id, claim_text, source_url, status, user_read, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', NULL, ?, ?)""",
+            (session_id, claim_text, source_url, now_iso, now_iso),
+        )
+
+
+def list_research_sessions() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT session_id, claim_text, status, updated_at
+               FROM research_sessions ORDER BY updated_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_research_session(session_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT session_id, claim_text, source_url, status, user_read, created_at, updated_at
+               FROM research_sessions WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_research_messages(session_id: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, session_id, role, content, created_at
+               FROM research_messages WHERE session_id = ? ORDER BY id ASC""",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def append_research_message(session_id: str, role: str, content: str, now_iso: str):
+    """Appends a turn and bumps the parent session's updated_at in the same
+    connection block — no triggers, matching this module's existing
+    multi-statement-per-block style (e.g. catcor.py's
+    fetch_and_persist_consensus updates a child row then touches the parent)."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO research_messages (session_id, role, content, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, role, content, now_iso),
+        )
+        conn.execute(
+            "UPDATE research_sessions SET updated_at = ? WHERE session_id = ?",
+            (now_iso, session_id),
+        )
+
+
+def touch_research_session(session_id: str, now_iso: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE research_sessions SET updated_at = ? WHERE session_id = ?",
+            (now_iso, session_id),
+        )
