@@ -10,7 +10,6 @@ db.py and mc_token.py are: functions take an httpx.AsyncClient explicitly
 rather than owning global client state.
 """
 
-import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -32,13 +31,19 @@ YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 # The feed content is static for a given calendar week (it's not an
 # intraday-moving quote) and the endpoint rate-limits aggressively on
 # repeat hits (confirmed live: a 429 after two calls a couple minutes
-# apart) — so this is fetched at most once per calendar week and cached
-# to disk, not re-fetched on every poll. _consensus_tier_loop calls
-# fetch_and_persist_consensus periodically, but the cache check below
-# means most of those calls do zero network I/O.
+# apart) — so this is fetched at most once per calendar week and persisted
+# to db.forexfactory_calendar (every entry, all countries, not just the
+# USD/CPI/NFP subset this module currently matches against — the rest of
+# a week's global economic calendar has no consumer today but is real data
+# worth keeping for future CATCOR event types, per SPEC.MD's Iteration 2+).
+# db.has_forexfactory_week() is the cache check; _consensus_tier_loop calls
+# fetch_and_persist_consensus periodically, but that check means most of
+# those calls do zero network I/O — the live endpoint is only ever hit once
+# per calendar week, and once a week has passed there is no way to
+# re-fetch it even if we wanted to (the endpoint only ever serves "this
+# week"), so what's captured is a permanent historical record, not scratch
+# state — hence append-only in SQLite, not a disposable file cache.
 FOREXFACTORY_THISWEEK_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FOREXFACTORY_CACHE_PATH = os.path.join(_REPO_ROOT, "runtime", "forexfactory_thisweek.json")
 
 # ForexFactory's title strings for each event_type CATCOR tracks. NFP
 # specifically means "Non-Farm Employment Change" — ForexFactory also lists
@@ -229,25 +234,6 @@ def _current_calendar_week_key() -> str:
     return sunday.isoformat()
 
 
-def _load_forexfactory_cache() -> list[dict] | None:
-    if not os.path.exists(FOREXFACTORY_CACHE_PATH):
-        return None
-    try:
-        with open(FOREXFACTORY_CACHE_PATH) as f:
-            cached = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-    if cached.get("week_key") != _current_calendar_week_key():
-        return None  # stale — belongs to a previous calendar week
-    return cached.get("entries")
-
-
-def _save_forexfactory_cache(entries: list[dict]):
-    os.makedirs(os.path.dirname(FOREXFACTORY_CACHE_PATH), exist_ok=True)
-    with open(FOREXFACTORY_CACHE_PATH, "w") as f:
-        json.dump({"week_key": _current_calendar_week_key(), "entries": entries}, f)
-
-
 async def fetch_and_persist_consensus(client: httpx.AsyncClient):
     """Match event_calendar rows against ForexFactory's "this week" feed by
     event_type + same UTC instant, persisting a real consensus_value where
@@ -256,11 +242,13 @@ async def fetch_and_persist_consensus(client: httpx.AsyncClient):
     once, so an event isn't missed purely because the server wasn't running
     the moment it entered the window.
 
-    The feed itself is fetched at most once per calendar week and cached
-    to disk (see _load_forexfactory_cache/_save_forexfactory_cache) — its
-    content doesn't change within a week, and the endpoint rate-limits
-    aggressively on repeat hits (confirmed live), so every call beyond the
-    first per week is a pure cache read, no network I/O.
+    The feed itself is fetched at most once per calendar week and persisted
+    to db.forexfactory_calendar (every entry, not just the ones matched
+    below — see the module-level comment above FOREXFACTORY_THISWEEK_URL).
+    db.has_forexfactory_week() is the cache check: the feed's content
+    doesn't change within a week, and the endpoint rate-limits aggressively
+    on repeat hits (confirmed live), so every call beyond the first per
+    week is a pure DB read, no network I/O.
 
     If an event already has an actual_value (i.e. fetch_and_persist_actuals
     ran first) but was missing consensus until just now, recomputes
@@ -269,16 +257,32 @@ async def fetch_and_persist_consensus(client: httpx.AsyncClient):
     sit with a real actual and a freshly-arrived consensus but a stale NULL
     surprise_delta until something else touches it.
     """
-    entries = _load_forexfactory_cache()
-    if entries is None:
+    week_key = _current_calendar_week_key()
+    if not db.has_forexfactory_week(week_key):
         try:
             resp = await client.get(FOREXFACTORY_THISWEEK_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             resp.raise_for_status()
-            entries = resp.json()
-            _save_forexfactory_cache(entries)
+            raw_entries = resp.json()
+            db.insert_forexfactory_rows([
+                {
+                    "week_key": week_key,
+                    "title": e["title"],
+                    "country": e["country"],
+                    "event_date": e["date"],
+                    "impact": e.get("impact"),
+                    "forecast": e.get("forecast"),
+                    "previous": e.get("previous"),
+                }
+                for e in raw_entries
+            ])
         except httpx.HTTPError as e:
             print(f"[catcor] warning: ForexFactory fetch failed: {e}")
             return {"succeeded": 0, "failed": 1}
+
+    entries = [
+        {"title": r["title"], "country": r["country"], "date": r["event_date"], "forecast": r["forecast"]}
+        for r in db.get_forexfactory_week(week_key)
+    ]
 
     succeeded = 0
     with db.get_conn() as conn:
