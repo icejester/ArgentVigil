@@ -1,17 +1,6 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:www.silverwars.com)",
-      "WebFetch(domain:www.silverinstitute.org)",
-      "Bash(bash -n utils/dev.sh)",
-      "WebFetch(domain:www.federalreserve.gov)",
-      "WebFetch(domain:www.bls.gov)",
-      "Bash(bash utils/dev.sh)",
-      "Bash(echo \"started with PID $!\")",
-      "Bash(npm init *)",
-      "Bash(npm install *)",
-      "Bash(npx playwright *)",
-      "Bash(node screenshot.mjs)",
       "Read(//Users/jrmallas/.gitRepos/amp-dev/**)"
     ]
   }

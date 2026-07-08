@@ -25,7 +25,7 @@ from fetch import (
     fetch_gold_disaggregated_cot_data,
 )
 from price_fetch import fetch_silver_prices, fetch_gold_prices, fetch_spot_prices
-from compute import parse_and_compute, compute_signal_track_record
+from compute import compute_from_series, compute_signal_track_record
 
 _CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache", "cot_data.json")
 
@@ -88,17 +88,22 @@ def _rows_for_db(raw_rows: list[dict]) -> list[dict]:
     return out
 
 
-def _run_metal(name: str, rows_fn, prices_fn, db_insert_fn) -> tuple[dict, dict]:
+def _run_metal(name: str, rows_fn, prices_fn, db_insert_fn, db_series_fn, since: str | None) -> tuple[dict, dict]:
     print(f"\n  [{name}] Fetching CoT data...")
-    rows = rows_fn()
-    print(f"  [{name}] {len(rows)} weekly records.")
+    rows = rows_fn(since=since)
+    print(f"  [{name}] {len(rows)} new weekly records.")
     db_insert_fn(_rows_for_db(rows))
 
     print(f"  [{name}] Fetching price data...")
     prices = prices_fn(years=8)
     print(f"  [{name}] {len(prices)} price records.")
 
-    result = parse_and_compute(rows)
+    # Percentile/track-record windows need the full persisted history, not
+    # just this run's incremental fetch (since is set, most runs return only
+    # the newest 0-1 rows) — read the whole series back from SQLite, same
+    # data backend/main.py's /api/cot/db reads via compute_from_series.
+    full_series = db_series_fn()
+    result = compute_from_series(full_series)
     latest = result["latest"]
     w2 = result["windows"]["2yr"]
     w5 = result["windows"]["5yr"]
@@ -141,55 +146,79 @@ def _compute_gsr_series(gold_spot: dict, silver_spot: dict) -> list[dict]:
     return series
 
 
+def run_pipeline_once() -> None:
+    """Fetches + persists CoT (Legacy + Disaggregated), prices, and GSR, then
+    writes the standalone-CLI cache file. Raises on failure, same as any
+    other fetch-and-persist function — callers (the CLI entry point below,
+    and backend/main.py's on-demand health-refresh route) are both expected
+    to let that propagate/catch it themselves. Records its own outcome to
+    source_health (source_key "cot_pipeline") on both the success and
+    exception paths so the health system reflects reality regardless of
+    which caller triggered the run — cron/manual CLI invocations included,
+    not just the in-app button."""
+    try:
+        print("ArgentVigil pipeline starting...")
+        db.init_db()
+
+        since = db.get_latest_cot_report_date()
+
+        silver, silver_prices = _run_metal(
+            "Silver", fetch_cot_data, fetch_silver_prices, db.insert_silver_rows, db.get_silver_series, since
+        )
+        gold, gold_prices = _run_metal(
+            "Gold", fetch_gold_cot_data, fetch_gold_prices, db.insert_gold_rows, db.get_gold_series, since
+        )
+        db.upsert_prices("SLV", silver_prices)
+        db.upsert_prices("GLD", gold_prices)
+
+        print("\n  [Disaggregated] Fetching silver...")
+        silver_disagg = fetch_disaggregated_cot_data(since=since)
+        db.insert_disaggregated_rows(_disaggregated_rows_for_db("XAG", silver_disagg))
+        print(f"  [Disaggregated] Fetching gold...")
+        gold_disagg = fetch_gold_disaggregated_cot_data(since=since)
+        db.insert_disaggregated_rows(_disaggregated_rows_for_db("XAU", gold_disagg))
+
+        print("\n  [GSR] Fetching spot prices (GC=F, SI=F)...")
+        gold_spot = fetch_spot_prices("GC=F", years=8)
+        silver_spot = fetch_spot_prices("SI=F", years=8)
+        db.upsert_prices("GC=F", gold_spot)
+        db.upsert_prices("SI=F", silver_spot)
+        gsr_series = _compute_gsr_series(gold_spot, silver_spot)
+
+        output = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cot_as_of_date": silver["latest"]["date"],
+            # Silver (top-level keys preserved for backwards compat)
+            "series": silver["series"],
+            "latest": silver["latest"],
+            "windows": silver["windows"],
+            "signal_track_record": silver["signal_track_record"],
+            # Gold
+            "gold": {
+                "series": gold["series"],
+                "latest": gold["latest"],
+                "windows": gold["windows"],
+                "signal_track_record": gold["signal_track_record"],
+            },
+            "gsr_series": gsr_series,
+            "macro_watchlist": _load_existing_watchlist(),
+        }
+
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+        with open(_CACHE_PATH, "w") as f:
+            json.dump(output, f, indent=2)
+
+        db.record_pipeline_run(output["generated_at"])
+        db.record_fetch_attempt("cot_pipeline", success=True)
+
+        print(f"\n  Cache written to {_CACHE_PATH}")
+    except Exception as e:
+        db.record_fetch_attempt("cot_pipeline", success=False, error=str(e))
+        raise
+
+
 def main():
-    print("ArgentVigil pipeline starting...")
-    db.init_db()
-
-    silver, silver_prices = _run_metal("Silver", fetch_cot_data, fetch_silver_prices, db.insert_silver_rows)
-    gold, gold_prices = _run_metal("Gold", fetch_gold_cot_data, fetch_gold_prices, db.insert_gold_rows)
-    db.upsert_prices("SLV", silver_prices)
-    db.upsert_prices("GLD", gold_prices)
-
-    print("\n  [Disaggregated] Fetching silver...")
-    silver_disagg = fetch_disaggregated_cot_data()
-    db.insert_disaggregated_rows(_disaggregated_rows_for_db("XAG", silver_disagg))
-    print(f"  [Disaggregated] Fetching gold...")
-    gold_disagg = fetch_gold_disaggregated_cot_data()
-    db.insert_disaggregated_rows(_disaggregated_rows_for_db("XAU", gold_disagg))
-
-    print("\n  [GSR] Fetching spot prices (GC=F, SI=F)...")
-    gold_spot = fetch_spot_prices("GC=F", years=8)
-    silver_spot = fetch_spot_prices("SI=F", years=8)
-    db.upsert_prices("GC=F", gold_spot)
-    db.upsert_prices("SI=F", silver_spot)
-    gsr_series = _compute_gsr_series(gold_spot, silver_spot)
-
-    output = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "cot_as_of_date": silver["latest"]["date"],
-        # Silver (top-level keys preserved for backwards compat)
-        "series": silver["series"],
-        "latest": silver["latest"],
-        "windows": silver["windows"],
-        "signal_track_record": silver["signal_track_record"],
-        # Gold
-        "gold": {
-            "series": gold["series"],
-            "latest": gold["latest"],
-            "windows": gold["windows"],
-            "signal_track_record": gold["signal_track_record"],
-        },
-        "gsr_series": gsr_series,
-        "macro_watchlist": _load_existing_watchlist(),
-    }
-
-    os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
-    with open(_CACHE_PATH, "w") as f:
-        json.dump(output, f, indent=2)
-
-    db.record_pipeline_run(output["generated_at"])
-
-    print(f"\n  Cache written to {_CACHE_PATH}")
+    run_pipeline_once()
 
 
 def _load_existing_watchlist() -> dict:

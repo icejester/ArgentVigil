@@ -2,22 +2,18 @@
 CATCOR Iteration 2 — Research Pane. A place to work a single claim by hand:
 paste it, see AV's own trusted numbers next to it, log a read, then decide —
 promote to a tracked catalyst or dismiss as noise (Deliverable 3, not yet
-built). This module now covers session/message CRUD (Deliverable 1) and a
-2-call Claude pipeline (Deliverable 2):
+built). This module covers session/message CRUD (Deliverable 1) and a
+single-call chat pipeline (Deliverable 2, temporarily simplified):
 
-  Call 1 (parser_v1) — decomposes the claim into testable sub-assertions,
-  matches each to an AV tool/statistic, and runs the existing tool-use loop
-  to actually fetch that data. Its own prose output is never the visible
-  chat turn.
-
-  Call 2 (analyst_v1) — takes Call 1's decomposition + the real tool data
-  already gathered and contextualizes it (connects sub-assertions, notes
-  agreement/tension in the evidence, explains what a reading means relative
-  to its own historical range). Has no tools of its own — it only works
-  from what Call 1 already fetched. Its output is what gets persisted as
-  the assistant turn and shown in the chat thread. Same hard invariant as
-  the parser: no verdict on the claim, no bullish/bearish framing — Call 2
-  is allowed more synthesis before that stop, not a different stop.
+  send_message makes exactly one call per turn — no tools, no parser/
+  analyst split — against the word-count persona (prompts/word_count_v1.py),
+  a deliberately trivial stand-in used to validate chat plumbing (session/
+  message persistence, backend routing, frontend rendering) independent of
+  any real evidence-gathering or synthesis. The earlier 2-call parser+
+  analyst pipeline (decompose claim -> fetch AV data via tools ->
+  contextualize) is not currently wired into send_message; the tool
+  functions themselves (_tool_get_*, dump_all_evidence) remain, still used
+  by GET /evidence/db.
 
 Same convention as catcor.py: plain functions here, route decorators live in
 main.py. `from . import db` for persistence. No Anthropic SDK — raw httpx
@@ -26,7 +22,7 @@ outbound integration in this codebase (metalcharts.org/ForexFactory/ALFRED/
 Yahoo all go through the one shared httpx.AsyncClient, no SDK for any of
 them).
 
-Model backend layering (three layers, strict separation of duties):
+Model backend layering:
 
   call_anthropic(system_prompt, messages, model) / call_forge(same
   signature) — one per vendor, identical signature and identical return
@@ -37,26 +33,17 @@ Model backend layering (three layers, strict separation of duties):
 
   call_ai(backend, system_prompt, messages, model) — thin dispatcher, picks
   which vendor function to invoke by name. Also has no concept of tools.
-
-  The tool-use loop (_run_parser) — the one place that knows about tools.
-  It calls call_ai like any other primitive and inspects the plain text it
-  gets back for a TOOL_REQUEST: <name> line (see prompts/parser_v1.py) —
-  not a vendor-specific protocol (Anthropic's structured tools/tool_use
-  blocks), specifically so the same loop works unchanged regardless of
-  which backend answered.
 """
 
 import json
 import os
-import re
 import uuid
 from datetime import datetime, timezone
 
 import httpx
 
 from . import db
-from .prompts.analyst_v1 import PROMPT as ANALYST_PROMPT
-from .prompts.parser_v1 import PROMPT as PARSER_PROMPT
+from .prompts.word_count_v1 import PROMPT as WORD_COUNT_PROMPT
 from pipeline.compute import compute_from_series
 from pipeline.config import FRED_SERIES_CPI, FRED_SERIES_M2, FRED_SERIES_WALCL
 
@@ -78,28 +65,13 @@ ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 # contract this relies on. Configurable via env var so a different host/
 # port doesn't require a code change.
 FORGE_URL = os.environ.get("FORGE_URL", "http://amp-forge:8001/chat/stream")
-FORGE_MODEL = "llama3.1:8b"
+FORGE_MODEL = "qwen3:8b"
 
-# Which backend call_ai uses when a caller doesn't specify one. "anthropic"
-# for now — Forge is newly wired and not yet the default for real pipeline
-# traffic.
-DEFAULT_BACKEND = "anthropic"
+# Which backend call_ai uses when a caller doesn't specify one. Configurable
+# via env var, same convention as FORGE_URL above — "anthropic" if unset.
+DEFAULT_BACKEND = os.environ.get("AI_BACKEND", "forge")
 
 MAX_TOKENS = 2000
-# Hard cap on tool-request round-trips within a single turn — a new failure
-# mode for this codebase (every existing loop in catcor.py is a fixed
-# backfill or an asyncio.sleep poll, never "loop until the model stops
-# asking").
-MAX_TOOL_ROUNDS = 5
-
-_TOOL_REQUEST_RE = re.compile(r"^TOOL_REQUEST:\s*(\w+)\s*$", re.MULTILINE)
-
-_KNOWN_TOOL_NAMES = (
-    "get_cot_positioning",
-    "get_comex_inventory",
-    "get_money_supply",
-    "get_market_balance",
-)
 
 
 def _now_iso() -> str:
@@ -107,8 +79,14 @@ def _now_iso() -> str:
 
 
 def create_session(claim_text: str, source_url: str | None = None) -> str:
+    """Persists the session row only — does NOT seed research_messages with
+    claim_text. The caller (main.py's create-session route) is expected to
+    follow this with a send_message(session_id, claim_text) call to actually
+    get the claim into conversation history and produce a first reply; doing
+    the seeding here as well as there would duplicate the first turn."""
     session_id = str(uuid.uuid4())
-    db.create_research_session(session_id, claim_text, source_url, _now_iso())
+    now = _now_iso()
+    db.create_research_session(session_id, claim_text, source_url, now)
     return session_id
 
 
@@ -214,15 +192,6 @@ def dump_all_evidence() -> dict:
     any conversation happens, at zero cost."""
     return {name: impl() for name, impl in _TOOL_IMPLS.items()}
 
-
-def _execute_tool(name: str, tool_input: dict) -> dict:
-    impl = _TOOL_IMPLS.get(name)
-    if impl is None:
-        return {"error": f"unknown tool: {name}"}
-    try:
-        return impl()
-    except Exception as e:
-        return {"error": f"tool execution failed: {e}"}
 
 
 # --- Claude tool-use chat loop ------------------------------------------
@@ -374,105 +343,30 @@ async def call_ai(
     return await fn(client, system_prompt, messages, **kwargs)
 
 
-def _extract_tool_requests(text: str) -> list[str]:
-    """Pulls every TOOL_REQUEST: <name> line out of the parser's plain-text
-    reply, filtered to known tool names (an unrecognized name is dropped
-    silently rather than passed to _execute_tool, which would just bounce
-    it back as an "unknown tool" error — cheaper to filter here)."""
-    return [name for name in _TOOL_REQUEST_RE.findall(text) if name in _KNOWN_TOOL_NAMES]
-
-
-async def _run_parser(
-    client: httpx.AsyncClient, messages: list[dict], backend: str = DEFAULT_BACKEND
+async def send_message(
+    client: httpx.AsyncClient, session_id: str, user_content: str, backend: str = DEFAULT_BACKEND
 ) -> dict:
-    """Call 1 of the pipeline: runs the bounded tool-request loop against
-    the parser persona (decompose claim -> match statistic -> fetch it via
-    AV's tools) through call_ai. Tool access is a plain-text contract (see
-    prompts/parser_v1.py's TOOL_REQUEST: <name> format) rather than a
-    vendor-specific tool-use protocol, so this loop works unchanged
-    regardless of which backend answers. Returns
-    {"final_text": ..., "tool_calls": [...]} — this is NOT persisted or
-    shown directly; it's Call 2's (the analyst's) input. Raises
-    RuntimeError if the loop exceeds MAX_TOOL_ROUNDS without resolving."""
-    tool_calls_log = []
-
-    for _round in range(MAX_TOOL_ROUNDS):
-        data = await call_ai(client, PARSER_PROMPT, messages, backend=backend)
-        final_text = data["final_text"]
-        requested = _extract_tool_requests(final_text)
-
-        if not requested:
-            return {"final_text": final_text, "tool_calls": tool_calls_log}
-
-        # Model asked for one or more tools: execute each, append its own
-        # reply (so it can see what it asked for) and a plain-text user
-        # message carrying the results, then loop again.
-        messages.append({"role": "assistant", "content": final_text})
-        result_lines = []
-        for name in requested:
-            result = _execute_tool(name, {})
-            tool_calls_log.append({"tool": name, "input": {}, "result": result})
-            result_lines.append(f"{name}: {json.dumps(result)}")
-        messages.append({
-            "role": "user",
-            "content": "Tool results:\n" + "\n".join(result_lines),
-        })
-
-    raise RuntimeError(
-        f"Parser tool-request loop exceeded {MAX_TOOL_ROUNDS} rounds without resolving to a final answer"
-    )
-
-
-def _build_analyst_input(user_content: str, parser_result: dict) -> list[dict]:
-    """Call 2 gets a single synthetic user message: the original claim, the
-    parser's decomposition, and the raw tool data it already gathered. Call
-    2 has no tools of its own — it only ever sees what Call 1 fetched."""
-    tool_data = json.dumps(
-        [{"tool": t["tool"], "result": t["result"]} for t in parser_result["tool_calls"]],
-        indent=2,
-    )
-    content = (
-        f"A user made this claim: {user_content}\n\n"
-        f"Here is the parsed breakdown and matched statistics:\n{parser_result['final_text']}\n\n"
-        f"Raw data gathered for that breakdown:\n{tool_data}"
-    )
-    return [{"role": "user", "content": content}]
-
-
-async def send_message(client: httpx.AsyncClient, session_id: str, user_content: str) -> dict:
     """Persists the user turn immediately (never lost even if what follows
-    fails), then runs the 2-call pipeline: Call 1 (parser, with tools)
-    decomposes the claim and fetches AV's real data; Call 2 (analyst, no
-    tools) takes that output and contextualizes it. Only Call 2's output is
-    persisted as the visible assistant turn — the parser's own decomposition
-    is kept alongside it in the same row (parser_output) for inspection, but
-    is never itself a chat turn or resent as history.
+    fails), then makes exactly one call — no tools, no parser/analyst split
+    — against the word-count persona (prompts/word_count_v1.py). This is a
+    deliberately trivial single-call path used to validate chat plumbing
+    (session/message persistence, backend routing, frontend rendering)
+    independent of any real evidence-gathering; it replaces the earlier
+    2-call parser+analyst pipeline for now.
 
-    The assistant turn is persisted only if both calls fully resolve — a
-    network error, non-2xx response, or loop-cap breach at either stage
-    raises and leaves no assistant row, so no half-written replies ever land
-    in research_messages."""
+    The assistant turn is persisted only if the call fully resolves — a
+    network error or non-2xx response raises and leaves no assistant row,
+    so no half-written replies ever land in research_messages."""
     now = _now_iso()
     db.append_research_message(session_id, "user", user_content, now)
 
     history = db.list_research_messages(session_id)
     messages = _history_to_messages(history)
 
-    parser_result = await _run_parser(client, messages)
+    data = await call_ai(client, WORD_COUNT_PROMPT, messages, backend=backend)
+    final_text = data["final_text"]
 
-    analyst_messages = _build_analyst_input(user_content, parser_result)
-    analyst_data = await call_ai(client, ANALYST_PROMPT, analyst_messages)
-    final_text = analyst_data["final_text"]
-
-    assistant_content = json.dumps({
-        "final_text": final_text,
-        "tool_calls": parser_result["tool_calls"],
-        "parser_output": parser_result["final_text"],
-    })
+    assistant_content = json.dumps({"final_text": final_text})
     reply_now = _now_iso()
     db.append_research_message(session_id, "assistant", assistant_content, reply_now)
-    return {
-        "final_text": final_text,
-        "tool_calls": parser_result["tool_calls"],
-        "parser_output": parser_result["final_text"],
-    }
+    return {"final_text": final_text}

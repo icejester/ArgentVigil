@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(_REPO_ROOT, "runtime", "argentvigil.db")
@@ -170,6 +171,15 @@ CREATE TABLE IF NOT EXISTS cot_prices (
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     ran_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_health (
+    source_key          TEXT PRIMARY KEY,
+    last_attempt_at     TEXT,
+    last_attempt_status TEXT,
+    last_success_at     TEXT,
+    last_error          TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS cot_disaggregated (
@@ -622,6 +632,61 @@ def append_price_tick(rows: list[dict]):
         )
 
 
+def get_ticks_since(series_id: str, since_ts: str) -> list[dict]:
+    """Full intraday tick history for series_id at/after since_ts, ordered
+    oldest-first — for a 24h price chart, not a nearest-tick lookup like
+    get_ticks_near (CATCOR's use case). Ticks only exist from whenever the
+    fast-tier refresh loop started actually running at its 60s cadence; a
+    freshly-enabled instance will have a short/empty history until it
+    accumulates."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT ts, price FROM spot_price_tick
+               WHERE series_id = ? AND ts >= ?
+               ORDER BY ts ASC""",
+            (series_id, since_ts),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_price_history(series_id: str, since_ts: str) -> list[dict]:
+    """Tiered price history for a lookback window, stitching three
+    resolutions since none alone covers every window the frontend offers
+    (6H..12M): real spot_price_tick ticks (60s resolution, but only exist
+    from whenever the fast-tier refresh loop actually started running —
+    see get_ticks_since), then CATCOR's XAG_DAILY_CLOSE/XAU_DAILY_CLOSE
+    (daily, ~120 days back — catcor.DAILY_CLOSE_FETCH_DAYS), then the
+    month-end-resampled XAG_CLOSE/XAU_CLOSE used by Money Supply (monthly,
+    back to 2006). Each tier only contributes points strictly older than
+    the tier above it already covers, so the stitched series never has two
+    sources double-covering the same date. Returned oldest-first, each row
+    {"ts": <ISO string>, "price": <float>}."""
+    daily_series_id = f"{series_id}_DAILY_CLOSE"
+    monthly_series_id = f"{series_id}_CLOSE"
+
+    ticks = get_ticks_since(series_id, since_ts)
+    earliest_tick_date = ticks[0]["ts"][:10] if ticks else None
+
+    daily_cutoff = earliest_tick_date or datetime.now(timezone.utc).date().isoformat()
+    daily_rows = [
+        r for r in get_fred_observations(daily_series_id, since=since_ts[:10])
+        if r["value"] is not None and r["date"] < daily_cutoff
+    ]
+    earliest_daily_date = daily_rows[0]["date"] if daily_rows else daily_cutoff
+
+    monthly_rows = [
+        r for r in get_fred_observations(monthly_series_id, since=since_ts[:10])
+        if r["value"] is not None and r["date"] < earliest_daily_date
+    ]
+
+    combined = (
+        [{"ts": r["date"], "price": r["value"]} for r in monthly_rows]
+        + [{"ts": r["date"], "price": r["value"]} for r in daily_rows]
+        + [{"ts": t["ts"], "price": t["price"]} for t in ticks]
+    )
+    return combined
+
+
 def get_ticks_near(series_id: str, ts: str, tolerance_s: int) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
@@ -765,6 +830,64 @@ def get_last_run_at() -> str | None:
     with get_conn() as conn:
         row = conn.execute("SELECT ran_at FROM pipeline_runs WHERE id = 1").fetchone()
         return row["ran_at"] if row else None
+
+
+def record_fetch_attempt(source_key: str, success: bool, error: str | None = None, skipped: bool = False):
+    """Upserts source_health's current-state row for source_key. A skip
+    (rate-limit gate declined to even attempt the fetch) only touches
+    last_attempt_at/last_attempt_status — it is neither a success nor a
+    failure, so consecutive_failures and last_success_at are left alone."""
+    with get_conn() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        if skipped:
+            conn.execute(
+                """INSERT INTO source_health (source_key, last_attempt_at, last_attempt_status)
+                   VALUES (?, ?, 'skipped')
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       last_attempt_at = excluded.last_attempt_at,
+                       last_attempt_status = 'skipped'""",
+                (source_key, now),
+            )
+        elif success:
+            conn.execute(
+                """INSERT INTO source_health
+                       (source_key, last_attempt_at, last_attempt_status, last_success_at, last_error, consecutive_failures)
+                   VALUES (?, ?, 'success', ?, NULL, 0)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       last_attempt_at = excluded.last_attempt_at,
+                       last_attempt_status = 'success',
+                       last_success_at = excluded.last_success_at,
+                       last_error = NULL,
+                       consecutive_failures = 0""",
+                (source_key, now, now),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO source_health
+                       (source_key, last_attempt_at, last_attempt_status, last_error, consecutive_failures)
+                   VALUES (?, ?, 'error', ?, 1)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       last_attempt_at = excluded.last_attempt_at,
+                       last_attempt_status = 'error',
+                       last_error = excluded.last_error,
+                       consecutive_failures = source_health.consecutive_failures + 1""",
+                (source_key, now, error),
+            )
+
+
+def get_all_source_health() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM source_health").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_latest_cot_report_date() -> str | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(report_date) AS d FROM (SELECT report_date FROM cot_silver "
+            "UNION ALL SELECT report_date FROM cot_gold)"
+        ).fetchone()
+        return row["d"] if row else None
 
 
 def create_research_session(session_id: str, claim_text: str, source_url: str | None, now_iso: str):
