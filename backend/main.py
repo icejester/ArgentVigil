@@ -1358,6 +1358,33 @@ async def catcor_research_list_personas():
     return {"success": True, "data": catcor_research.list_personas()}
 
 
+@app.post("/api/catcor/research/sessions/{session_id}/preview")
+async def catcor_research_preview(session_id: str, body: dict = Body(...)):
+    """Spec 3.5's non-editable prompt preview — the exact assembled payload
+    for the controls currently selected, computed with zero model call
+    (assemble_prompt is pure). Lets the frontend show real assembled text
+    before Send is clicked, rather than a client-side approximation that
+    would drift from catcor_research.py's actual formatting."""
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        persona_prompt = catcor_research.load_persona_prompt(
+            body.get("persona", catcor_research.DEFAULT_PERSONA)
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    history = catcor_research.db.list_research_messages(session_id)
+    system_prompt, messages = catcor_research.assemble_prompt(
+        persona_prompt,
+        body.get("context_blocks", []),
+        body.get("memory_mode", "accumulating"),
+        history,
+        body.get("freeform_text"),
+        body.get("content", ""),
+    )
+    return {"success": True, "data": {"system": system_prompt, "messages": messages}}
+
+
 @app.get("/api/catcor/research/sessions/db")
 async def catcor_research_list_sessions():
     return {"success": True, "data": catcor_research.list_sessions()}

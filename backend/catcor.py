@@ -59,6 +59,15 @@ XAG_TICKER = "SI=F"
 XAU_TICKER = "GC=F"
 METALS = {"XAG": XAG_TICKER, "XAU": XAU_TICKER}
 
+# spot_price_tick's "XAG"/"XAU" series_ids belong exclusively to main.py's
+# fast-tier metalcharts.org spot poll — a genuinely different instrument
+# from Yahoo's SI=F/GC=F futures bars backfilled here, and the two used to
+# collide under the same series_id (real bug: futures prints running
+# ~0.3-0.6 higher than spot, interleaved in the same series, producing a
+# sawtooth in PriceHistoryChart). Yahoo's bars get their own series_id
+# family, same non-colliding-key precedent as DAILY_CLOSE_SERIES_ID below.
+FUTURES_SERIES_ID = {"XAG": "XAG_FUTURES", "XAU": "XAU_FUTURES"}
+
 # Window offsets in minutes relative to scheduled_time.
 WINDOWS = {
     "T-30m": -30,
@@ -402,14 +411,22 @@ async def backfill_intraday_ticks(client: httpx.AsyncClient):
     capture_snapshot has real intraday ticks to sample from even for
     events that predate this feature's own fast-tier tick collection.
     append_price_tick is INSERT OR IGNORE, so re-running this is always
-    safe and cheap on repeat startups."""
+    safe and cheap on repeat startups.
+
+    Written under FUTURES_SERIES_ID ("XAG_FUTURES"/"XAU_FUTURES"), NOT the
+    bare "XAG"/"XAU" spot_price_tick keys main.py's fast tier uses — SI=F/
+    GC=F are futures, a genuinely different instrument from metalcharts.org's
+    spot quote, and sharing a series_id with it produced a real sawtooth
+    artifact in PriceHistoryChart (futures prints running ~0.3-0.6 higher,
+    interleaved with real spot ticks on the same line)."""
     for series_id, ticker in METALS.items():
         try:
             bars = await _fetch_yahoo_intraday(client, ticker, YAHOO_INTRADAY_DAYS)
         except httpx.HTTPError as e:
             print(f"[catcor] warning: Yahoo intraday fetch failed for {ticker}: {e}")
             continue
-        rows = [{"series_id": series_id, "ts": b["ts"], "price": b["price"]} for b in bars]
+        futures_series_id = FUTURES_SERIES_ID[series_id]
+        rows = [{"series_id": futures_series_id, "ts": b["ts"], "price": b["price"]} for b in bars]
         if rows:
             db.append_price_tick(rows)
 
@@ -500,10 +517,17 @@ def capture_snapshot(event_id: str, window: str):
         if (series_id, window) in existing:
             continue
 
-        tick = db.get_ticks_near(series_id, target_ts, TICK_TOLERANCE_S)
+        # Queries FUTURES_SERIES_ID, not the bare series_id — CATCOR's
+        # intraday-precision reactions are (and always have been) sourced
+        # from Yahoo's SI=F/GC=F futures bars (backfill_intraday_ticks),
+        # never from main.py's fast-tier spot ticks. Keeping this explicit
+        # preserves existing snapshot coverage after spot_price_tick's
+        # "XAG"/"XAU" keys were reserved exclusively for real spot ticks.
+        futures_series_id = FUTURES_SERIES_ID[series_id]
+        tick = db.get_ticks_near(futures_series_id, target_ts, TICK_TOLERANCE_S)
         price = tick["price"] if tick else _daily_close_fallback(series_id, target_ts)
 
-        baseline_tick = db.get_ticks_near(series_id, baseline_ts, TICK_TOLERANCE_S)
+        baseline_tick = db.get_ticks_near(futures_series_id, baseline_ts, TICK_TOLERANCE_S)
         baseline_price = baseline_tick["price"] if baseline_tick else _daily_close_fallback(series_id, baseline_ts)
 
         price_delta_pct = None

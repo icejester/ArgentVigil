@@ -682,7 +682,16 @@ def get_ticks_since(series_id: str, since_ts: str) -> list[dict]:
     get_ticks_near (CATCOR's use case). Ticks only exist from whenever the
     fast-tier refresh loop started actually running at its 60s cadence; a
     freshly-enabled instance will have a short/empty history until it
-    accumulates."""
+    accumulates.
+
+    Note: spot_price_tick holds more than one series_id family — "XAG"/
+    "XAU" are main.py's real metalcharts.org spot quotes (60s cadence);
+    "XAG_FUTURES"/"XAU_FUTURES" are catcor.py's Yahoo SI=F/GC=F futures
+    bars (5m cadence, used for event-reaction snapshots, NOT the live spot
+    price). These two used to collide under the same "XAG"/"XAU" keys —
+    a real bug that sawtoothed PriceHistoryChart with futures prints
+    running ~0.3-0.6 higher than spot, interleaved on the same line. Pass
+    the series_id family that matches what you actually want."""
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT ts, price FROM spot_price_tick
@@ -704,7 +713,12 @@ def get_price_history(series_id: str, since_ts: str) -> list[dict]:
     back to 2006). Each tier only contributes points strictly older than
     the tier above it already covers, so the stitched series never has two
     sources double-covering the same date. Returned oldest-first, each row
-    {"ts": <ISO string>, "price": <float>}."""
+    {"ts": <ISO string>, "price": <float>}.
+
+    Callers should pass "XAG"/"XAU" here (the real spot series) — never
+    "XAG_FUTURES"/"XAU_FUTURES" (catcor.py's Yahoo futures backfill, a
+    different instrument used only for CATCOR's own event-reaction
+    snapshots, see get_ticks_since's note)."""
     daily_series_id = f"{series_id}_DAILY_CLOSE"
     monthly_series_id = f"{series_id}_CLOSE"
 
@@ -732,6 +746,10 @@ def get_price_history(series_id: str, since_ts: str) -> list[dict]:
 
 
 def get_ticks_near(series_id: str, ts: str, tolerance_s: int) -> dict | None:
+    """Nearest spot_price_tick row to ts within tolerance_s, or None.
+    CATCOR's capture_snapshot passes "XAG_FUTURES"/"XAU_FUTURES" here (see
+    get_ticks_since's note) — this function itself is series-id-agnostic,
+    it just finds whichever row is closest under whatever key you pass."""
     with get_conn() as conn:
         row = conn.execute(
             """SELECT series_id, ts, price FROM spot_price_tick
