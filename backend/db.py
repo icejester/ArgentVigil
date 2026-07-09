@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS research_sessions (
     source_url TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     user_read TEXT,
+    memory_mode TEXT NOT NULL DEFAULT 'accumulating',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -219,7 +220,14 @@ CREATE TABLE IF NOT EXISTS research_messages (
     session_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    backend TEXT,
+    model TEXT,
+    persona TEXT,
+    context_blocks TEXT,
+    memory_mode TEXT,
+    memory_changed INTEGER NOT NULL DEFAULT 0,
+    assembled_prompt TEXT
 );
 
 CREATE TABLE IF NOT EXISTS research_log (
@@ -229,6 +237,7 @@ CREATE TABLE IF NOT EXISTS research_log (
     source_url TEXT,
     user_read TEXT NOT NULL,
     dismissed_at TEXT NOT NULL,
+    dismiss_reason TEXT NOT NULL DEFAULT '',
     validation_status TEXT
 );
 """
@@ -272,6 +281,41 @@ def init_db():
         # events.
         try:
             conn.execute("ALTER TABLE event_calendar ADD COLUMN direction TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Research Pane rebuild (catcor-events-spec.md) — memory_mode tracks
+        # a session's current Stateless/Accumulating setting so the UI can
+        # default the toggle to wherever it was last left, rather than
+        # always resetting to one fixed value.
+        try:
+            conn.execute(
+                "ALTER TABLE research_sessions ADD COLUMN memory_mode TEXT NOT NULL DEFAULT 'accumulating'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # research_messages: new per-turn metadata, split across user-row vs
+        # assistant-row fields (a "turn" is a user/assistant row pair, same
+        # as before this change) — see catcor_research.py's send_message for
+        # which role writes which column.
+        for stmt in (
+            "ALTER TABLE research_messages ADD COLUMN backend TEXT",
+            "ALTER TABLE research_messages ADD COLUMN model TEXT",
+            "ALTER TABLE research_messages ADD COLUMN persona TEXT",
+            "ALTER TABLE research_messages ADD COLUMN context_blocks TEXT",
+            "ALTER TABLE research_messages ADD COLUMN memory_mode TEXT",
+            "ALTER TABLE research_messages ADD COLUMN memory_changed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE research_messages ADD COLUMN assembled_prompt TEXT",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        # research_log: dismissal reason, required by dismiss_research_session
+        # going forward but backfilled empty for any pre-existing rows.
+        try:
+            conn.execute(
+                "ALTER TABLE research_log ADD COLUMN dismiss_reason TEXT NOT NULL DEFAULT ''"
+            )
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -901,9 +945,12 @@ def create_research_session(session_id: str, claim_text: str, source_url: str | 
 
 
 def list_research_sessions() -> list[dict]:
+    """Widened beyond the original session_id/claim_text/status/updated_at
+    to include user_read/source_url — the Phase 2 session-list view needs
+    read/disposition context per row without a separate detail fetch."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT session_id, claim_text, status, updated_at
+            """SELECT session_id, claim_text, source_url, status, user_read, updated_at
                FROM research_sessions ORDER BY updated_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
@@ -912,7 +959,8 @@ def list_research_sessions() -> list[dict]:
 def get_research_session(session_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
-            """SELECT session_id, claim_text, source_url, status, user_read, created_at, updated_at
+            """SELECT session_id, claim_text, source_url, status, user_read,
+                      memory_mode, created_at, updated_at
                FROM research_sessions WHERE session_id = ?""",
             (session_id,),
         ).fetchone()
@@ -922,23 +970,60 @@ def get_research_session(session_id: str) -> dict | None:
 def list_research_messages(session_id: str) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT id, session_id, role, content, created_at
+            """SELECT id, session_id, role, content, created_at,
+                      backend, model, persona, context_blocks, memory_mode,
+                      memory_changed, assembled_prompt
                FROM research_messages WHERE session_id = ? ORDER BY id ASC""",
             (session_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def append_research_message(session_id: str, role: str, content: str, now_iso: str):
+def get_research_message_count(session_id: str) -> int:
+    """Backs dismiss_session's >=1-turn gate (catcor-events-spec.md section
+    5.2 — a session with zero turns has nothing to reason about, so it can
+    only be discarded, never dismissed-with-reason)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM research_messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row["n"]
+
+
+def append_research_message(
+    session_id: str,
+    role: str,
+    content: str,
+    now_iso: str,
+    backend: str | None = None,
+    model: str | None = None,
+    persona: str | None = None,
+    context_blocks: str | None = None,
+    memory_mode: str | None = None,
+    memory_changed: int = 0,
+    assembled_prompt: str | None = None,
+):
     """Appends a turn and bumps the parent session's updated_at in the same
     connection block — no triggers, matching this module's existing
     multi-statement-per-block style (e.g. catcor.py's
-    fetch_and_persist_consensus updates a child row then touches the parent)."""
+    fetch_and_persist_consensus updates a child row then touches the parent).
+
+    The new metadata columns are optional/nullable since a "turn" is a
+    user-row/assistant-row pair: backend/model/persona describe what
+    answered (assistant rows), context_blocks/memory_mode/memory_changed/
+    assembled_prompt describe what was sent (user rows) — callers only pass
+    the subset relevant to the role being inserted."""
     with get_conn() as conn:
         conn.execute(
-            """INSERT INTO research_messages (session_id, role, content, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (session_id, role, content, now_iso),
+            """INSERT INTO research_messages
+               (session_id, role, content, created_at, backend, model, persona,
+                context_blocks, memory_mode, memory_changed, assembled_prompt)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id, role, content, now_iso, backend, model, persona,
+                context_blocks, memory_mode, memory_changed, assembled_prompt,
+            ),
         )
         conn.execute(
             "UPDATE research_sessions SET updated_at = ? WHERE session_id = ?",
@@ -952,3 +1037,76 @@ def touch_research_session(session_id: str, now_iso: str):
             "UPDATE research_sessions SET updated_at = ? WHERE session_id = ?",
             (now_iso, session_id),
         )
+
+
+def set_research_memory_mode(session_id: str, mode: str, now_iso: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE research_sessions SET memory_mode = ?, updated_at = ? WHERE session_id = ?",
+            (mode, now_iso, session_id),
+        )
+
+
+def set_research_read(session_id: str, user_read: str, now_iso: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE research_sessions SET user_read = ?, updated_at = ? WHERE session_id = ?",
+            (user_read, now_iso, session_id),
+        )
+
+
+def promote_research_session(session_id: str, event_row: dict, now_iso: str):
+    """Inserts the new Observed-origin event_calendar row and flips the
+    session to 'promoted' in one connection block, so the two writes are
+    atomic — either both land or neither does. event_row must supply
+    event_id/event_name/event_type/scheduled_time/source_url/source_tier/
+    research_session_id/direction; consensus_value/actual_value/
+    surprise_delta are not applicable to an Observed event and are left
+    NULL by the caller."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO event_calendar
+               (event_id, event_name, event_type, scheduled_time, consensus_value,
+                actual_value, surprise_delta, source_url, source_tier,
+                research_session_id, direction)
+               VALUES (:event_id, :event_name, :event_type, :scheduled_time, NULL,
+                       NULL, NULL, :source_url, :source_tier,
+                       :research_session_id, :direction)""",
+            event_row,
+        )
+        conn.execute(
+            "UPDATE research_sessions SET status = 'promoted', updated_at = ? WHERE session_id = ?",
+            (now_iso, session_id),
+        )
+
+
+def dismiss_research_session(
+    session_id: str,
+    claim_text: str,
+    source_url: str | None,
+    user_read: str,
+    reason: str,
+    now_iso: str,
+):
+    """Inserts the research_log row and flips the session to 'dismissed' in
+    one connection block, same atomicity rationale as promote_research_session."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO research_log
+               (session_id, claim_text, source_url, user_read, dismissed_at, dismiss_reason)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, claim_text, source_url, user_read, now_iso, reason),
+        )
+        conn.execute(
+            "UPDATE research_sessions SET status = 'dismissed', updated_at = ? WHERE session_id = ?",
+            (now_iso, session_id),
+        )
+
+
+def discard_research_session(session_id: str):
+    """Hard-deletes a session and its turns — no read-only record kept
+    anywhere, per catcor-events-spec.md section 2 ("Discarded... purged
+    entirely, not kept anywhere"). Children before parent."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM research_messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM research_sessions WHERE session_id = ?", (session_id,))

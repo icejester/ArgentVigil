@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/jrmallas/.gitRepos/amp-dev/**)"
+      "Read(//Users/jrmallas/.gitRepos/amp-dev/**)",
+      "Bash(bash utils/vigil.sh start backend)",
+      "Bash(bash utils/vigil.sh restart backend)"
     ]
   }
 }

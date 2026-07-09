@@ -1293,15 +1293,32 @@ async def catcor_refresh():
         raise HTTPException(502, str(e))
 
 
-# CATCOR Iteration 2 — Research Pane (backend/catcor_research.py).
-def _require_backend_credentials():
+# CATCOR Research Pane (backend/catcor_research.py), per catcor-events-spec.md.
+def _require_backend_credentials(backend: str):
     """Only Anthropic needs a key on AV's side — Forge is a local, unauthed
-    LAN service. Gate on the backend that will actually be used
-    (catcor_research.DEFAULT_BACKEND, driven by AI_BACKEND) rather than
-    unconditionally requiring ANTHROPIC_API_KEY, which would block the
-    Forge-default path for no reason."""
-    if catcor_research.DEFAULT_BACKEND == "anthropic" and "ANTHROPIC_API_KEY" not in os.environ:
+    LAN service. Gate on the backend actually resolved for THIS request
+    (now chosen per-turn via the request body, not just the module-level
+    AI_BACKEND default) — otherwise a request explicitly choosing
+    "anthropic" while the server default is "forge" would sail past this
+    check and fail later with a raw KeyError inside call_anthropic."""
+    if backend == "anthropic" and "ANTHROPIC_API_KEY" not in os.environ:
         raise HTTPException(500, "ANTHROPIC_API_KEY environment variable is not set")
+
+
+def _turn_kwargs_from_body(body: dict) -> dict:
+    """Shared extraction of the five-control turn parameters (spec section
+    3) from a request body — used by both session-creation and message-send
+    routes so the two don't drift apart."""
+    return dict(
+        backend=body.get("backend", catcor_research.DEFAULT_BACKEND),
+        model=body.get("model"),
+        persona=body.get("persona", catcor_research.DEFAULT_PERSONA),
+        context_blocks=body.get("context_blocks", []),
+        memory_mode=body.get("memory_mode"),
+        freeform_text=body.get("freeform_text"),
+        system_prompt_override=body.get("system_prompt_override"),
+        messages_override=body.get("messages_override"),
+    )
 
 
 @app.post("/api/catcor/research/sessions")
@@ -1313,10 +1330,11 @@ async def catcor_research_create_session(body: dict = Body(...)):
     claim_text = body.get("claim_text")
     if not claim_text:
         raise HTTPException(400, "claim_text is required")
-    _require_backend_credentials()
+    turn_kwargs = _turn_kwargs_from_body(body)
+    _require_backend_credentials(turn_kwargs["backend"])
     session_id = catcor_research.create_session(claim_text, body.get("source_url"))
     try:
-        result = await catcor_research.send_message(_client, session_id, claim_text)
+        result = await catcor_research.send_message(_client, session_id, claim_text, **turn_kwargs)
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
     except RuntimeError as e:
@@ -1331,6 +1349,13 @@ async def catcor_research_evidence_dump():
     them directly. Lets you see exactly what data Claude has access to
     before/without holding a conversation, at zero cost."""
     return {"success": True, "data": catcor_research.dump_all_evidence()}
+
+
+@app.get("/api/catcor/research/personas")
+async def catcor_research_list_personas():
+    """Backs spec 3.2's dynamically-populated persona dropdown — reflects
+    whatever's actually in backend/prompts/ right now, no registration step."""
+    return {"success": True, "data": catcor_research.list_personas()}
 
 
 @app.get("/api/catcor/research/sessions/db")
@@ -1348,19 +1373,95 @@ async def catcor_research_get_session(session_id: str):
 
 @app.post("/api/catcor/research/sessions/{session_id}/messages")
 async def catcor_research_send_message(session_id: str, body: dict = Body(...)):
-    _require_backend_credentials()
     content = body.get("content")
     if not content:
         raise HTTPException(400, "content is required")
     if catcor_research.get_session_detail(session_id) is None:
         raise HTTPException(404, f"No research session with id {session_id}")
+    turn_kwargs = _turn_kwargs_from_body(body)
+    _require_backend_credentials(turn_kwargs["backend"])
     try:
-        result = await catcor_research.send_message(_client, session_id, content)
+        result = await catcor_research.send_message(_client, session_id, content, **turn_kwargs)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
     except httpx.HTTPError as e:
         raise HTTPException(502, str(e))
     except RuntimeError as e:
         raise HTTPException(502, str(e))
     return {"success": True, "data": result}
+
+
+@app.post("/api/catcor/research/sessions/{session_id}/read")
+async def catcor_research_set_read(session_id: str, body: dict = Body(...)):
+    user_read = body.get("user_read")
+    if user_read not in ("bullish", "bearish", "neutral"):
+        raise HTTPException(400, "user_read must be one of bullish|bearish|neutral")
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        catcor_research.set_read(session_id, user_read)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"success": True, "data": catcor_research.get_session_detail(session_id)}
+
+
+@app.post("/api/catcor/research/sessions/{session_id}/promote")
+async def catcor_research_promote(session_id: str, body: dict = Body(...)):
+    event_name = body.get("event_name")
+    scheduled_time = body.get("scheduled_time")
+    direction = body.get("direction")
+    if not event_name or not scheduled_time or direction not in ("bullish", "bearish"):
+        raise HTTPException(400, "event_name, scheduled_time, and direction (bullish|bearish) are required")
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        event_id = catcor_research.promote_session(session_id, event_name, scheduled_time, direction)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"success": True, "data": {"event_id": event_id}}
+
+
+@app.post("/api/catcor/research/sessions/{session_id}/dismiss")
+async def catcor_research_dismiss(session_id: str, body: dict = Body(...)):
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(400, "reason is required")
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        catcor_research.dismiss_session(session_id, reason)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"success": True, "data": None}
+
+
+@app.post("/api/catcor/research/sessions/{session_id}/discard")
+async def catcor_research_discard(session_id: str):
+    if catcor_research.get_session_detail(session_id) is None:
+        raise HTTPException(404, f"No research session with id {session_id}")
+    try:
+        catcor_research.discard_session(session_id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"success": True, "data": None}
+
+
+@app.get("/api/catcor/research/forge-sessions")
+async def catcor_research_forge_sessions():
+    """STUB. Spec 3.4 calls for viewing/clearing amp-forge's own
+    server-side session state (separate from AV's own research_sessions),
+    since amp-forge may hold model-side context independent of what AV
+    resends. That contract lives in forge-spec.md, in the separate amp-dev
+    repo, and has not been confirmed against this codebase — call_forge
+    always sends persist:false today, but nothing here queries or clears
+    any amp-forge-side state. Returns a fixed "not yet available" payload
+    rather than guessing at a wire call; replace once forge-spec.md's
+    actual contract (if any such endpoint exists) is confirmed."""
+    return {
+        "success": False,
+        "data": None,
+        "detail": "amp-forge session visibility not yet available — forge-spec.md contract unconfirmed",
+    }
 
 
 # Serve built frontend; keep last so API routes take priority
