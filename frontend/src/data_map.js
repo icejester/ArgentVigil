@@ -300,14 +300,14 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
       {
         name: "spot_price_tick",
         fields: [
-          ["series_id", "PK (with ts)"],
+          ["series_id", "PK (with ts) — \"XAG\"/\"XAU\" (real metalcharts.org spot ticks, this card's source) or \"XAG_FUTURES\"/\"XAU_FUTURES\" (Yahoo SI=F/GC=F futures bars, a different instrument backfilled by CATCOR — see the catcor_reactions card)"],
           ["ts", "PK — timestamp of this tick"],
           ["price", "Price at that tick"],
         ],
-        note: "Append-only (INSERT OR IGNORE) — the true intraday series, written on every fast-tier poll alongside spot_price_snapshot. Used by CATCOR's snapshot capture to find prices near an event window, and by GET /api/prices/db/ticks (below) for the Paper Leverage panel's price chart.",
+        note: "Append-only (INSERT OR IGNORE) — two distinct series_id families share this table. \"XAG\"/\"XAU\" (this source's fast-tier poll, ~60s cadence) power GET /api/prices/db/ticks and the Paper Leverage panel's price chart. \"XAG_FUTURES\"/\"XAU_FUTURES\" (Yahoo futures, ~5m cadence, see catcor_reactions) power CATCOR's event-reaction snapshot capture only — never the spot chart. These two used to collide under the same \"XAG\"/\"XAU\" keys, a real bug (futures prints running ~0.3-0.6 higher than spot, interleaved on the same chart line, producing a sawtooth) fixed by giving Yahoo's bars their own series_id.",
       },
     ],
-    note: "GET /api/prices/db/ticks?series_id=&hours= (Paper Leverage panel's 6H/12H/24H/48H/1M/3M/6M/12M price chart) stitches three resolutions since no single table covers every window: spot_price_tick (60s ticks, only from whenever the fast tier first ran — currently back to ~2026-04-22), then fred_observations' XAG_DAILY_CLOSE/XAU_DAILY_CLOSE (daily, ~120 days), then XAG_CLOSE/XAU_CLOSE (month-end, back to 2006) for anything older. See db.get_price_history.",
+    note: "GET /api/prices/db/ticks?series_id=&hours= (Paper Leverage panel's 6H/12H/24H/48H/1M/3M/6M/12M price chart) stitches three resolutions since no single table covers every window: spot_price_tick's \"XAG\"/\"XAU\" rows (60s real spot ticks, only from whenever the fast tier first ran — currently back to ~2026-04-22), then fred_observations' XAG_DAILY_CLOSE/XAU_DAILY_CLOSE (daily, ~120 days), then XAG_CLOSE/XAU_CLOSE (month-end, back to 2006) for anything older. See db.get_price_history. Never reads spot_price_tick's \"XAG_FUTURES\"/\"XAU_FUTURES\" rows (CATCOR-only, see catcor_reactions).",
   },
   {
     key: "fred",
@@ -458,7 +458,7 @@ curl "https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api
   {
     key: "catcor_reactions",
     label: "CATCOR — price reaction capture",
-    origin: "Computed from spot_price_tick / fred_observations (XAG_DAILY_CLOSE etc.) around each event's scheduled_time",
+    origin: "Computed from spot_price_tick's XAG_FUTURES/XAU_FUTURES rows (Yahoo SI=F/GC=F futures bars — NOT the spot chart's XAG/XAU rows, a deliberately separate series_id family) / fred_observations (XAG_DAILY_CLOSE etc.) around each event's scheduled_time",
     cadence: "Polled every 60s (main.py's _event_tier_loop, always-on — a missed window is permanent data loss)",
     sourceKeys: ["catcor_snapshot"],
     healthMeta: {
@@ -489,22 +489,27 @@ curl "https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=1
   },
   {
     key: "research",
-    label: "CATCOR Research Pane (chat)",
-    origin: "AV's own backend/catcor_research.py — not a third-party upstream. Each turn is one call to whichever model backend AI_BACKEND resolves to.",
+    label: "CATCOR Research Pane",
+    origin: "AV's own backend/catcor_research.py — not a third-party upstream. Each turn is one call to whichever model backend is selected for that turn (per-request, defaulting to AI_BACKEND's server-wide default).",
     cadence: "On-demand only — one call per Send click in the Research tab, no background loop.",
-    rateLimit: "Whichever backend is active: Anthropic Messages API (real cost/request) or amp-forge, a local Ollama-backed LAN service with no rate limit.",
-    curl: `# Anthropic (AI_BACKEND=anthropic)
+    rateLimit: "Whichever backend is chosen for a given turn: Anthropic Messages API (real cost/request) or amp-forge, a local Ollama-backed LAN service with no rate limit.",
+    curl: `# Anthropic (backend: "anthropic" in the turn's request body)
 curl https://api.anthropic.com/v1/messages \\
   -H "x-api-key: \${ANTHROPIC_API_KEY}" \\
   -H "anthropic-version: 2023-06-01" \\
   -H "content-type: application/json" \\
   -d '{"model": "claude-haiku-4-5-20251001", "max_tokens": 2000, "system": "...", "messages": [...]}'
 
-# amp-forge (AI_BACKEND=forge, the default)
+# amp-forge (backend: "forge", the default)
 curl -N -X POST http://amp-forge:8001/chat/stream \\
   -H "Content-Type: application/json" \\
-  -d '{"message": "...", "system": "...", "model": "qwen3:8b", "persist": false}'`,
-    note: "Currently single-call, no tools: every turn goes through prompts/word_count_v1.py, a deliberately trivial word-counting persona used to validate chat plumbing (session/message persistence, backend routing, frontend rendering) independent of real evidence-gathering. The earlier 2-call parser+analyst pipeline (prompts/parser_v1.py + analyst_v1.py — decompose a claim, fetch AV's own CoT/inventory/money-supply/market-balance data via read-only tools, then contextualize it) is built and importable but not wired into send_message right now. research_log/promote/dismiss (SPEC.MD Deliverable 3) are not implemented — sessions can only be created and chatted in, never promoted to event_calendar or dismissed.",
+  -d '{"message": "...", "system": "...", "history": [...], "model": "qwen3:8b", "persist": false}'
+
+# Send a turn with the full five-control set (model/persona/context/memory/override)
+curl -X POST localhost:8000/api/catcor/research/sessions/<id>/messages \\
+  -H "Content-Type: application/json" \\
+  -d '{"content": "...", "backend": "forge", "persona": "analyst_v1", "context_blocks": ["cot_positioning", "money_supply"], "memory_mode": "accumulating"}'`,
+    note: "Every turn is assembled from five independently-adjustable controls (model, persona, context blocks, memory mode, prompt transparency — catcor-events-spec.md section 3), nothing auto-fetched by model choice. Persona is dynamically read from backend/prompts/ (GET /api/catcor/research/personas) — analyst_v1, parser_v1, and word_count_v1 are all live, selectable personas today, no 'not wired in' distinction anymore. Context blocks (CoT positioning, COMEX/SHFE inventory, money supply, market balance, prior turns, freeform paste) are folded into the prompt via a dict-to-text formatting layer, only when explicitly checked. Sessions have a full 4-state lifecycle (active/promoted/dismissed/discarded — discarded sessions are hard-deleted, never a stored status) with promote/dismiss/discard all implemented per spec section 5's gating rules (promote and dismiss both require a read set first; dismiss additionally requires a non-empty reason and at least one turn; discard has no gating). Promoting writes a new Observed-origin event_calendar row (source_tier='discovered') backlinked via research_session_id. amp-forge's own server-side session visibility/clearing (spec 3.4) is a known, disclosed gap — GET /api/catcor/research/forge-sessions is a stub returning 'not yet available,' since that contract lives in a separate repo's forge-spec.md and is unconfirmed.",
     tables: [
       {
         name: "research_sessions",
@@ -512,8 +517,9 @@ curl -N -X POST http://amp-forge:8001/chat/stream \\
           ["session_id", "PK — UUID"],
           ["claim_text", "The pasted claim/first message, as originally entered"],
           ["source_url", "Optional"],
-          ["status", "active | promoted | dismissed — always 'active' currently, nothing sets the other two yet"],
-          ["user_read", "bullish | bearish | neutral — not currently settable, no /read route yet"],
+          ["status", "active | promoted | dismissed — discarded sessions are deleted outright, never a 4th stored value"],
+          ["user_read", "bullish | bearish | neutral — settable via POST .../read"],
+          ["memory_mode", "stateless | accumulating — the session's current setting, defaults to accumulating; used to default the turn composer's toggle to wherever it was left"],
           ["created_at", "ISO timestamp"],
           ["updated_at", "Bumped on every message"],
         ],
@@ -526,8 +532,15 @@ curl -N -X POST http://amp-forge:8001/chat/stream \\
           ["role", "user | assistant"],
           ["content", "Raw turn text (user) or a small JSON envelope {\"final_text\": ...} (assistant)"],
           ["created_at", "ISO timestamp, preserves ordering"],
+          ["backend", "assistant rows only — 'anthropic' | 'forge', which backend answered"],
+          ["model", "assistant rows only — resolved model string actually used"],
+          ["persona", "assistant rows only — persona filename stem active for this turn"],
+          ["context_blocks", "user rows only — JSON array of the context blocks checked for this turn"],
+          ["memory_mode", "user rows only — stateless | accumulating, the mode this turn was sent under"],
+          ["memory_changed", "user rows only — 1 if this turn's memory_mode differs from the session's previous turn, else 0; drives the transcript's memory-switch divider"],
+          ["assembled_prompt", "user rows only — the exact system+messages payload sent to the model, for transcript replay"],
         ],
-        note: "Append-only — a turn is never edited or deleted once persisted, same convention as cot_silver/cot_gold.",
+        note: "Append-only — a turn is never edited or deleted once persisted, same convention as cot_silver/cot_gold. A 'turn' is a user-row/assistant-row pair; fields are split across the two roles rather than duplicated on both (see backend vs. context_blocks above).",
       },
       {
         name: "research_log",
@@ -538,9 +551,10 @@ curl -N -X POST http://amp-forge:8001/chat/stream \\
           ["source_url", "Optional"],
           ["user_read", "bullish | bearish | neutral"],
           ["dismissed_at", "ISO timestamp"],
+          ["dismiss_reason", "Required, non-empty — why this claim didn't hold up"],
           ["validation_status", "correct | incorrect | mixed — reserved for a later validation pass, always NULL today"],
         ],
-        note: "Table exists in the schema but nothing writes to it yet — the 'log as noise' disposition (SPEC.MD Deliverable 3) isn't built.",
+        note: "Written by POST .../dismiss — 'log as noise' is fully implemented (dismiss_reason is required and non-empty; the session must already have a read and at least one turn).",
       },
     ],
   },

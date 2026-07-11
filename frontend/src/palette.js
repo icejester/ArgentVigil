@@ -7,4 +7,5 @@ export const CATCOR_EVENT_COLORS = {
   FOMC: "#e05252",
   CPI: "#7b9fff",
   NFP: "#4caf76",
+  observed: "#d9a441",
 };

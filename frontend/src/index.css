@@ -56,10 +56,19 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   padding: 6px 14px; font-size: 12px; font-weight: 600; color: #8a94a6;
   cursor: pointer; letter-spacing: 0.05em; text-transform: uppercase;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
+  display: inline-flex; align-items: center; gap: 6px;
 }
 .section-nav-button:hover { border-color: #4a5268; color: #c8d0de; }
 .section-nav-button--active {
   border-color: #7b9fff; color: #7b9fff; background: #0d1428;
+}
+.section-pin-icon {
+  font-size: 11px; opacity: 0.25; filter: grayscale(1);
+  transition: opacity 0.15s, filter 0.15s;
+}
+.section-nav-button:hover .section-pin-icon { opacity: 0.6; }
+.section-pin-icon--pinned {
+  opacity: 1; filter: none;
 }
 
 /* ── Header ── */
@@ -293,6 +302,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-panel-note {
   font-size: 11px; color: #3e4860; line-height: 1.55;
 }
+.live-toggle {
+  display: flex; align-items: center; gap: 5px; cursor: pointer;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: #5a6278;
+}
+.live-toggle input { cursor: pointer; accent-color: #7b9fff; }
+.live-toggle:has(input:checked) { color: #7b9fff; }
 .comex-chart-block { flex-basis: 100%; width: 100%; margin-top: 6px; }
 .comex-chart-subheader {
   font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
@@ -574,47 +590,185 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border-radius: 6px; padding: 14px 16px; color: #e05252;
 }
 
-/* ── Research panel (CATCOR Iteration 2 chat) ── */
-.research-feed {
-  display: flex; flex-direction: column; gap: 12px;
-  min-height: 220px; max-height: 60vh; overflow-y: auto;
-  padding: 4px 2px;
-}
+/* ── Research panel (CATCOR Research Pane, catcor-events-spec.md) ── */
+.research-mono { font-family: "Fira Code", "Courier New", monospace; }
+
 .research-empty-hint {
   color: #3e4860; font-size: 12px; text-align: center; padding: 40px 0;
 }
-.research-bubble {
-  display: flex; flex-direction: column; gap: 4px;
-  max-width: 80%; padding: 10px 14px; border-radius: 8px;
-  font-size: 13px; line-height: 1.6; white-space: pre-wrap;
+
+/* Session list/browser */
+.research-list { display: flex; flex-direction: column; gap: 16px; }
+.research-new-session { display: flex; flex-direction: column; gap: 8px; }
+.research-new-session-row { display: flex; align-items: center; gap: 10px; }
+.research-new-session-model {
+  background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
+  color: #c8d0de; padding: 10px 12px; font-size: 12px; font-family: inherit;
 }
-.research-bubble--user {
-  align-self: flex-end; background: #0d1428; border: 1px solid #2a3a6b;
-  color: #c8d0de;
+.research-session-row { cursor: pointer; }
+.research-session-row:hover td { background: #191d29; }
+.research-select-col { width: 28px; text-align: center; }
+.research-select-col input { cursor: pointer; accent-color: #7b9fff; }
+.research-trash-btn {
+  background: none; border: 1px solid #2e3547; color: #e05252;
+  font-size: 12px; letter-spacing: 0.02em; cursor: pointer;
+  padding: 4px 10px; border-radius: 6px; white-space: nowrap;
 }
-.research-bubble--assistant {
-  align-self: flex-start; background: #141820; border: 1px solid #2e3547;
-  color: #c8d0de;
+.research-trash-btn:hover:not(:disabled) { border-color: #e05252; background: rgba(224, 82, 82, 0.08); }
+.research-trash-btn:disabled { opacity: 0.5; cursor: default; }
+.research-demote-btn {
+  background: none; border: 1px solid #2e3547; color: #d9a441;
+  font-size: 12px; letter-spacing: 0.02em; cursor: pointer;
+  padding: 4px 10px; border-radius: 6px; white-space: nowrap; margin-left: 6px;
 }
-.research-bubble--pending .research-bubble-text { color: #5a6278; }
-.research-bubble-role {
-  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
-  text-transform: uppercase; color: #5a6278;
+.research-demote-btn:hover:not(:disabled) { border-color: #d9a441; background: rgba(217, 164, 65, 0.08); }
+.research-demote-btn:disabled { opacity: 0.5; cursor: default; }
+.research-status-badge {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; padding: 2px 8px; border-radius: 4px;
+  border: 1px solid #2e3547; color: #8892a8;
+}
+.research-status-badge--active { border-color: #7b9fff; color: #7b9fff; }
+.research-status-badge--promoted { border-color: #3fae6a; color: #3fae6a; }
+.research-status-badge--dismissed { border-color: #5a6278; color: #5a6278; }
+
+/* Session view shell */
+.research-session-view { display: flex; flex-direction: column; gap: 14px; }
+.research-back-btn {
+  align-self: flex-start; background: none; border: 1px solid #2e3547;
+  color: #8892a8; border-radius: 6px; padding: 6px 12px; font-size: 12px;
+  cursor: pointer;
+}
+.research-back-btn:hover { border-color: #7b9fff; color: #7b9fff; }
+.research-claim-header {
+  font-size: 13px; color: #c8d0de; padding: 10px 12px;
+  background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
+  white-space: pre-wrap;
+}
+.research-source-url { font-size: 11px; color: #5a6278; }
+.research-readonly-note {
+  font-size: 12px; color: #5a6278; font-style: italic; padding: 8px 0;
+}
+
+/* Terminal-style transcript — monospace log, not chat bubbles */
+.research-transcript {
+  display: flex; flex-direction: column;
+  min-height: 80px; max-height: 60vh; overflow-y: auto; padding: 10px 12px;
+  background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
+  font-family: "Fira Code", "Courier New", monospace; font-size: 12.5px;
+}
+.research-turn { border-bottom: 1px solid #2e3547; padding: 10px 0; }
+.research-turn:first-child { padding-top: 0; }
+.research-turn:last-child { border-bottom: none; padding-bottom: 0; }
+.research-turn-meta {
+  color: #5a6278; font-size: 11px; display: flex; gap: 12px;
+  flex-wrap: wrap; margin-bottom: 6px;
+}
+.research-turn-memory-divider {
+  border-top: 1px dashed #7b9fff; color: #7b9fff; font-size: 11px;
+  padding: 6px 0; margin: 10px 0; text-align: center;
+  font-family: "Fira Code", "Courier New", monospace;
+}
+.research-turn-input-details { margin-bottom: 8px; }
+.research-turn-input-details summary {
+  cursor: pointer; color: #5a6278; font-size: 11px; user-select: none;
+}
+.research-turn-input {
+  color: #8892a8; white-space: pre-wrap; margin-top: 6px;
+  padding-left: 8px; border-left: 2px solid #2e3547;
+}
+.research-turn-input-msg { color: #6b778d; }
+.research-evidence-block {
+  border-left: 2px solid #4a9eff; padding-left: 8px; margin: 6px 0;
+  color: #9fc2f5; white-space: pre-wrap;
+}
+.research-turn-response { color: #c8d0de; white-space: pre-wrap; }
+
+/* Turn composer — five controls + input */
+.research-turn-composer { display: flex; flex-direction: column; gap: 10px; }
+.research-controls-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.research-control {
+  display: flex; flex-direction: column; gap: 4px; font-size: 11px;
+  color: #8892a8; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.research-control select {
+  background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
+  color: #c8d0de; padding: 6px 10px; font-size: 12px; font-family: inherit;
+}
+.research-context-checkboxes {
+  display: flex; flex-wrap: wrap; gap: 12px;
+}
+.research-checkbox-item {
+  display: flex; align-items: center; gap: 6px; font-size: 12px;
+  color: #8892a8; cursor: pointer;
+}
+.research-preview-details {
+  border: 1px solid #2e3547; border-radius: 6px; padding: 8px 12px;
+}
+.research-preview-details summary {
+  cursor: pointer; color: #5a6278; font-size: 11px; user-select: none;
+}
+.research-preview-body {
+  color: #6b778d; font-size: 11px; white-space: pre-wrap; margin-top: 8px;
 }
 .research-input-row { display: flex; gap: 8px; align-items: flex-end; }
 .research-textarea {
-  flex: 1; resize: vertical; background: #0f1117; border: 1px solid #2e3547;
+  width: 100%; resize: vertical; background: #0f1117; border: 1px solid #2e3547;
   border-radius: 6px; padding: 10px 12px; color: #c8d0de; font-size: 13px;
   font-family: inherit; line-height: 1.5;
 }
 .research-textarea:focus { outline: none; border-color: #7b9fff; }
 .research-textarea:disabled { opacity: 0.6; }
+.research-input {
+  width: 100%; background: #0f1117; border: 1px solid #2e3547;
+  border-radius: 6px; padding: 8px 12px; color: #c8d0de; font-size: 13px;
+  font-family: inherit;
+}
+.research-input:focus { outline: none; border-color: #7b9fff; }
 .research-submit-btn {
-  background: #0d1428; border: 1px solid #7b9fff; color: #7b9fff;
-  border-radius: 6px; padding: 10px 18px; font-size: 12px; font-weight: 600;
-  letter-spacing: 0.05em; text-transform: uppercase; cursor: pointer;
-  transition: background 0.15s;
+  align-self: flex-start; background: #0d1428; border: 1px solid #7b9fff;
+  color: #7b9fff; border-radius: 6px; padding: 10px 18px; font-size: 12px;
+  font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+  cursor: pointer; transition: background 0.15s;
 }
 .research-submit-btn:hover:not(:disabled) { background: #131f3f; }
 .research-submit-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Read -> disposition */
+.research-disposition { display: flex; flex-direction: column; gap: 10px; }
+.research-read-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8892a8; }
+.research-read-btn {
+  background: none; border: 1px solid #2e3547; color: #8892a8;
+  border-radius: 6px; padding: 5px 12px; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer;
+}
+.research-read-btn--active { border-color: #7b9fff; color: #7b9fff; }
+.research-disposition-actions { display: flex; gap: 10px; }
+.research-disposition-btn {
+  background: none; border: 1px solid #2e3547; color: #c8d0de;
+  border-radius: 6px; padding: 8px 14px; font-size: 12px; cursor: pointer;
+}
+.research-disposition-btn:hover:not(:disabled) { border-color: #7b9fff; }
+.research-disposition-btn:disabled { opacity: 0.4; cursor: default; }
+.research-disposition-btn--danger:hover:not(:disabled) { border-color: #e05252; color: #e05252; }
+.research-disposition-form {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  padding: 10px; border: 1px solid #2e3547; border-radius: 6px;
+}
+.research-disposition-form select {
+  background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
+  color: #c8d0de; padding: 8px 10px; font-size: 13px;
+}
+
+/* amp-forge session-visibility placeholder (spec 3.4, stub) */
+.research-forge-placeholder {
+  border: 1px dashed #2e3547; border-radius: 6px; padding: 8px 12px;
+}
+.research-forge-placeholder summary {
+  cursor: pointer; color: #5a6278; font-size: 11px; user-select: none;
+}
+.research-forge-placeholder-body {
+  color: #5a6278; font-size: 11px; margin-top: 8px; font-style: italic;
+}
+
 .loading { color: #4a5268; padding: 40px 0; text-align: center; }
