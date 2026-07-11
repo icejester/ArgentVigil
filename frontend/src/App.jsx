@@ -60,6 +60,44 @@ function HeaderHealthDot() {
 
 export default function App() {
   const [activeSection, setActiveSection] = useState("cot");
+  const [pinnedSection, setPinnedSection] = useState(null);
+  // Cross-panel hotlink: CatcorPanel sets this when a promoted (Observed-
+  // origin) catalyst's dot is clicked, so the Research tab opens straight
+  // into that session's record instead of its own session list.
+  const [openResearchSessionId, setOpenResearchSessionId] = useState(null);
+
+  function openResearchSession(sessionId) {
+    setOpenResearchSessionId(sessionId);
+    setActiveSection("research");
+  }
+
+  // On first load, open whichever tab is pinned (if any) instead of always
+  // defaulting to CoT — the pin is a shared, server-persisted setting
+  // (backend/db.py's ui_settings table), not a per-browser localStorage
+  // value, so it's consistent across devices/reloads.
+  useEffect(() => {
+    fetch("/api/ui/pinned-section")
+      .then((r) => r.json())
+      .then((j) => {
+        const pinned = j.data?.pinned_section ?? null;
+        setPinnedSection(pinned);
+        if (pinned && SECTIONS.some((s) => s.key === pinned)) {
+          setActiveSection(pinned);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  function togglePin(e, sectionKey) {
+    e.stopPropagation();
+    const next = pinnedSection === sectionKey ? null : sectionKey;
+    setPinnedSection(next);
+    fetch("/api/ui/pinned-section", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ section: next }),
+    }).catch(() => {});
+  }
 
   return (
     <>
@@ -86,6 +124,25 @@ export default function App() {
                 onClick={() => setActiveSection(s.key)}
               >
                 {s.label}
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className={
+                    "section-pin-icon" +
+                    (pinnedSection === s.key ? " section-pin-icon--pinned" : "")
+                  }
+                  title={
+                    pinnedSection === s.key
+                      ? "Pinned as default tab — click to unpin"
+                      : "Pin as default tab on startup"
+                  }
+                  onClick={(e) => togglePin(e, s.key)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") togglePin(e, s.key);
+                  }}
+                >
+                  📌
+                </span>
               </button>
             ))}
           </div>
@@ -114,10 +171,13 @@ export default function App() {
           "app-shell" + (activeSection === "catcor" ? "" : " section-hidden")
         }
       >
-        <CatcorPanel />
+        <CatcorPanel onOpenResearchSession={openResearchSession} />
       </div>
       <div className={activeSection === "research" ? "" : "section-hidden"}>
-        <ResearchPanel />
+        <ResearchPanel
+          openSessionId={openResearchSessionId}
+          onOpenedSession={() => setOpenResearchSessionId(null)}
+        />
       </div>
       <div
         className={

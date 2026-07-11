@@ -572,28 +572,45 @@ const PRICE_HISTORY_WINDOWS = [
 // meaningful once the window spans multiple days.
 const DATE_ONLY_TICKS_ABOVE_HOURS = 48;
 
-function PriceHistoryChart({ spotKey, label }) {
+// Matches the backend fast tier's own spot-price poll cadence (see
+// backend/main.py) — polling more often than the data itself changes
+// would just be wasted requests against an unchanged row.
+const PRICE_LIVE_POLL_MS = 60 * 1000;
+
+function PriceHistoryChart({ spotKey, label, live }) {
   const [hours, setHours] = useState(6);
   const [ticks, setTicks] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
+    const fetchTicks = () => {
+      fetch(`/api/prices/db/ticks?series_id=${spotKey}&hours=${hours}`)
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
+        .then((j) => {
+          if (!cancelled) setTicks(j.data ?? []);
+        })
+        .catch(() => {
+          if (!cancelled) setTicks([]);
+        });
+    };
     setTicks(null);
-    fetch(`/api/prices/db/ticks?series_id=${spotKey}&hours=${hours}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then((j) => {
-        if (!cancelled) setTicks(j.data ?? []);
-      })
-      .catch(() => {
-        if (!cancelled) setTicks([]);
-      });
+    fetchTicks();
+    // Live mode polls at the same ~60s cadence the backend's fast tier
+    // actually writes new ticks at — polling faster wouldn't surface data
+    // any sooner, since spot_price_tick itself only gains a new row every
+    // ~60s (see backend/main.py's fast-tier loop).
+    let timer = null;
+    if (live) {
+      timer = setInterval(fetchTicks, PRICE_LIVE_POLL_MS);
+    }
     return () => {
       cancelled = true;
+      if (timer) clearInterval(timer);
     };
-  }, [spotKey, hours]);
+  }, [spotKey, hours, live]);
 
   const windowButtons = (
     <div className="comex-range-selector">
@@ -671,6 +688,7 @@ function PaperLeveragePanel({ metal = "silver" }) {
   const { label, leverageUrl, contractOz, spotKey } = METAL_CONFIG[metal];
   const [leverageData, setLeverageData] = useState(null);
   const [prices, setPrices] = useState(null);
+  const [live, setLive] = useState(false);
 
   const fetchLeverageAndPrices = useCallback(() => {
     fetch(leverageUrl)
@@ -692,8 +710,18 @@ function PaperLeveragePanel({ metal = "silver" }) {
   useEffect(() => {
     fetchLeverageAndPrices();
     window.addEventListener(FORCE_REFRESH_EVENT, fetchLeverageAndPrices);
-    return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchLeverageAndPrices);
-  }, [fetchLeverageAndPrices]);
+    // Live mode additionally polls on the same cadence as PriceHistoryChart
+    // below, so the spot badge and the chart never disagree about how
+    // fresh "live" actually means.
+    let timer = null;
+    if (live) {
+      timer = setInterval(fetchLeverageAndPrices, PRICE_LIVE_POLL_MS);
+    }
+    return () => {
+      window.removeEventListener(FORCE_REFRESH_EVENT, fetchLeverageAndPrices);
+      if (timer) clearInterval(timer);
+    };
+  }, [fetchLeverageAndPrices, live]);
 
   if (!leverageData) return (
     <div className="comex-panel">
@@ -716,7 +744,11 @@ function PaperLeveragePanel({ metal = "silver" }) {
   return (
     <div className="comex-panel">
       <div className="comex-panel-header">
-        {label} Paper Leverage Ratio — Open Interest × {contractOz.toLocaleString()} oz / Registered
+        <span>{label} Paper Leverage Ratio — Open Interest × {contractOz.toLocaleString()} oz / Registered</span>
+        <label className="live-toggle" title="Auto-refresh this metal's price widgets every 60s">
+          <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} />
+          Live
+        </label>
       </div>
       <div className="comex-panel-note">
         Above 1.0 = more paper claims than registered metal available for delivery.
@@ -733,7 +765,7 @@ function PaperLeveragePanel({ metal = "silver" }) {
             <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
             <span>As of: <strong>{date}</strong></span>
           </div>
-          <PriceHistoryChart spotKey={spotKey} label={label} />
+          <PriceHistoryChart spotKey={spotKey} label={label} live={live} />
         </div>
       ) : (
         <div className="comex-empty">

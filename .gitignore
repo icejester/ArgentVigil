@@ -220,6 +220,7 @@ __marimo__/
 # ArgentVigil
 pipeline/cache/cot_data.json
 runtime/
+TDM/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/

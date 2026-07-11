@@ -137,6 +137,7 @@ def get_session_detail(session_id: str) -> dict | None:
     return {
         "session": session,
         "messages": db.list_research_messages(session_id),
+        "promoted_event": db.get_event_for_session(session_id) if session["status"] == "promoted" else None,
     }
 
 
@@ -605,6 +606,21 @@ def promote_session(session_id: str, event_name: str, scheduled_time: str, direc
     }
     db.promote_research_session(session_id, event_row, _now_iso())
     return event_id
+
+
+def delete_promoted_event(event_id: str) -> None:
+    """Reverses promote_session: only valid for source_tier='discovered'
+    events (never a government-seeded CPI/FOMC/NFP row, which has no
+    originating research session to revert and isn't this app's own
+    editorial call to delete). Reverts the originating session back to
+    'active' so it can be edited/re-promoted/dismissed/discarded again —
+    symmetric with what promote itself did."""
+    event = db.get_event(event_id)
+    if event is None:
+        raise ValueError(f"no event with id {event_id}")
+    if event["source_tier"] != "discovered":
+        raise ValueError(f"event {event_id} is not a promoted (discovered) event — cannot delete")
+    db.delete_promoted_event(event_id, event["research_session_id"], _now_iso())
 
 
 def dismiss_session(session_id: str, reason: str) -> None:

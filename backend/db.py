@@ -240,6 +240,11 @@ CREATE TABLE IF NOT EXISTS research_log (
     dismiss_reason TEXT NOT NULL DEFAULT '',
     validation_status TEXT
 );
+
+CREATE TABLE IF NOT EXISTS ui_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pinned_section TEXT
+);
 """
 
 
@@ -613,7 +618,8 @@ def get_upcoming_events(limit: int = 20) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT event_id, event_name, event_type, scheduled_time,
-                      consensus_value, actual_value, surprise_delta, source_url, source_tier
+                      consensus_value, actual_value, surprise_delta, source_url, source_tier,
+                      research_session_id, direction
                FROM event_calendar
                WHERE scheduled_time >= datetime('now')
                ORDER BY scheduled_time ASC
@@ -627,9 +633,24 @@ def get_event(event_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
             """SELECT event_id, event_name, event_type, scheduled_time,
-                      consensus_value, actual_value, surprise_delta, source_url, source_tier
+                      consensus_value, actual_value, surprise_delta, source_url, source_tier,
+                      research_session_id, direction
                FROM event_calendar WHERE event_id = ?""",
             (event_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_event_for_session(session_id: str) -> dict | None:
+    """Reverse lookup of get_event's research_session_id backlink — the
+    Research panel's session view needs the promoted event_id to offer a
+    Demote action, but a session only knows its own fields, not which
+    event it produced."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT event_id, event_name, scheduled_time, direction
+               FROM event_calendar WHERE research_session_id = ?""",
+            (session_id,),
         ).fetchone()
         return dict(row) if row else None
 
@@ -658,7 +679,8 @@ def get_event_reaction_series() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT e.event_id, e.event_name, e.event_type, e.scheduled_time,
-                      e.surprise_delta, r.metal, r.window, r.price, r.price_delta_pct,
+                      e.surprise_delta, e.research_session_id, e.direction,
+                      r.metal, r.window, r.price, r.price_delta_pct,
                       r.surprise_magnitude
                FROM event_calendar e
                JOIN macro_price_reaction r ON r.event_id = e.event_id
@@ -894,6 +916,24 @@ def get_last_run_at() -> str | None:
         return row["ran_at"] if row else None
 
 
+def set_pinned_section(section: str | None):
+    """Single shared 'which nav tab opens by default' setting — same
+    single-row-upsert convention as pipeline_runs above. section=None
+    un-pins (falls back to the frontend's own "cot" default)."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO ui_settings (id, pinned_section) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET pinned_section = excluded.pinned_section",
+            (section,),
+        )
+
+
+def get_pinned_section() -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT pinned_section FROM ui_settings WHERE id = 1").fetchone()
+        return row["pinned_section"] if row else None
+
+
 def record_fetch_attempt(source_key: str, success: bool, error: str | None = None, skipped: bool = False):
     """Upserts source_health's current-state row for source_key. A skip
     (rate-limit gate declined to even attempt the fetch) only touches
@@ -965,11 +1005,17 @@ def create_research_session(session_id: str, claim_text: str, source_url: str | 
 def list_research_sessions() -> list[dict]:
     """Widened beyond the original session_id/claim_text/status/updated_at
     to include user_read/source_url — the Phase 2 session-list view needs
-    read/disposition context per row without a separate detail fetch."""
+    read/disposition context per row without a separate detail fetch.
+    LEFT JOINs event_calendar for promoted_event_id — the list's bulk
+    demote action needs an event_id per promoted row without a separate
+    per-row lookup; NULL for active/dismissed rows."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT session_id, claim_text, source_url, status, user_read, updated_at
-               FROM research_sessions ORDER BY updated_at DESC"""
+            """SELECT s.session_id, s.claim_text, s.source_url, s.status, s.user_read, s.updated_at,
+                      e.event_id AS promoted_event_id
+               FROM research_sessions s
+               LEFT JOIN event_calendar e ON e.research_session_id = s.session_id
+               ORDER BY s.updated_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1096,6 +1142,24 @@ def promote_research_session(session_id: str, event_row: dict, now_iso: str):
             "UPDATE research_sessions SET status = 'promoted', updated_at = ? WHERE session_id = ?",
             (now_iso, session_id),
         )
+
+
+def delete_promoted_event(event_id: str, session_id: str | None, now_iso: str):
+    """Reverses promote_research_session: deletes the event_calendar row and
+    its macro_price_reaction rows, and — if the event still has a live
+    research_session_id backlink — reverts that session to 'active' so it
+    can be edited/re-promoted/dismissed/discarded again. Symmetric with
+    promote's own atomic write, same single-block rationale (an event
+    deleted but a session left dangling as 'promoted', or vice versa, would
+    both be inconsistent states)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM macro_price_reaction WHERE event_id = ?", (event_id,))
+        conn.execute("DELETE FROM event_calendar WHERE event_id = ?", (event_id,))
+        if session_id is not None:
+            conn.execute(
+                "UPDATE research_sessions SET status = 'active', updated_at = ? WHERE session_id = ?",
+                (now_iso, session_id),
+            )
 
 
 def dismiss_research_session(

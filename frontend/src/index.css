@@ -56,10 +56,19 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   padding: 6px 14px; font-size: 12px; font-weight: 600; color: #8a94a6;
   cursor: pointer; letter-spacing: 0.05em; text-transform: uppercase;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
+  display: inline-flex; align-items: center; gap: 6px;
 }
 .section-nav-button:hover { border-color: #4a5268; color: #c8d0de; }
 .section-nav-button--active {
   border-color: #7b9fff; color: #7b9fff; background: #0d1428;
+}
+.section-pin-icon {
+  font-size: 11px; opacity: 0.25; filter: grayscale(1);
+  transition: opacity 0.15s, filter 0.15s;
+}
+.section-nav-button:hover .section-pin-icon { opacity: 0.6; }
+.section-pin-icon--pinned {
+  opacity: 1; filter: none;
 }
 
 /* ── Header ── */
@@ -293,6 +302,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-panel-note {
   font-size: 11px; color: #3e4860; line-height: 1.55;
 }
+.live-toggle {
+  display: flex; align-items: center; gap: 5px; cursor: pointer;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: #5a6278;
+}
+.live-toggle input { cursor: pointer; accent-color: #7b9fff; }
+.live-toggle:has(input:checked) { color: #7b9fff; }
 .comex-chart-block { flex-basis: 100%; width: 100%; margin-top: 6px; }
 .comex-chart-subheader {
   font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
@@ -591,13 +607,22 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .research-session-row { cursor: pointer; }
 .research-session-row:hover td { background: #191d29; }
-.research-discard-link {
-  background: none; border: none; color: #5a6278; font-size: 11px;
-  text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer;
-  padding: 4px 6px;
+.research-select-col { width: 28px; text-align: center; }
+.research-select-col input { cursor: pointer; accent-color: #7b9fff; }
+.research-trash-btn {
+  background: none; border: 1px solid #2e3547; color: #e05252;
+  font-size: 12px; letter-spacing: 0.02em; cursor: pointer;
+  padding: 4px 10px; border-radius: 6px; white-space: nowrap;
 }
-.research-discard-link:hover:not(:disabled) { color: #e05252; }
-.research-discard-link:disabled { opacity: 0.5; cursor: default; }
+.research-trash-btn:hover:not(:disabled) { border-color: #e05252; background: rgba(224, 82, 82, 0.08); }
+.research-trash-btn:disabled { opacity: 0.5; cursor: default; }
+.research-demote-btn {
+  background: none; border: 1px solid #2e3547; color: #d9a441;
+  font-size: 12px; letter-spacing: 0.02em; cursor: pointer;
+  padding: 4px 10px; border-radius: 6px; white-space: nowrap; margin-left: 6px;
+}
+.research-demote-btn:hover:not(:disabled) { border-color: #d9a441; background: rgba(217, 164, 65, 0.08); }
+.research-demote-btn:disabled { opacity: 0.5; cursor: default; }
 .research-status-badge {
   font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
   text-transform: uppercase; padding: 2px 8px; border-radius: 4px;

@@ -41,6 +41,15 @@ async function postJSON(url, body) {
   return data.data;
 }
 
+async function deleteJSON(url) {
+  const res = await fetch(url, { method: "DELETE" });
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.detail || `request to ${url} failed`);
+  }
+  return data.data;
+}
+
 async function getJSON(url) {
   const res = await fetch(url);
   const data = await res.json();
@@ -50,7 +59,7 @@ async function getJSON(url) {
   return data.data;
 }
 
-export default function ResearchPanel() {
+export default function ResearchPanel({ openSessionId, onOpenedSession }) {
   const [view, setView] = useState("list"); // "list" | "session"
   const [sessions, setSessions] = useState([]);
   const [sessionsError, setSessionsError] = useState(null);
@@ -76,6 +85,18 @@ export default function ResearchPanel() {
     setView("list");
     refreshSessions();
   }
+
+  // Hotlink entry point (a CATCOR timeline dot's "open record" click) —
+  // jumps straight into a specific session regardless of whatever view
+  // this panel was already showing. onOpenedSession clears the request so
+  // navigating away and back to Research afterward doesn't re-trigger it.
+  useEffect(() => {
+    if (openSessionId) {
+      openSession(openSessionId);
+      onOpenedSession?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSessionId]);
 
   return (
     <div className="app-shell">
@@ -111,21 +132,77 @@ function SessionList({ sessions, error, onOpen, onCreated, onRefresh }) {
   const [backend, setBackend] = useState("forge");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState(null);
-  const [discardError, setDiscardError] = useState(null);
-  const [discardingId, setDiscardingId] = useState(null);
+  const [actionError, setActionError] = useState(null);
+  const [selected, setSelected] = useState(() => new Set());
+  const [acting, setActing] = useState(false);
 
-  async function handleDiscard(e, sessionId) {
+  const sessionsById = new Map(sessions.map((s) => [s.session_id, s]));
+
+  // Selectable rows: active (discardable) or promoted (demotable) —
+  // dismissed sessions are terminal with no further action, so they never
+  // render a checkbox at all. A selection CAN be a mix of active and
+  // promoted rows — in that case selectionStatus is null and both the
+  // discard and demote header buttons render disabled (greyed out) rather
+  // than either guessing which action was meant.
+  const selectableIds = sessions.filter((s) => s.status === "active" || s.status === "promoted").map((s) => s.session_id);
+  const selectedStatuses = new Set([...selected].map((id) => sessionsById.get(id)?.status).filter(Boolean));
+  const selectionStatus = selectedStatuses.size === 1 ? [...selectedStatuses][0] : null;
+  const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.has(id));
+
+  function toggleOne(e, session) {
     e.stopPropagation();
-    if (!window.confirm("Discard this session? This purges it entirely — no record kept.")) return;
-    setDiscardingId(sessionId);
-    setDiscardError(null);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(session.session_id)) next.delete(session.session_id);
+      else next.add(session.session_id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected(allSelected ? new Set() : new Set(selectableIds));
+  }
+
+  async function handleDiscardSelected() {
+    if (selected.size === 0 || selectionStatus !== "active") return;
+    const count = selected.size;
+    if (!window.confirm(`Discard ${count} session${count === 1 ? "" : "s"}? This purges them entirely — no record kept.`)) return;
+    setActing(true);
+    setActionError(null);
     try {
-      await postJSON(`/api/catcor/research/sessions/${sessionId}/discard`, {});
+      await Promise.all(
+        [...selected].map((sessionId) => postJSON(`/api/catcor/research/sessions/${sessionId}/discard`, {}))
+      );
+      setSelected(new Set());
       onRefresh();
     } catch (err) {
-      setDiscardError(err.message);
+      setActionError(err.message);
+      onRefresh(); // some may have succeeded before the failure — reflect that
     } finally {
-      setDiscardingId(null);
+      setActing(false);
+    }
+  }
+
+  async function handleDemoteSelected() {
+    if (selected.size === 0 || selectionStatus !== "promoted") return;
+    const count = selected.size;
+    if (!window.confirm(
+      `Demote ${count} catalyst${count === 1 ? "" : "s"}? This removes ${count === 1 ? "it" : "them"} from the CATCOR timeline and reopens the session${count === 1 ? "" : "s"} for editing/re-promotion/dismiss/discard.`
+    )) return;
+    setActing(true);
+    setActionError(null);
+    try {
+      const eventIds = [...selected]
+        .map((sessionId) => sessionsById.get(sessionId)?.promoted_event_id)
+        .filter(Boolean);
+      await Promise.all(eventIds.map((eventId) => deleteJSON(`/api/catcor/events/${eventId}`)));
+      setSelected(new Set());
+      onRefresh();
+    } catch (err) {
+      setActionError(err.message);
+      onRefresh();
+    } finally {
+      setActing(false);
     }
   }
 
@@ -186,7 +263,7 @@ function SessionList({ sessions, error, onOpen, onCreated, onRefresh }) {
         </div>
       </form>
       {createError && <div className="error-box">{createError}</div>}
-      {discardError && <div className="error-box">{discardError}</div>}
+      {actionError && <div className="error-box">{actionError}</div>}
 
       {error && <div className="error-box">{error}</div>}
       {!error && sessions.length === 0 && (
@@ -197,16 +274,66 @@ function SessionList({ sessions, error, onOpen, onCreated, onRefresh }) {
           <table className="comex-table research-mono">
             <thead>
               <tr>
+                <th className="research-select-col">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    onChange={toggleAll}
+                    disabled={selectableIds.length === 0}
+                    title="Select all"
+                  />
+                </th>
                 <th>Claim</th>
                 <th>Status</th>
                 <th>Read</th>
                 <th className="right">Updated</th>
-                <th></th>
+                <th className="right">
+                  {selected.size > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        className="research-trash-btn"
+                        onClick={handleDiscardSelected}
+                        disabled={acting || selectionStatus !== "active"}
+                        title={
+                          selectionStatus === "active"
+                            ? `Discard ${selected.size} selected`
+                            : "Select only active sessions to discard"
+                        }
+                      >
+                        {acting && selectionStatus === "active" ? "…" : `🗑 (${selected.size})`}
+                      </button>
+                      <button
+                        type="button"
+                        className="research-demote-btn"
+                        onClick={handleDemoteSelected}
+                        disabled={acting || selectionStatus !== "promoted"}
+                        title={
+                          selectionStatus === "promoted"
+                            ? `Demote ${selected.size} selected`
+                            : "Select only promoted catalysts to demote"
+                        }
+                      >
+                        {acting && selectionStatus === "promoted" ? "…" : `⬇ (${selected.size})`}
+                      </button>
+                    </>
+                  )}
+                </th>
               </tr>
             </thead>
             <tbody>
               {sessions.map((s) => (
                 <tr key={s.session_id} className="research-session-row" onClick={() => onOpen(s.session_id)}>
+                  <td className="research-select-col">
+                    {(s.status === "active" || s.status === "promoted") && (
+                      <input
+                        type="checkbox"
+                        checked={selected.has(s.session_id)}
+                        onChange={(e) => toggleOne(e, s)}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    )}
+                  </td>
                   <td>{s.claim_text.length > 80 ? s.claim_text.slice(0, 80) + "…" : s.claim_text}</td>
                   <td>
                     <span className={`research-status-badge research-status-badge--${s.status}`}>
@@ -215,18 +342,7 @@ function SessionList({ sessions, error, onOpen, onCreated, onRefresh }) {
                   </td>
                   <td>{s.user_read || "—"}</td>
                   <td className="right">{fmtDateTime(s.updated_at)}</td>
-                  <td className="right">
-                    {s.status === "active" && (
-                      <button
-                        type="button"
-                        className="research-discard-link"
-                        onClick={(e) => handleDiscard(e, s.session_id)}
-                        disabled={discardingId === s.session_id}
-                      >
-                        {discardingId === s.session_id ? "…" : "Discard"}
-                      </button>
-                    )}
-                  </td>
+                  <td></td>
                 </tr>
               ))}
             </tbody>

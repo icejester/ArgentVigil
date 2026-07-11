@@ -86,6 +86,7 @@ function toScatterPoints(reactions, events, window, metal) {
       event_name: r.event_name,
       event_type: r.event_type,
       scheduled_time: r.scheduled_time,
+      research_session_id: r.research_session_id ?? null,
       y: r.price_delta_pct,
       surprise_magnitude: r.surprise_magnitude,
       isFuture: false,
@@ -105,6 +106,7 @@ function toScatterPoints(reactions, events, window, metal) {
       event_name: e.event_name,
       event_type: e.event_type,
       scheduled_time: e.scheduled_time,
+      research_session_id: e.research_session_id ?? null,
       y: 0,
       surprise_magnitude: null,
       isFuture: true,
@@ -112,6 +114,13 @@ function toScatterPoints(reactions, events, window, metal) {
     });
   }
   return { withSurprise, timeline };
+}
+
+function RecordHotlinkHint({ researchSessionId }) {
+  if (!researchSessionId) return null;
+  return (
+    <div style={{ color: "#d9a441", marginTop: 4 }}>Click to open the research record →</div>
+  );
 }
 
 function CatcorTooltip({ active, payload }) {
@@ -125,6 +134,7 @@ function CatcorTooltip({ active, payload }) {
       <div style={{ color: "#8a94a6" }}>{fmtDateTime(p.scheduled_time)}</div>
       <div>Surprise magnitude: {p.x.toFixed(3)}</div>
       <div>Price reaction: {fmtPct(p.y)}</div>
+      <RecordHotlinkHint researchSessionId={p.research_session_id} />
     </div>
   );
 }
@@ -140,6 +150,7 @@ function TimelineTooltip({ active, payload }) {
         </div>
         <div style={{ color: "#8a94a6" }}>{fmtDateTime(p.scheduled_time)}</div>
         <div style={{ color: "#8a94a6" }}>Scheduled — hasn't happened yet, no reaction to show</div>
+        <RecordHotlinkHint researchSessionId={p.research_session_id} />
       </div>
     );
   }
@@ -155,6 +166,7 @@ function TimelineTooltip({ active, payload }) {
       ) : (
         <div style={{ color: "#8a94a6" }}>No consensus source yet — surprise magnitude unknown</div>
       )}
+      <RecordHotlinkHint researchSessionId={p.research_session_id} />
     </div>
   );
 }
@@ -188,7 +200,7 @@ function makeLinkedShape(color, hoveredEventId, baseRadius, diamond) {
   };
 }
 
-export default function CatcorPanel() {
+export default function CatcorPanel({ onOpenResearchSession }) {
   const [events, setEvents] = useState(null);
   const [reactions, setReactions] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -206,6 +218,28 @@ export default function CatcorPanel() {
   // matching event's point in the OTHER chart (and itself), regardless of
   // which chart the pointer is actually over.
   const [hoveredEventId, setHoveredEventId] = useState(null);
+  // Legend click-to-toggle (same convention as silver_cot_tracker.jsx's
+  // CoT lines) — a Set of event_type strings currently hidden from both
+  // charts. Empty by default: everything visible until the user hides one.
+  const [hiddenTypes, setHiddenTypes] = useState(() => new Set());
+
+  function toggleType(type) {
+    setHiddenTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  }
+
+  // Only Observed-origin (promoted-from-Research) points carry a
+  // research_session_id — clicking a government-seeded (CPI/FOMC/NFP)
+  // point is a no-op, since there's no session record to hotlink to.
+  function handlePointClick(p) {
+    if (p?.research_session_id && onOpenResearchSession) {
+      onOpenResearchSession(p.research_session_id);
+    }
+  }
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -247,12 +281,15 @@ export default function CatcorPanel() {
     }
   }
 
-  const { withSurprise, timeline: fullTimeline } = reactions
+  const { withSurprise: allWithSurprise, timeline: fullTimeline } = reactions
     ? toScatterPoints(reactions, events, window_, metal)
     : { withSurprise: [], timeline: [] };
   const lookbackStart = lookbackStartFor(lookbackMonths);
   const lookaheadEnd = Date.now() + LOOKAHEAD_DAYS * 86400000;
-  const timeline = fullTimeline.filter((p) => p.t >= lookbackStart && p.t <= lookaheadEnd);
+  const withSurprise = allWithSurprise.filter((p) => !hiddenTypes.has(p.event_type));
+  const timeline = fullTimeline.filter(
+    (p) => p.t >= lookbackStart && p.t <= lookaheadEnd && !hiddenTypes.has(p.event_type)
+  );
   const pointsByType = withSurprise.reduce((acc, p) => {
     (acc[p.event_type] ??= []).push(p);
     return acc;
@@ -339,9 +376,11 @@ export default function CatcorPanel() {
                     key={type}
                     data={typePoints}
                     fill={CATCOR_EVENT_COLORS[type] ?? "#94a3b8"}
-                    shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, true)}
+                    shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, type !== "observed")}
                     onMouseEnter={(p) => setHoveredEventId(p.event_id)}
                     onMouseLeave={() => setHoveredEventId(null)}
+                    onClick={handlePointClick}
+                    style={{ cursor: typePoints.some((p) => p.research_session_id) ? "pointer" : "default" }}
                   />
                 ))}
               </ScatterChart>
@@ -391,9 +430,11 @@ export default function CatcorPanel() {
                     key={type}
                     data={typePoints}
                     fill={CATCOR_EVENT_COLORS[type] ?? "#94a3b8"}
-                    shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, true)}
+                    shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, type !== "observed")}
                     onMouseEnter={(p) => setHoveredEventId(p.event_id)}
                     onMouseLeave={() => setHoveredEventId(null)}
+                    onClick={handlePointClick}
+                    style={{ cursor: typePoints.some((p) => p.research_session_id) ? "pointer" : "default" }}
                   />
                 ))}
               </ScatterChart>
@@ -408,25 +449,38 @@ export default function CatcorPanel() {
             </div>
           )}
 
-          {withSurprise.length > 0 && (
+          {allWithSurprise.length > 0 && (
             <div className="comex-legend-list">
               {Object.keys(CATCOR_EVENT_COLORS).map((type) => {
                 // events is sorted by scheduled_time ascending (get_upcoming_events),
                 // so the first match for this type is its next scheduled date.
                 const next = (events || []).find((e) => e.event_type === type);
+                const isHidden = hiddenTypes.has(type);
                 return (
-                  <div key={type} className="comex-legend-item">
-                    <span className="comex-legend-swatch comex-legend-swatch--diamond" style={{ background: CATCOR_EVENT_COLORS[type] }} />
+                  <button
+                    key={type}
+                    type="button"
+                    className={`comex-legend-item legend-btn-row${isHidden ? " legend-btn--off" : ""}`}
+                    onClick={() => toggleType(type)}
+                    title={isHidden ? `Show ${type} on both charts` : `Hide ${type} from both charts`}
+                  >
+                    <span
+                      className={
+                        "comex-legend-swatch" + (type !== "observed" ? " comex-legend-swatch--diamond" : "")
+                      }
+                      style={{ background: CATCOR_EVENT_COLORS[type] }}
+                    />
                     <span>
                       <strong>{type}</strong>
                       {type === "FOMC" && " — FOMC rate decisions"}
                       {type === "CPI" && " — Consumer Price Index releases"}
                       {type === "NFP" && " — Employment Situation (nonfarm payrolls) releases"}
+                      {type === "observed" && " — promoted from a Research session (click a point to open its record)"}
                       {next
                         ? ` — next: ${fmtDateTime(next.scheduled_time)}`
                         : " — no upcoming date scheduled"}
                     </span>
-                  </div>
+                  </button>
                 );
               })}
             </div>

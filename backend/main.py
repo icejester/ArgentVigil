@@ -936,6 +936,23 @@ async def refresh_settings_post(body: dict = Body(...)):
     return {"success": True, "data": _refresh_settings}
 
 
+_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "data"}
+
+
+@app.get("/api/ui/pinned-section")
+async def ui_pinned_section_get():
+    return {"success": True, "data": {"pinned_section": db.get_pinned_section()}}
+
+
+@app.post("/api/ui/pinned-section")
+async def ui_pinned_section_post(body: dict = Body(...)):
+    section = body.get("section")
+    if section is not None and section not in _VALID_NAV_SECTIONS:
+        raise HTTPException(400, f"section must be one of {sorted(_VALID_NAV_SECTIONS)} or null")
+    db.set_pinned_section(section)
+    return {"success": True, "data": {"pinned_section": section}}
+
+
 @app.post("/api/refresh/force")
 async def refresh_force():
     fast_result = await _refresh_fast_tier()
@@ -1446,6 +1463,20 @@ async def catcor_research_promote(session_id: str, body: dict = Body(...)):
     except ValueError as e:
         raise HTTPException(409, str(e))
     return {"success": True, "data": {"event_id": event_id}}
+
+
+@app.delete("/api/catcor/events/{event_id}")
+async def catcor_delete_promoted_event(event_id: str):
+    """Deletes a promoted (source_tier='discovered') event_calendar row and
+    its captured reactions, reverting the originating research session back
+    to 'active'. Government-seeded events (CPI/FOMC/NFP) are rejected —
+    this is only for undoing a Research-panel promotion, not for editing
+    AV's own seeded calendar."""
+    try:
+        catcor_research.delete_promoted_event(event_id)
+    except ValueError as e:
+        raise HTTPException(404 if "no event with id" in str(e) else 409, str(e))
+    return {"success": True, "data": None}
 
 
 @app.post("/api/catcor/research/sessions/{session_id}/dismiss")
