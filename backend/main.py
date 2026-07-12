@@ -74,6 +74,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_backfill_if_needed())
     asyncio.create_task(_refresh_fast_tier())
     asyncio.create_task(_refresh_slow_tier())
+    asyncio.create_task(_lbma_fix_startup())
     asyncio.create_task(_catcor_startup())
     _refresh_tasks.append(asyncio.create_task(_fast_tier_loop()))
     _refresh_tasks.append(asyncio.create_task(_slow_tier_loop()))
@@ -83,6 +84,25 @@ async def lifespan(app: FastAPI):
     for t in _refresh_tasks:
         t.cancel()
     await _client.aclose()
+
+
+async def _lbma_fix_startup():
+    """LBMA fix updates 1-2x/day (per metal) — too slow for either tiered
+    loop, so per the price-spec decision this is startup-only plus manual
+    force-refresh via the Data tab's per-source button (lbma_fix is in
+    _ON_DEMAND_REGISTRY, not either tier), not a third recurring loop.
+    Silently skips if GAPI_API_KEY isn't set, same as CATCOR's ALFRED calls
+    silently degrade without FRED_API_KEY — this is a nice-to-have layer,
+    not a hard requirement to boot the app."""
+    if "GAPI_API_KEY" not in os.environ:
+        print("[lbma] GAPI_API_KEY not set — skipping LBMA fix fetch")
+        return
+    try:
+        await _fetch_and_persist_lbma_fix()
+        db.record_fetch_attempt("lbma_fix", success=True)
+    except Exception as e:
+        print(f"[lbma] warning: {e}")
+        db.record_fetch_attempt("lbma_fix", success=False, error=str(e))
 
 
 async def _catcor_startup():
@@ -413,6 +433,23 @@ async def silver_db_leverage():
     return {"success": True, "data": [enriched]}
 
 
+@app.get("/api/silver/db/leverage/history")
+async def silver_db_leverage_history():
+    rows = db.get_leverage_history("XAG")
+    return {
+        "success": True,
+        "data": [
+            {
+                "date": r["date"],
+                "openInterest": r["open_interest"] / 5000 if r["open_interest"] else None,
+                "volume": r["volume"],
+                "paper_leverage": r["paper_leverage"],
+            }
+            for r in rows
+        ],
+    }
+
+
 async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
     hdrs = await authed_headers(_client)
     resp = await _client.get(
@@ -524,6 +561,23 @@ async def gold_db_leverage():
         "paper_leverage": row["paper_leverage"],
     }
     return {"success": True, "data": [enriched]}
+
+
+@app.get("/api/gold/db/leverage/history")
+async def gold_db_leverage_history():
+    rows = db.get_leverage_history("XAU")
+    return {
+        "success": True,
+        "data": [
+            {
+                "date": r["date"],
+                "openInterest": r["open_interest"] / 100 if r["open_interest"] else None,
+                "volume": r["volume"],
+                "paper_leverage": r["paper_leverage"],
+            }
+            for r in rows
+        ],
+    }
 
 
 async def _fetch_and_persist_delivery(type: str = "mtd") -> dict:
@@ -802,6 +856,17 @@ async def _fetch_and_persist_prices() -> dict:
     )
     resp.raise_for_status()
     data = resp.json()
+    # metalcharts.org's own top-level isStale flag (sibling of "data", not
+    # per-metal) marks its underlying twelvedata-ws feed as a stale cache
+    # re-serve — confirmed live over a weekend market closure that it kept
+    # returning isStale=true with a live-looking "timestamp" field and a
+    # cacheAge in the hours, while slowly drifting the price by rounding/
+    # re-sampling jitter on their end. Skipping persistence entirely when
+    # stale (rather than writing it anyway) means the tick series/chart
+    # goes flat when the real market is closed instead of showing fake
+    # movement that never actually traded.
+    if isinstance(data, dict) and data.get("isStale"):
+        return data
     payload = data.get("data", data) if isinstance(data, dict) else {}
     today = str(date.today())
     rows = []
@@ -915,6 +980,75 @@ async def prices_db_ticks(series_id: str = Query("XAG"), hours: int = Query(24))
     if coarser, history instead of a gap before the tick table existed."""
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     rows = db.get_price_history(series_id, since)
+    return {"success": True, "data": rows}
+
+
+GOLDAPI_BASE = "https://www.goldapi.io/api"
+# GoldAPI.io's bare /api/{SYMBOL}/{CURRENCY} endpoint is a FOREXCOM spot
+# feed (confirmed live) — NOT LBMA. Only the date-suffixed historical
+# endpoint (/api/{SYMBOL}/{CURRENCY}/{YYYYMMDD}) returns exchange="LBMA".
+# "Today's" fix is therefore fetched via that same date-suffixed path with
+# today's date, not the bare endpoint. Confirmed live that gold and silver
+# both come back stamped 10:30:00Z regardless of metal — that does NOT
+# match silver's real fix time (LBMA Silver Price is set at 12:00 London,
+# not 10:30), so the date field is treated as "which calendar day this fix
+# is for," not a trustworthy per-metal fix-moment timestamp. GoldAPI.io
+# also exposes only one price/day for gold — no distinct AM vs PM fix
+# field — so gold's PM fix is not available from this source; gold is
+# persisted as fix_type="AM" (best-effort) and silver as fix_type="daily".
+_LBMA_METAL_SYMBOLS = {"XAU": "AM", "XAG": "daily"}
+
+
+async def _fetch_goldapi_fix(symbol: str, api_key: str, for_date: date) -> dict:
+    resp = await _client.get(
+        f"{GOLDAPI_BASE}/{symbol}/USD/{for_date.strftime('%Y%m%d')}",
+        headers={"x-access-token": api_key},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _fetch_and_persist_lbma_fix() -> dict:
+    if "GAPI_API_KEY" not in os.environ:
+        raise HTTPException(500, "GAPI_API_KEY environment variable is not set")
+    api_key = os.environ["GAPI_API_KEY"]
+    today = date.today()
+    results = {}
+    for symbol, fix_type in _LBMA_METAL_SYMBOLS.items():
+        # GoldAPI.io's historical endpoint confirmed live to have no data
+        # for "today" until some lag later in the day (returns
+        # {"error": "No data available..."} — no "price" key at all, not
+        # just null) — fall back to yesterday so the badge/history always
+        # reflects the most recent real fix instead of going empty for
+        # part of each day.
+        payload = await _fetch_goldapi_fix(symbol, api_key, today)
+        fetched_date = today
+        if payload.get("price") is None:
+            payload = await _fetch_goldapi_fix(symbol, api_key, today - timedelta(days=1))
+            fetched_date = today - timedelta(days=1)
+        price = payload.get("price")
+        if price is not None:
+            db.upsert_lbma_fix_row({
+                "metal": symbol,
+                "fix_type": fix_type,
+                "date": str(fetched_date),
+                "price_usd": price,
+            })
+        results[symbol] = payload
+    return results
+
+
+@app.get("/api/lbma/db")
+async def lbma_db(metal: str = Query("XAU")):
+    rows = db.get_latest_lbma_fix(metal)
+    return {"success": True, "data": rows}
+
+
+@app.get("/api/lbma/db/history")
+async def lbma_db_history(metal: str = Query("XAU"), fix_type: str = Query(None)):
+    resolved_fix_type = fix_type or _LBMA_METAL_SYMBOLS.get(metal, "daily")
+    rows = db.get_lbma_fix_series(metal, resolved_fix_type)
     return {"success": True, "data": rows}
 
 
@@ -1140,6 +1274,7 @@ _ON_DEMAND_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
     "money_supply": fred_money_supply_refresh,
     "metals_prices": metals_prices_refresh,
     "cot_pipeline": _refresh_cot_pipeline,
+    "lbma_fix": _fetch_and_persist_lbma_fix,
 }
 _SOURCE_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
     **_FAST_TIER_REGISTRY,

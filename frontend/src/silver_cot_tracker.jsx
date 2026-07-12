@@ -415,8 +415,22 @@ function ZoneTable({ title, zone, directionLabel }) {
 }
 
 const METAL_CONFIG = {
-  silver: { label: "Silver", leverageUrl: "/api/silver/db/leverage", contractOz: 5000, spotKey: "XAG" },
-  gold:   { label: "Gold",   leverageUrl: "/api/gold/db/leverage",   contractOz: 100,  spotKey: "XAU" },
+  silver: {
+    label: "Silver",
+    leverageUrl: "/api/silver/db/leverage",
+    leverageHistoryUrl: "/api/silver/db/leverage/history",
+    contractOz: 5000,
+    spotKey: "XAG",
+    lbmaSymbol: "XAG",
+  },
+  gold: {
+    label: "Gold",
+    leverageUrl: "/api/gold/db/leverage",
+    leverageHistoryUrl: "/api/gold/db/leverage/history",
+    contractOz: 100,
+    spotKey: "XAU",
+    lbmaSymbol: "XAU",
+  },
 };
 
 function spotPrice(entry) {
@@ -578,7 +592,7 @@ const DATE_ONLY_TICKS_ABOVE_HOURS = 48;
 const PRICE_LIVE_POLL_MS = 60 * 1000;
 
 function PriceHistoryChart({ spotKey, label, live }) {
-  const [hours, setHours] = useState(6);
+  const [hours, setHours] = useState(24);
   const [ticks, setTicks] = useState(null);
 
   useEffect(() => {
@@ -684,6 +698,136 @@ function PriceHistoryChart({ spotKey, label, live }) {
   );
 }
 
+const LEVERAGE_HISTORY_WINDOWS = [
+  { label: "1W", days: 7 },
+  { label: "1M", days: 30 },
+  { label: "6M", days: 180 },
+  { label: "1Y", days: 365 },
+  { label: "All", days: null },
+];
+
+function LeverageHistoryChart({ metal, label }) {
+  const [rows, setRows] = useState(null);
+  const [days, setDays] = useState(180);
+  const historyUrl = METAL_CONFIG[metal].leverageHistoryUrl;
+
+  const fetchHistory = useCallback(() => {
+    fetch(historyUrl)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((j) => setRows(j.data ?? []))
+      .catch(() => setRows([]));
+  }, [historyUrl]);
+
+  useEffect(() => {
+    fetchHistory();
+    window.addEventListener(FORCE_REFRESH_EVENT, fetchHistory);
+    return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchHistory);
+  }, [fetchHistory]);
+
+  const windowButtons = (
+    <div className="comex-range-selector">
+      {LEVERAGE_HISTORY_WINDOWS.map((w) => (
+        <button
+          key={w.label}
+          type="button"
+          className={`comex-range-btn${days === w.days ? " comex-range-btn--active" : ""}`}
+          onClick={() => setDays(w.days)}
+        >
+          {w.label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (rows == null) return null;
+  const since = days == null ? null : Date.now() - days * 24 * 60 * 60 * 1000;
+  const chartable = rows.filter(
+    (r) => r.paper_leverage != null && (since == null || new Date(r.date).getTime() >= since)
+  );
+  const activeWindowLabel = LEVERAGE_HISTORY_WINDOWS.find((w) => w.days === days)?.label ?? `${days}d`;
+
+  if (chartable.length < 2) {
+    return (
+      <div className="comex-chart-block">
+        <div className="comex-chart-subheader">{label} Paper Leverage — Last {activeWindowLabel}</div>
+        {windowButtons}
+        <div className="comex-empty comex-empty-note">
+          Not enough history yet to chart leverage over this window — this accumulates
+          one row per day as the slow-tier refresh runs.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="comex-chart-block">
+      <div className="comex-chart-subheader">{label} Paper Leverage — Last {activeWindowLabel}</div>
+      {windowButtons}
+      <ResponsiveContainer width="100%" height={160}>
+        <LineChart data={chartable} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1e2333" />
+          <XAxis
+            dataKey="date"
+            tickFormatter={(d) => new Date(d).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+            minTickGap={40}
+            stroke="#5a6278"
+            fontSize={11}
+          />
+          <YAxis
+            domain={["auto", "auto"]}
+            tickFormatter={(v) => `${v.toFixed(1)}x`}
+            stroke="#5a6278"
+            fontSize={11}
+            width={44}
+          />
+          <Tooltip
+            labelFormatter={(d) => new Date(d).toLocaleDateString()}
+            formatter={(v) => [`${Number(v).toFixed(2)}x`, "Leverage"]}
+            contentStyle={{ background: "#141820", border: "1px solid #2e3547", fontSize: 12 }}
+          />
+          <Line type="monotone" dataKey="paper_leverage" stroke="#e0a84c" dot={false} strokeWidth={1.5} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function LbmaFixBadge({ metal, label }) {
+  const [rows, setRows] = useState(null);
+  const lbmaMetal = METAL_CONFIG[metal].lbmaSymbol;
+
+  const fetchFix = useCallback(() => {
+    fetch(`/api/lbma/db?metal=${lbmaMetal}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((j) => setRows(j.data ?? []))
+      .catch(() => setRows([]));
+  }, [lbmaMetal]);
+
+  useEffect(() => {
+    fetchFix();
+    window.addEventListener(FORCE_REFRESH_EVENT, fetchFix);
+    return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchFix);
+  }, [fetchFix]);
+
+  if (!rows || rows.length === 0) return null;
+  const row = rows[0];
+  const fixLabel = row.fix_type === "AM" ? "LBMA AM Fix" : "LBMA Fix";
+
+  return (
+    <div className="comex-spot-badge" title="Settlement reference, not a continuous quote — updates once (silver) or twice (gold, AM only available) per day.">
+      <span className="comex-spot-label">{label} {fixLabel}</span>
+      <span className="comex-spot-price">${Number(row.price_usd).toFixed(2)}</span>
+      <span className="comex-spot-change" style={{ color: "#6b778d" }}>{row.date}</span>
+    </div>
+  );
+}
+
 function PaperLeveragePanel({ metal = "silver" }) {
   const { label, leverageUrl, contractOz, spotKey } = METAL_CONFIG[metal];
   const [leverageData, setLeverageData] = useState(null);
@@ -756,7 +900,7 @@ function PaperLeveragePanel({ metal = "silver" }) {
       </div>
       {leverage != null ? (
         <div className="comex-leverage-card">
-          <LeverageSpotBadge prices={prices} spotKey={spotKey} label={label} />
+          <LbmaFixBadge metal={metal} label={label} />
           <div className={`comex-leverage-value comex-leverage--${alertLevel}`}>
             {leverage.toFixed(2)}x
           </div>
@@ -765,11 +909,14 @@ function PaperLeveragePanel({ metal = "silver" }) {
             <span>Volume: <strong>{vol?.toLocaleString()} contracts</strong></span>
             <span>As of: <strong>{date}</strong></span>
           </div>
+          <LeverageHistoryChart metal={metal} label={label} />
+          <LeverageSpotBadge prices={prices} spotKey={spotKey} label={label} />
           <PriceHistoryChart spotKey={spotKey} label={label} live={live} />
         </div>
       ) : (
         <div className="comex-empty">
           <LeverageSpotBadge prices={prices} spotKey={spotKey} label={label} />
+          <LbmaFixBadge metal={metal} label={label} />
           No leverage data available.
         </div>
       )}

@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from bisect import bisect_right
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -110,6 +111,21 @@ CREATE TABLE IF NOT EXISTS spot_price_snapshot (
     price REAL,
     change_pct_24h REAL,
     PRIMARY KEY (series_id, date)
+);
+
+-- LBMA AM/PM (gold) / daily (silver) fix, sourced from GoldAPI.io's
+-- date-suffixed historical endpoint (exchange="LBMA" in its response —
+-- confirmed distinct from GoldAPI's bare current-price endpoint, which is
+-- a FOREX.com spot feed, not LBMA at all). fix_type is 'AM' for gold
+-- (GoldAPI.io exposes no PM-fix-distinct field — gold's PM fix is not
+-- available from this source) and 'daily' for silver.
+CREATE TABLE IF NOT EXISTS lbma_fix (
+    metal TEXT NOT NULL,
+    fix_type TEXT NOT NULL,
+    date TEXT NOT NULL,
+    price_usd REAL,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (metal, fix_type, date)
 );
 
 CREATE TABLE IF NOT EXISTS event_calendar (
@@ -508,6 +524,148 @@ def get_latest_gold_volume_oi() -> dict | None:
             "SELECT date, open_interest, volume, paper_leverage FROM gold_volume_oi ORDER BY date DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_volume_oi_series() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, open_interest, volume, paper_leverage FROM volume_oi ORDER BY date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_gold_volume_oi_series() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, open_interest, volume, paper_leverage FROM gold_volume_oi ORDER BY date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _leverage_backfill_from_cot(cot_table: str, aggregate_table: str, contract_oz: int) -> list[dict]:
+    """Derives a historical paper_leverage series from two tables AV
+    already ingests for unrelated reasons: cot_{silver,gold}'s weekly
+    open_interest (CFTC, real history back to 2011 — open_interest here is
+    CFTC's open_interest_all field, i.e. total OI across every trader
+    category, the same quantity metalcharts.org's volume-oi endpoint
+    returns as openInterest, so the two are a valid substitute for each
+    other) joined against {inventory,gold_inventory}_aggregate's daily
+    registered oz. Exists because metalcharts.org's volume-oi endpoint
+    itself has NO historical range support (confirmed live — a range/date
+    param is silently ignored, always returns only today's single
+    snapshot), so volume_oi/gold_volume_oi (daily, INSERT OR REPLACE per
+    date) only ever accumulates forward from whenever the slow-tier
+    refresh first ran.
+
+    Real ceiling is set by `registered` specifically, NOT by `total`
+    (which does go back to 1992 for both metals) or by CoT's 2011 OI
+    coverage — metalcharts.org's registered/eligible split is a real
+    upstream gap confirmed live: NULL before 2020-01-02 for silver, NULL
+    before 2026-02-17 for gold (gold's registered/eligible breakdown is
+    only a few months old upstream; this backfill effectively does
+    nothing for gold beyond that). Silver backfills to 2020-01-02, not
+    2019 and not CoT's full 2011 range, because that's where registered
+    itself actually starts being reported, not a query-side limitation.
+
+    This backfill is weekly-resolution (CoT's own publish cadence), a
+    real granularity step down from volume_oi's daily rows — see
+    get_leverage_history, which stitches this in only for dates strictly
+    before the real daily series begins, the same pattern
+    get_price_history uses for its own tiered resolutions."""
+    with get_conn() as conn:
+        cot_rows = conn.execute(
+            f"SELECT report_date AS date, open_interest FROM {cot_table} "
+            f"WHERE open_interest IS NOT NULL ORDER BY report_date"
+        ).fetchall()
+        agg_rows = conn.execute(
+            f"SELECT date, registered FROM {aggregate_table} "
+            f"WHERE registered IS NOT NULL ORDER BY date"
+        ).fetchall()
+
+    agg_dates = [r["date"] for r in agg_rows]
+    agg_by_date = {r["date"]: r["registered"] for r in agg_rows}
+
+    out = []
+    for r in cot_rows:
+        report_date = r["date"]
+        oi = r["open_interest"]
+        # Registered inventory isn't always reported exactly on a CoT
+        # Tuesday (weekends/holidays/gaps) — use the nearest available
+        # date on or before it, same "as-of" convention VaultSnapshotPanel
+        # already uses for pinned-date lookups.
+        idx = bisect_right(agg_dates, report_date) - 1
+        if idx < 0:
+            continue
+        registered = agg_by_date[agg_dates[idx]]
+        if not oi or not registered:
+            continue
+        out.append({
+            "date": report_date,
+            "open_interest": oi * contract_oz,
+            "volume": None,
+            "paper_leverage": (oi * contract_oz) / registered,
+        })
+    return out
+
+
+def get_leverage_history(metal: str) -> list[dict]:
+    """Stitched paper_leverage series: CoT-derived weekly points (see
+    _leverage_backfill_from_cot) for any date strictly before the real
+    daily volume_oi/gold_volume_oi series begins, then the real daily
+    series itself. One continuous line, sparser/weekly further back,
+    denser/daily for recent history — mirrors get_price_history's
+    tiered-resolution stitching."""
+    if metal == "XAG":
+        daily_rows = get_volume_oi_series()
+        backfill = _leverage_backfill_from_cot("cot_silver", "inventory_aggregate", 5000)
+    else:
+        daily_rows = get_gold_volume_oi_series()
+        backfill = _leverage_backfill_from_cot("cot_gold", "gold_inventory_aggregate", 100)
+
+    earliest_daily_date = daily_rows[0]["date"] if daily_rows else None
+    older_backfill = [
+        r for r in backfill
+        if earliest_daily_date is None or r["date"] < earliest_daily_date
+    ]
+    return older_backfill + daily_rows
+
+
+def upsert_lbma_fix_row(row: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO lbma_fix (metal, fix_type, date, price_usd)
+               VALUES (:metal, :fix_type, :date, :price_usd)
+               ON CONFLICT (metal, fix_type, date) DO UPDATE SET
+                   price_usd = excluded.price_usd,
+                   fetched_at = datetime('now')""",
+            row,
+        )
+
+
+def get_latest_lbma_fix(metal: str) -> list[dict]:
+    """Latest fix row per fix_type for a metal (gold has 'AM' only via
+    GoldAPI.io; silver has 'daily' only) — a list since gold could in
+    principle carry more than one fix_type in the future."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT metal, fix_type, date, price_usd FROM lbma_fix AS outer_fix
+               WHERE metal = ? AND date = (
+                   SELECT MAX(date) FROM lbma_fix
+                   WHERE metal = outer_fix.metal AND fix_type = outer_fix.fix_type
+               )""",
+            (metal,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_lbma_fix_series(metal: str, fix_type: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, price_usd FROM lbma_fix
+               WHERE metal = ? AND fix_type = ? ORDER BY date""",
+            (metal, fix_type),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def upsert_delivery_rows(rows: list[dict]):

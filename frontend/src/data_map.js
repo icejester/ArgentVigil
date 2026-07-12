@@ -173,6 +173,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
           ["volume", "Daily volume, contracts"],
           ["paper_leverage", "Derived ratio, powers Paper Leverage cards"],
         ],
+        note: "One row per slow-tier cycle that lands on a new date (INSERT OR REPLACE keyed by date) — already a real daily time series, but only accumulates forward from whenever the slow-tier refresh first ran (metalcharts.org's volume-oi endpoint has NO historical range support — confirmed live, a range/date param is silently ignored). GET /api/silver/db/leverage returns only the latest row. GET /api/silver/db/leverage/history (price-spec Section 1) returns a STITCHED series via db.get_leverage_history — CoT-derived weekly backfill (cot_silver.open_interest × 5,000oz, joined against inventory_aggregate.registered as-of each CoT report date) for any date before this table's real daily rows begin, then this table's own daily rows. Real backfill ceiling is 2020-01-02, set by when metalcharts.org's registered/eligible split itself starts being reported (NOT by cot_silver's own 2011 coverage, and NOT 2019) — see db.py's _leverage_backfill_from_cot docstring.",
       },
       {
         name: "delivery_notices",
@@ -206,7 +207,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     tables: [
       { name: "gold_inventory_aggregate", fields: [["(mirrors inventory_aggregate)", "Gold COMEX vault totals"]] },
       { name: "gold_inventory_depository", fields: [["(mirrors inventory_depository)", "Gold per-vault snapshot"]] },
-      { name: "gold_volume_oi", fields: [["(mirrors volume_oi)", "Gold OI/volume/leverage"]] },
+      { name: "gold_volume_oi", fields: [["(mirrors volume_oi)", "Gold OI/volume/leverage — GET /api/gold/db/leverage/history stitches in a CoT-derived backfill same as silver's, but gold_inventory_aggregate.registered is only reported upstream from 2026-02-17 onward (a real, much later upstream gap than silver's 2020-01-02 — confirmed live, not a fetch bug), so the backfill contributes almost nothing for gold today"]] },
     ],
     note: "Fetched+persisted every slow-tier cycle; history/depositories not currently rendered anywhere in the frontend (leverage is).",
   },
@@ -308,6 +309,33 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
       },
     ],
     note: "GET /api/prices/db/ticks?series_id=&hours= (Paper Leverage panel's 6H/12H/24H/48H/1M/3M/6M/12M price chart) stitches three resolutions since no single table covers every window: spot_price_tick's \"XAG\"/\"XAU\" rows (60s real spot ticks, only from whenever the fast tier first ran — currently back to ~2026-04-22), then fred_observations' XAG_DAILY_CLOSE/XAU_DAILY_CLOSE (daily, ~120 days), then XAG_CLOSE/XAU_CLOSE (month-end, back to 2006) for anything older. See db.get_price_history. Never reads spot_price_tick's \"XAG_FUTURES\"/\"XAU_FUTURES\" rows (CATCOR-only, see catcor_reactions).",
+  },
+  {
+    key: "lbma_fix",
+    label: "GoldAPI.io — LBMA fix",
+    origin: "GoldAPI.io, free tier (500 req/month) — requires GAPI_API_KEY. Only the date-suffixed historical endpoint (/api/{SYMBOL}/USD/{YYYYMMDD}) returns exchange=\"LBMA\"; the bare current-price endpoint is a FOREXCOM spot feed, not LBMA, and is never used by this source.",
+    cadence: "Startup-only + manual force-refresh (Data tab's per-source button) — deliberately not on either tiered loop, since the fix only updates 1-2x/day and both existing tiers assume daily-or-faster cadence. See price-spec.md Section 2.",
+    sourceKeys: ["lbma_fix"],
+    healthMeta: {
+      lbma_fix: { expectedIntervalS: 86400, tier: "on-demand" },
+    },
+    rateLimit: "500 requests/month free tier — 2 fetches/day (gold + silver) keeps this far under cap even fetched daily",
+    curl: `curl "https://www.goldapi.io/api/XAU/USD/$(date +%Y%m%d)" \\
+  -H "x-access-token: \${GAPI_API_KEY}"
+# silver: /api/XAG/USD/{YYYYMMDD}`,
+    tables: [
+      {
+        name: "lbma_fix",
+        fields: [
+          ["metal", "PK — 'XAU' or 'XAG'"],
+          ["fix_type", "PK — 'AM' for gold (GoldAPI.io exposes no PM-fix-distinct field — gold's real 15:00 London PM fix is NOT available from this source), 'daily' for silver"],
+          ["date", "PK — calendar date requested, not a verified per-metal fix-moment timestamp (see note)"],
+          ["price_usd", "Fix price, USD/oz"],
+          ["fetched_at", "Row upsert timestamp"],
+        ],
+        note: "Upsert (INSERT ... ON CONFLICT), not append-only. Confirmed live against a real API key: GoldAPI.io stamps BOTH gold and silver historical rows with an identical 10:30:00Z timestamp regardless of metal — real LBMA fix times are gold AM 10:30 UTC, gold PM 15:00 UTC, silver 12:00 UTC (winter), so silver's 10:30 stamp does not match its real fix time. The date field is treated as \"which calendar day this fix is for,\" not a trustworthy fix-moment timestamp. price_usd is presumed close to the real LBMA print (exchange=\"LBMA\" in the raw response, and gold's value differs meaningfully from the bare current-price endpoint's FOREXCOM spot value) but this has not been independently cross-checked against LBMA's own published fix, since LBMA's official data requires a paid IBA license (see price-spec.md).",
+      },
+    ],
   },
   {
     key: "fred",
