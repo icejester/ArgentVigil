@@ -128,6 +128,30 @@ CREATE TABLE IF NOT EXISTS lbma_fix (
     PRIMARY KEY (metal, fix_type, date)
 );
 
+-- U.S. Census Bureau International Trade API, HS 7106 (silver) / HS 7108
+-- (gold, comparison-only) monthly imports/exports by country. Revised
+-- annually every April (unlike CFTC's immutable-once-published reports),
+-- so this is upsert, not append-only. Confirmed live (2025-01, 2024-06,
+-- both flows, both metals): Census reports no quantity/weight for either
+-- HS code — GEN_QY1_MO/CON_QY1_MO/QTY_1_MO are always "0" and UNIT_QY1 is
+-- always "-" (Census's own not-applicable sentinel). qty/qty_unit persist
+-- as NULL until Census ever starts reporting a real figure.
+CREATE TABLE IF NOT EXISTS census_trade (
+    metal TEXT NOT NULL,
+    flow TEXT NOT NULL,
+    hs_code TEXT NOT NULL,
+    cty_code TEXT NOT NULL,
+    cty_name TEXT,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    value_general_usd INTEGER,
+    value_consumption_usd INTEGER,
+    qty REAL,
+    qty_unit TEXT,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (metal, flow, hs_code, cty_code, year, month)
+);
+
 CREATE TABLE IF NOT EXISTS event_calendar (
     event_id TEXT PRIMARY KEY,
     event_name TEXT NOT NULL,
@@ -668,6 +692,58 @@ def get_lbma_fix_series(metal: str, fix_type: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def upsert_census_trade_rows(rows: list[dict]):
+    """Partial-column upsert (not INSERT OR REPLACE) since Census revises
+    only specific value/qty columns for a given period on its annual April
+    release, while fetched_at should still refresh to 'now' — mirrors
+    upsert_lbma_fix_row's ON CONFLICT DO UPDATE shape."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO census_trade
+                   (metal, flow, hs_code, cty_code, cty_name, year, month,
+                    value_general_usd, value_consumption_usd, qty, qty_unit)
+               VALUES (:metal, :flow, :hs_code, :cty_code, :cty_name, :year, :month,
+                       :value_general_usd, :value_consumption_usd, :qty, :qty_unit)
+               ON CONFLICT (metal, flow, hs_code, cty_code, year, month) DO UPDATE SET
+                   cty_name = excluded.cty_name,
+                   value_general_usd = excluded.value_general_usd,
+                   value_consumption_usd = excluded.value_consumption_usd,
+                   qty = excluded.qty,
+                   qty_unit = excluded.qty_unit,
+                   fetched_at = datetime('now')""",
+            rows,
+        )
+
+
+def get_census_trade(metal: str, flow: str | None = None, hs_code: str | None = None) -> list[dict]:
+    query = "SELECT * FROM census_trade WHERE metal = ?"
+    params: list = [metal]
+    if flow is not None:
+        query += " AND flow = ?"
+        params.append(flow)
+    if hs_code is not None:
+        query += " AND hs_code = ?"
+        params.append(hs_code)
+    query += " ORDER BY year, month"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_latest_census_trade_period() -> str | None:
+    """Latest persisted (year, month) as 'YYYY-MM', across every metal/flow/
+    country row — used by the ~25-day rate-limit gate to decide whether a
+    re-fetch is due yet. None if census_trade is still empty."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(year * 100 + month) AS ym FROM census_trade"
+        ).fetchone()
+        ym = row["ym"] if row else None
+        if ym is None:
+            return None
+        return f"{ym // 100:04d}-{ym % 100:02d}"
+
+
 def upsert_delivery_rows(rows: list[dict]):
     with get_conn() as conn:
         conn.executemany(
@@ -1139,6 +1215,14 @@ def get_all_source_health() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM source_health").fetchall()
         return [dict(r) for r in rows]
+
+
+def get_source_health(source_key: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM source_health WHERE source_key = ?", (source_key,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def get_latest_cot_report_date() -> str | None:
