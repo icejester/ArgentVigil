@@ -14,6 +14,7 @@ import {
 } from "recharts";
 import MarketBalancePanel, { DemandCompositionPanel } from "./market_balance";
 import DeliveryBehaviorPanel from "./delivery_behavior_panel";
+import TradeFlowPanel from "./trade_flow_panel";
 import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 
@@ -1006,6 +1007,13 @@ export default function ComexInventoryDashboard() {
             <summary className="collapsible-pane-title">Global Context</summary>
             <div className="collapsible-pane-body">
               <GlobalSilverPanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
+            </div>
+          </details>
+
+          <details className="collapsible-pane">
+            <summary className="collapsible-pane-title">Trade Flow</summary>
+            <div className="collapsible-pane-body">
+              <TradeFlowPanel />
             </div>
           </details>
 

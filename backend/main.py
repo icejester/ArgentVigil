@@ -887,11 +887,17 @@ async def _fetch_and_persist_prices() -> dict:
     # re-serve — confirmed live over a weekend market closure that it kept
     # returning isStale=true with a live-looking "timestamp" field and a
     # cacheAge in the hours, while slowly drifting the price by rounding/
-    # re-sampling jitter on their end. Skipping persistence entirely when
-    # stale (rather than writing it anyway) means the tick series/chart
-    # goes flat when the real market is closed instead of showing fake
-    # movement that never actually traded.
-    if isinstance(data, dict) and data.get("isStale"):
+    # re-sampling jitter on their end. Skipping persistence when stale
+    # (rather than writing it anyway) means the tick series/chart goes flat
+    # when the real market is closed instead of showing fake movement that
+    # never actually traded — but that's only the right call for a real
+    # weekend closure. Confirmed live that isStale can also fire on a
+    # weekday with a cacheAge of months (metalcharts.org's own upstream feed
+    # stuck, not a market closure) — skipping indefinitely in that case would
+    # silently flatline the chart forever with no visible signal anything's
+    # wrong. So: skip only when it's currently a real weekend; on a weekday,
+    # persist anyway and let a stuck upstream surface directly in the chart.
+    if isinstance(data, dict) and data.get("isStale") and date.today().weekday() >= 5:
         return data
     payload = data.get("data", data) if isinstance(data, dict) else {}
     today = str(date.today())
