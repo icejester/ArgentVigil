@@ -228,3 +228,6 @@ frontend/.vite/
 *SPEC.md
 *spec.md
 *-spec.md
+
+# macOS
+.DS_Store

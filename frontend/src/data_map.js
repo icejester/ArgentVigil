@@ -338,6 +338,40 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     ],
   },
   {
+    key: "census_trade",
+    label: "U.S. Census Bureau — International Trade",
+    origin: "Census Bureau International Trade API, free/CC0, requires CENSUS_API_KEY (self-service signup, https://api.census.gov/data/key_signup.html). HS 7106 (silver, unwrought/semi-manufactured/powder, including silver plated with gold or platinum) and HS 7108 (gold, non-monetary only — excludes central-bank/reserve gold movements). Gold's presence here is comparison-only per CLAUDE.md's \"gold as context, not a tracked asset\" rule — no gold-specific signal or panel. No frontend panel yet for either metal (v1 is backend + DB + this Data tab entry only).",
+    cadenceFrequency: "Monthly",
+    cadenceMechanism: "On-demand, rate-limit gated (~25 days since the last fetch attempt, not since the data's own age — see note below) — startup-only plus manual force-refresh (Data tab's per-source button), same pattern as cot_pipeline/lbma_fix. Not on either tiered loop; both existing tiers assume daily-or-faster cadence.",
+    sourceKeys: ["census_trade"],
+    healthMeta: {
+      census_trade: { expectedIntervalS: 2160000, tier: "monthly" }, // 25 days, matching the gate threshold
+    },
+    rateLimit: "Census's published API rate limit applies; a monthly-cadence fetch (~20 requests per run — 2 metals × 2 flows × 5 months checked per flow, since ~2 of those months return 204/unpublished) stays far under it even fetched daily",
+    curl: `curl "https://api.census.gov/data/timeseries/intltrade/imports/hs?get=CTY_CODE,CTY_NAME,GEN_VAL_MO,CON_VAL_MO,GEN_QY1_MO,UNIT_QY1&I_COMMODITY=7106&time=2025-01&key=\${CENSUS_API_KEY}"
+# exports: /exports/hs?get=CTY_CODE,CTY_NAME,ALL_VAL_MO,QTY_1_MO,UNIT_QY1&E_COMMODITY=7106&time=2025-01&key=...`,
+    tables: [
+      {
+        name: "census_trade",
+        fields: [
+          ["metal", "PK — 'XAG' (HS 7106) or 'XAU' (HS 7108, comparison-only)"],
+          ["flow", "PK — 'import' or 'export'"],
+          ["hs_code", "PK — '7106' or '7108'"],
+          ["cty_code", "PK — Census country code, '-' = all countries total"],
+          ["cty_name", "Country name"],
+          ["year", "PK"],
+          ["month", "PK"],
+          ["value_general_usd", "Imports: GEN_VAL_MO (general import value). Exports: ALL_VAL_MO."],
+          ["value_consumption_usd", "Imports only, CON_VAL_MO (value for consumption — excludes bonded-warehouse/re-export flow). NULL for exports."],
+          ["qty", "Confirmed live (2025-01, 2024-06, both flows, both metals): always NULL today — Census reports no quantity/weight for HS 7106 or 7108 (GEN_QY1_MO/CON_QY1_MO/QTY_1_MO are always \"0\"). Not an error case; do not build oz-conversion logic against this field."],
+          ["qty_unit", "Same confirmed-live gap as qty — always NULL today (UNIT_QY1 is always Census's '-' not-applicable sentinel for these two HS codes)."],
+          ["fetched_at", "Row upsert timestamp"],
+        ],
+        note: "Upsert (INSERT ... ON CONFLICT), not append-only — Census revises trade data annually every April, unlike CFTC's immutable-once-published reports (see international-trade-spec.md Decision 5). Each fetch checks a 5-month window per (metal, flow) to land 3 real months, since Census's real publication lag is confirmed live at ~2 months (both the current calendar month and the immediately-prior one return HTTP 204 until released) — a self-heal against both that lag and a late revision landing between gate-interval runs. The ~25-day rate-limit gate itself is keyed on wall-clock time since the last fetch attempt (source_health.last_attempt_at), not on the persisted data's own age — gating on data age (mirroring cot_pipeline's CFTC pattern) would never actually trigger given the 2-month lag, a real design correction made during implementation.",
+      },
+    ],
+  },
+  {
     key: "fred",
     label: "FRED / ALFRED",
     origin: "FRED API (money supply) and ALFRED point-in-time vintage API (CATCOR actuals) — requires FRED_API_KEY",

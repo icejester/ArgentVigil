@@ -1,6 +1,6 @@
-# ArgentVigil v1.0.0
+# ArgentVigil v1.1.1
 
-Silver speculative-positioning monitor with gold as comparative context. Framing is **"selling dollars, not buying metals"** — is the speculative futures crowd genuinely capitulated, or just pulling back. Not a trading system: no price targets, no prediction framing, no risk-tolerance commentary. See `SPEC.MD` (gitignored, local-only — do not assume it exists in fresh clones) for the full Stock & Flow panel spec and CATCOR feature map, `deliveryBehavior-spec.md` (also gitignored, local-only) for the Delivery Behavior layer's full spec and story list, `dataHealth-spec.md` (gitignored, local-only) for the Data Health/Fetch Status spec, and `README.md` for the user-facing feature/data-source overview.
+Silver speculative-positioning monitor with gold as comparative context. Framing is **"selling dollars, not buying metals"** — is the speculative futures crowd genuinely capitulated, or just pulling back. Not a trading system: no price targets, no prediction framing, no risk-tolerance commentary. See `SPEC.MD` (gitignored, local-only — do not assume it exists in fresh clones) for the full Stock & Flow panel spec and CATCOR feature map, `deliveryBehavior-spec.md` (also gitignored, local-only) for the Delivery Behavior layer's full spec and story list, `dataHealth-spec.md` (gitignored, local-only) for the Data Health/Fetch Status spec, `international-trade-spec.md` (also gitignored, local-only) for the Census international-trade ingestion spec, and `README.md` for the user-facing feature/data-source overview.
 
 This doc is organized **by app tab** — the six sections below match `frontend/src/App.jsx`'s nav bar exactly (`SECTIONS`, in order: CoT, Money Supply, Inventory, CATCOR, Research, Data). Each section covers that tab's frontend component(s), the backend routes/modules feeding it, its SQLite tables, and its known gaps/scope boundaries together, so you don't have to cross-reference three different doc sections to understand one panel end-to-end. Cross-cutting stuff that doesn't belong to one tab (repo layout, conventions, running the app) lives in its own sections at the end.
 
@@ -11,7 +11,7 @@ This doc is organized **by app tab** — the six sections below match `frontend/
 - **Backend package layout**: `backend/` is a real package (`backend/__init__.py`, empty, enables `from . import db` and `uvicorn backend.main:app`). `seed_data/` (manually-maintained static content) and `runtime/` (gitignored generated state) are namespace packages / non-packages sitting alongside it, not nested inside it.
 - **Tiered background refresh** (`main.py`'s `lifespan`): two independent `asyncio` loops keep SQLite warm without the frontend ever calling upstream. **Fast tier** = spot prices only (the one genuinely intraday-moving figure). **Slow tier** = the other ~10 exchange-inventory sources (all move at most daily upstream). Both run once, unconditionally, at server startup, then default to **disabled** — each tier only repeats on its interval if explicitly turned on via `GET`/`POST /api/refresh/settings`. `POST /api/refresh/force` runs both tiers once immediately regardless of enabled state, returns real per-tier `{"succeeded","failed","errors"}` counts, and — only if at least one source actually succeeded — dispatches a `FORCE_REFRESH_EVENT` window `CustomEvent` that Inventory/CoT/CATCOR panels listen for to re-read their `/db` data immediately. CoT and Research are excluded from force-update (CoT stays pipeline-only; Research is on-demand chat, nothing to force-refresh).
 - **Nulls over zeros**: metalcharts.org sometimes reports `0` to mean "not reported that day" — `_parse_aggregate_row` in `main.py` converts those to `None` so charts gap instead of showing false dips. Apply the same treatment to any new fields with this failure mode.
-- **Stale spot feed over weekends/closures**: `/api/prices`'s underlying `twelvedata-ws` feed doesn't pause when COMEX/LBMA silver/gold trading is actually closed — confirmed live over a weekend that it kept returning a top-level `isStale: true` flag (sibling of `data`, not per-metal) alongside a `cacheAge` in the hours, while still stamping each entry with a live-looking `timestamp` and slowly drifting the price via rounding/re-sampling jitter on metalcharts.org's own end. `_fetch_and_persist_prices` (`main.py`) checks `isStale` and skips persisting entirely when true — no new `spot_price_snapshot`/`spot_price_tick` row is written, so `PriceHistoryChart` goes flat at the last real print instead of showing fake weekend movement that never actually traded. Apply the same check to any other route that reads `/api/prices`' response.
+- **Stale spot feed over weekends/closures**: `/api/prices`'s underlying `twelvedata-ws` feed doesn't pause when COMEX/LBMA silver/gold trading is actually closed — confirmed live over a weekend that it kept returning a top-level `isStale: true` flag (sibling of `data`, not per-metal) alongside a `cacheAge` in the hours, while still stamping each entry with a live-looking `timestamp` and slowly drifting the price via rounding/re-sampling jitter on metalcharts.org's own end. `_fetch_and_persist_prices` (`main.py`) checks `isStale` **and** `date.today().weekday() >= 5` (real Sat/Sun) before skipping persistence — no new `spot_price_snapshot`/`spot_price_tick` row is written on a real weekend, so `PriceHistoryChart` goes flat at the last real print instead of showing fake weekend movement that never actually traded. On a weekday, `isStale=true` is persisted anyway rather than skipped — confirmed live that `isStale` can also fire on a weekday with `cacheAge` in the **months** (metalcharts.org's own upstream feed stuck, not a market closure); skipping indefinitely in that case would silently flatline the chart forever with no visible signal anything's wrong, so a stuck weekday feed is deliberately allowed to surface directly in the chart instead. Apply the same check to any other route that reads `/api/prices`' response.
 - **The Data tab (`frontend/src/data_map.js` + `data_panel.jsx`) MUST be updated whenever app data changes — this is a strict requirement, not a nice-to-have.** Any change that adds/removes/renames a SQLite table or column, adds/removes/changes an upstream source or its fetch shape, or changes a source's fetch cadence/rate-limit posture must land a matching edit to `data_map.js` in the same change. Treat a data-shape change without a Data-tab update as incomplete, the same as a migration without a schema update.
 - **Pinned default tab**: a 📌 icon on each of `App.jsx`'s six nav buttons lets the user designate which tab opens by default on load, instead of always defaulting to CoT. Persisted server-side (`ui_settings` table, single-row upsert — same convention as `pipeline_runs` — via `GET`/`POST /api/ui/pinned-section`), **not** `localStorage` (the app has no client-only persistence anywhere; a shared setting like this belongs in the same SQLite database as everything else). `App.jsx` fetches the pinned section on mount and opens it if valid; falls back to `"cot"` if nothing's pinned or the fetch fails.
 
@@ -276,9 +276,24 @@ Sources with no periodic fetch of their own (`catcor_calendar`'s static seed, `r
 
 A small always-visible header dot (`HeaderHealthDot` in `App.jsx`) polls `/api/health/db` every 60s independent of which tab is active — red if any tracked source is erroring, yellow if any is stale with no errors, green otherwise; links nowhere, since the Data tab nav button is already one click away for drill-down.
 
+### Census International Trade (`census_trade`, per international-trade-spec.md)
+
+The one data source that lives in this tab and nowhere else — no frontend panel exists for it yet (v1 is backend + DB + Data tab only, per the spec's explicit scope). U.S. Census Bureau International Trade API, monthly imports/exports for HS 7106 (silver) and HS 7108 (gold, comparison-only per the standing "gold as context" rule — no gold-specific signal or panel). Answers "where does US silver supply actually come from, and is that mix shifting" with a primary-source view of trade flow (value, quantity, country-of-origin/destination) — does not attempt to reproduce USGS's net-import-reliance %, which needs domestic mine-production data AV doesn't track.
+
+`census_trade` table (`metal`, `flow`, `hs_code`, `cty_code`, `cty_name`, `year`, `month`, `value_general_usd`, `value_consumption_usd`, `qty`, `qty_unit`, `fetched_at`; PK `(metal, flow, hs_code, cty_code, year, month)`) — **upsert, not append-only** (`INSERT ... ON CONFLICT DO UPDATE`, same shape as `lbma_fix`), since Census revises trade data annually every April, unlike CFTC's immutable-once-published reports.
+
+**Confirmed live** (real `CENSUS_API_KEY`, both flows, both metals, several months, including a real production run): field names are `GEN_VAL_MO`/`CON_VAL_MO` (imports) and `ALL_VAL_MO` (exports) for value, `GEN_QY1_MO`/`CON_QY1_MO` (imports) vs. the differently-named `QTY_1_MO` (exports) for quantity, sharing `UNIT_QY1` for the unit code. **Census reports no quantity/weight at all for HS 7106 or HS 7108** — the qty fields are always `"0"` and `UNIT_QY1` is always `"-"` (Census's own not-applicable sentinel), consistently across every row checked. `qty`/`qty_unit` persist as `NULL` accordingly; this is a schema-level upstream gap, not a per-row data hole, and not something to build oz-conversion logic against.
+
+**Also confirmed live, a real correction mid-build**: Census's true publication lag is **~2 months, not ~1** — both the current calendar month and the immediately-prior one return HTTP `204` (empty body, not an error status) until released. `_fetch_and_persist_census_trade` treats `204`/empty-body responses as "not yet published, skip this month" and fetches a wider window (`CENSUS_TRADE_MONTHS_PER_FETCH + 2` months back) so 3 real months still land per run. This lag also broke the originally-spec'd rate-limit gate design: gating on "is the latest **persisted** `(year, month)` under 25 days old" (mirroring `_refresh_cot_pipeline`'s CFTC pattern, where report age closely tracks fetch recency) is never true in practice for Census, since by the time a new month is available the previous latest month is already 2+ months old — the gate would never actually skip. `_refresh_census_trade` instead gates on **wall-clock time since the last fetch attempt** (`source_health.last_attempt_at`, via a new `db.get_source_health(source_key)` single-row read), which correctly approximates "don't re-check Census more than once per ~25 days" regardless of publication lag.
+
+`_refresh_census_trade` (`main.py`) wraps `_fetch_and_persist_census_trade` with that gate — skips (records `last_attempt_status="skipped"`) if the last fetch attempt is under ~25 days old, otherwise fetches and records its own success, since it's in `_SELF_RECORDING_KEYS` alongside `cot_pipeline`. Cadence: startup-only (gated) + manual force-refresh via the Data tab's "Re-run now" button (`census_trade` is in `_ON_DEMAND_REGISTRY`) — silently skips at startup if `CENSUS_API_KEY` isn't set, same as LBMA. `GET /api/census-trade/db?metal=&flow=&hs_code=` is the sole read route — no live `/refresh` route, per the same "a government monthly release isn't something a page load should trigger" reasoning as CoT. `GET /api/health/db` enriches `census_trade`'s row with `last_period` (via `db.get_latest_census_trade_period()`), same convention as `cot_pipeline`'s `last_report_date`.
+
 ### Data: known gaps
 
-None currently tracked — this tab's own gaps are, by design, whatever every other tab's Known gaps sections say about their upstream fetches.
+- 📌 `census_trade`'s `qty`/`qty_unit` are confirmed-live always `NULL` — Census does not report a quantity/weight figure for HS 7106 or HS 7108 today. Not a bug; revisit only if Census ever starts populating `UNIT_QY1` for these codes.
+- 📌 `census_trade` has no frontend panel — v1 is backend + DB + this Data tab entry only, per international-trade-spec.md's explicit scope. HS 7112 (scrap) and other Critical Minerals List comparators (e.g. copper 7402/7403) are deferred to a documented Phase 2, not discarded.
+
+This tab's own gaps are otherwise, by design, whatever every other tab's Known gaps sections say about their upstream fetches.
 
 ---
 
@@ -326,7 +341,8 @@ frontend/
   vite.config.js              publicDir points at pipeline/cache (legacy); /api proxied to :8000
 
 utils/
-  dev.sh              Boots venv, installs deps if missing, kills anything already listening on :8000/:5173, runs FastAPI + Vite together
+  vigil.sh            Process manager for backend/frontend as background daemons (start/stop/restart/status, PID-tracked, logs to runtime/logs/) — the standing way to run/stop/restart services, always allowed to run (see Development Notes). Backend picks up Python edits via `vigil.sh restart backend` (no --reload); frontend gets Vite HMR automatically either way.
+  dev.sh              Legacy foreground runner (Ctrl-C to stop, uvicorn --reload) — superseded by vigil.sh for a single-user local app; kept only if you want auto-restart-on-save for the backend without typing `vigil.sh restart`.
   sniff-metal-charts.py, sniffer.sh   Tools for reverse-engineering metalcharts.org API responses
 ```
 
@@ -346,15 +362,17 @@ utils/
 ## Running it
 
 ```bash
-bash utils/dev.sh          # everything (venv bootstrap + backend :8000 + frontend :5173)
-python3 pipeline/run.py    # CoT pipeline only, no server needed
+bash utils/vigil.sh start         # everything, as background daemons (venv bootstrap + backend :8000 + frontend :5173)
+bash utils/vigil.sh restart backend   # after backend Python edits — picks up the change (no --reload running)
+bash utils/vigil.sh stop          # stop everything
+python3 pipeline/run.py           # CoT pipeline only, no server needed
 ```
 
 Run the pipeline at least once before the frontend, since the CoT tab reads from `/api/cot/db`, which reads `cot_silver`/`cot_gold` from `runtime/argentvigil.db` — empty tables make that route return a `500` ("No CoT data persisted yet. Run pipeline/run.py first.").
 
 The exchange-inventory/FRED/spot-price data populates itself on first backend startup regardless (a one-time unconditional refresh runs in `main.py`'s `lifespan`) — the tiered background refresh only *repeats* on a schedule if explicitly enabled via `POST /api/refresh/settings` or forced via `POST /api/refresh/force`. CATCOR's event calendar and reaction backfill also run automatically on every startup — no manual trigger needed, though `/api/catcor/refresh` exists for an on-demand re-run. ALFRED calls need `FRED_API_KEY` set in whatever shell launches the backend — without it, the event calendar and price reactions still populate, but `actual_value`/`surprise_delta` stay `NULL`. Research's Anthropic backend needs `ANTHROPIC_API_KEY` only if `AI_BACKEND=anthropic` is explicitly set (default is `forge`, which needs no key but does need the `amp-forge` LAN service reachable). The LBMA fix (see Silver/Gold sections above) needs `GAPI_API_KEY` (GoldAPI.io, free tier) — without it, `_lbma_fix_startup` logs a skip message and the rest of the app boots normally; `lbma_fix` just stays empty and `LbmaFixBadge` renders nothing.
 
-**Always run Python through `.venv`, never bare `python3`.** `bash utils/dev.sh` creates
+**Always run Python through `.venv`, never bare `python3`.** `bash utils/vigil.sh start` creates
 `.venv` on first run and installs `requirements.txt` into it (`fastapi`, `uvicorn`, `httpx`,
 `python-dotenv` — none of these are on system Python). Before running any Python command
 against this repo — import checks, one-off scripts, `python -c "..."` sanity tests — run
@@ -362,6 +380,35 @@ against this repo — import checks, one-off scripts, `python -c "..."` sanity t
 exception: it's intentionally stdlib-only by design and *can* run under bare `python3`, but
 `main.py`/`db.py`/anything importing `fastapi`, `httpx`, or `dotenv` cannot.
 
+## Development Notes
+
+Standing instructions for every interaction in this repo — distinct from each tab's "known gaps" (which describe upstream/data limitations, not workflow). Add to this section directly as new quirks/preferences come up.
+
+- **Always run Python through `.venv`, never bare `python3`** — see the full rule under "Running it" above. `pipeline/` is the sole stdlib-only exception.
+- **Use `utils/vigil.sh` to stop/start services** — always allowed, no need to ask first.
+- **Bump the version number in this file's title (`# ArgentVigil vX.Y.Z`) on every feature completion** — a new spec, or any change bigger than a typo/doc tweak. Not on every edit; only when a development effort actually completes.
+
+### TODO
+
+- 📌 (none yet — add items here as they come up)
+
+## Coding Modes
+
+Two modes govern how work in this repo is done. **Learning mode is the default** — only switch to auto mode when explicitly told to.
+
+### Learning mode (default)
+
+- **Never validate UI changes yourself** — no headless browser, no automated screenshotting. The user is at the screen and will look; acknowledge their eyes are better than a headless check for this.
+- **Pause after delivering any "demo-able" change** for an interactive walkthrough — explain/demo it, be ready to defend the approach or change it. The user always makes the final call.
+- **The goal is learning** — everything AV touches, from physical vault volumes to how the AI pieces work, not just shipping the change.
+- **Ask rather than guess** when something is ambiguous.
+
+### Auto mode (explicit opt-in only)
+
+- **Maximize work done before stopping.**
+- **Ask no questions** — if a decision is unavoidable, pick the option that would have been recommended anyway.
+- **Guess rather than ask.**
+
 ## Data sources (see README.md for full table)
 
-CFTC PRE Socrata API (CoT — both Legacy `jun7-fc8e` and Disaggregated `72hh-3qpy` datasets), Yahoo Finance (SLV/GLD/GC=F/SI=F), metalcharts.org (COMEX/SHFE inventory, volume/OI, delivery notices, spot prices — reverse-engineered API, auth via `mc_token.py`), Sprott direct API (PSLV), Silver Institute World Silver Survey (manually transcribed, annual), ALFRED (FRED's point-in-time vintage API — CATCOR's `actual_value`s), ForexFactory (`nfs.faireconomy.media`'s free calendar export — CATCOR's `consensus_value`s, current-calendar-week only), CME Group COMEX rulebook (Chapters 112/113 — Delivery Behavior's Last Trade Day rule, `seed_data/cme/`), Anthropic Messages API / amp-forge LAN service (Research tab's chat backend). CME's Market Data Platform (per-contract-month OI/settlement, the `get_settlements` API) was investigated and confirmed **paid**, not a free source — not integrated.
+CFTC PRE Socrata API (CoT — both Legacy `jun7-fc8e` and Disaggregated `72hh-3qpy` datasets), Yahoo Finance (SLV/GLD/GC=F/SI=F), metalcharts.org (COMEX/SHFE inventory, volume/OI, delivery notices, spot prices — reverse-engineered API, auth via `mc_token.py`), Sprott direct API (PSLV), Silver Institute World Silver Survey (manually transcribed, annual), ALFRED (FRED's point-in-time vintage API — CATCOR's `actual_value`s), ForexFactory (`nfs.faireconomy.media`'s free calendar export — CATCOR's `consensus_value`s, current-calendar-week only), CME Group COMEX rulebook (Chapters 112/113 — Delivery Behavior's Last Trade Day rule, `seed_data/cme/`), Anthropic Messages API / amp-forge LAN service (Research tab's chat backend), U.S. Census Bureau International Trade API (`census_trade` — HS 7106 silver / HS 7108 gold monthly imports/exports by country, free/CC0, `CENSUS_API_KEY`). CME's Market Data Platform (per-contract-month OI/settlement, the `get_settlements` API) was investigated and confirmed **paid**, not a free source — not integrated.

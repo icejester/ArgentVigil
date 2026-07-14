@@ -40,6 +40,31 @@ METALCHARTS = "https://metalcharts.org"
 MARKET_BALANCE_PATH = os.path.join(_REPO_ROOT, "seed_data", "silver_market_balance.json")
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+CENSUS_TRADE_BASE = "https://api.census.gov/data/timeseries/intltrade"
+# HS 7106 (silver, unwrought/semi-manufactured/powder) / HS 7108 (gold,
+# non-monetary — comparison-only per CLAUDE.md's "gold as context" rule).
+CENSUS_TRADE_HS_CODES = {"XAG": "7106", "XAU": "7108"}
+# Confirmed live (2025-01, 2024-06, both flows, both metals): imports and
+# exports use different field names for quantity — GEN_QY1_MO/CON_QY1_MO
+# (imports) vs. QTY_1_MO (exports) — sharing UNIT_QY1 for the unit code.
+# Both are always "0"/"-" today (Census reports no qty for these HS codes).
+CENSUS_TRADE_FLOWS = {
+    "import": {
+        "path": "imports/hs",
+        "commodity_param": "I_COMMODITY",
+        "value_general_field": "GEN_VAL_MO",
+        "value_consumption_field": "CON_VAL_MO",
+        "qty_field": "GEN_QY1_MO",
+    },
+    "export": {
+        "path": "exports/hs",
+        "commodity_param": "E_COMMODITY",
+        "value_general_field": "ALL_VAL_MO",
+        "value_consumption_field": None,
+        "qty_field": "QTY_1_MO",
+    },
+}
+CENSUS_TRADE_MONTHS_PER_FETCH = 3  # cheap self-heal against late revisions between gate-interval runs
 METAL_PRICE_TICKERS = {XAG_SERIES_ID: XAG_TICKER, XAU_SERIES_ID: XAU_TICKER}
 
 # Recoverable stock = Investment (coins/bars) + ETF/Exchange Vaults + Central
@@ -75,6 +100,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_refresh_fast_tier())
     asyncio.create_task(_refresh_slow_tier())
     asyncio.create_task(_lbma_fix_startup())
+    asyncio.create_task(_census_trade_startup())
     asyncio.create_task(_catcor_startup())
     _refresh_tasks.append(asyncio.create_task(_fast_tier_loop()))
     _refresh_tasks.append(asyncio.create_task(_slow_tier_loop()))
@@ -861,11 +887,17 @@ async def _fetch_and_persist_prices() -> dict:
     # re-serve — confirmed live over a weekend market closure that it kept
     # returning isStale=true with a live-looking "timestamp" field and a
     # cacheAge in the hours, while slowly drifting the price by rounding/
-    # re-sampling jitter on their end. Skipping persistence entirely when
-    # stale (rather than writing it anyway) means the tick series/chart
-    # goes flat when the real market is closed instead of showing fake
-    # movement that never actually traded.
-    if isinstance(data, dict) and data.get("isStale"):
+    # re-sampling jitter on their end. Skipping persistence when stale
+    # (rather than writing it anyway) means the tick series/chart goes flat
+    # when the real market is closed instead of showing fake movement that
+    # never actually traded — but that's only the right call for a real
+    # weekend closure. Confirmed live that isStale can also fire on a
+    # weekday with a cacheAge of months (metalcharts.org's own upstream feed
+    # stuck, not a market closure) — skipping indefinitely in that case would
+    # silently flatline the chart forever with no visible signal anything's
+    # wrong. So: skip only when it's currently a real weekend; on a weekday,
+    # persist anyway and let a stuck upstream surface directly in the chart.
+    if isinstance(data, dict) and data.get("isStale") and date.today().weekday() >= 5:
         return data
     payload = data.get("data", data) if isinstance(data, dict) else {}
     today = str(date.today())
@@ -1049,6 +1081,141 @@ async def lbma_db(metal: str = Query("XAU")):
 async def lbma_db_history(metal: str = Query("XAU"), fix_type: str = Query(None)):
     resolved_fix_type = fix_type or _LBMA_METAL_SYMBOLS.get(metal, "daily")
     rows = db.get_lbma_fix_series(metal, resolved_fix_type)
+    return {"success": True, "data": rows}
+
+
+def _census_trade_months(n: int) -> list[str]:
+    """Last n calendar months as 'YYYY-MM' strings, most recent first."""
+    months = []
+    y, m = date.today().year, date.today().month
+    for _ in range(n):
+        months.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return months
+
+
+async def _fetch_and_persist_census_trade() -> dict:
+    if "CENSUS_API_KEY" not in os.environ:
+        raise HTTPException(500, "CENSUS_API_KEY environment variable is not set")
+    api_key = os.environ["CENSUS_API_KEY"]
+    results = {}
+    for metal, hs_code in CENSUS_TRADE_HS_CODES.items():
+        for flow, spec in CENSUS_TRADE_FLOWS.items():
+            get_fields = ["CTY_CODE", "CTY_NAME", spec["value_general_field"]]
+            if spec["value_consumption_field"]:
+                get_fields.append(spec["value_consumption_field"])
+            get_fields += [spec["qty_field"], "UNIT_QY1"]
+            rows_for_flow = []
+            # Confirmed live: Census's publication lag is ~2 months, not 1 —
+            # both the current calendar month and the immediately-prior one
+            # return HTTP 204 (empty body, not an error) until released.
+            # Fetch a wider window so CENSUS_TRADE_MONTHS_PER_FETCH real
+            # months still land even after skipping unpublished ones.
+            for month in _census_trade_months(CENSUS_TRADE_MONTHS_PER_FETCH + 2):
+                resp = await _client.get(
+                    f"{CENSUS_TRADE_BASE}/{spec['path']}",
+                    params={
+                        "get": ",".join(get_fields),
+                        spec["commodity_param"]: hs_code,
+                        "time": month,
+                        "key": api_key,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                if resp.status_code == 204 or not resp.content:
+                    continue  # not yet published for this month
+                payload = resp.json()
+                header, *data_rows = payload
+                col_idx = {name: i for i, name in enumerate(header)}
+                for r in data_rows:
+                    qty_raw = r[col_idx[spec["qty_field"]]]
+                    unit_raw = r[col_idx["UNIT_QY1"]]
+                    # Confirmed live: HS 7106/7108 always report qty "0" /
+                    # unit "-" (Census's not-applicable sentinel) — persist
+                    # as NULL rather than a misleading 0/"-" pair.
+                    qty = None if qty_raw in (None, "0", "-") else float(qty_raw)
+                    qty_unit = None if unit_raw in (None, "-") else unit_raw
+                    con_val = None
+                    if spec["value_consumption_field"]:
+                        con_val = int(r[col_idx[spec["value_consumption_field"]]])
+                    rows_for_flow.append({
+                        "metal": metal,
+                        "flow": flow,
+                        "hs_code": hs_code,
+                        "cty_code": r[col_idx["CTY_CODE"]],
+                        "cty_name": r[col_idx["CTY_NAME"]],
+                        "year": int(month[:4]),
+                        "month": int(month[5:7]),
+                        "value_general_usd": int(r[col_idx[spec["value_general_field"]]]),
+                        "value_consumption_usd": con_val,
+                        "qty": qty,
+                        "qty_unit": qty_unit,
+                    })
+            if rows_for_flow:
+                db.upsert_census_trade_rows(rows_for_flow)
+            results[f"{metal}_{flow}"] = len(rows_for_flow)
+    return results
+
+
+CENSUS_TRADE_MIN_REFRESH_DAYS = 25  # Census releases monthly — no point re-pulling more often
+
+
+async def _refresh_census_trade():
+    """census_trade's registry entry — a rate-limit gate wrapping the real
+    fetch, same shape as _refresh_cot_pipeline. Gates on wall-clock time
+    since the LAST FETCH ATTEMPT (source_health.last_attempt_at), not on
+    the persisted data's own age — confirmed live that Census's real
+    publication lag is ~2 months (both the current calendar month and the
+    immediately-prior one return HTTP 204 until released), so "latest
+    persisted month is under 25 days old" is never true in practice and
+    would make the gate a permanent no-op, unlike cot_pipeline's CFTC data
+    (published within ~3 days of its as-of date, so report age closely
+    tracks fetch recency there). Records a 'skipped' attempt rather than a
+    failure when gated. In _SELF_RECORDING_KEYS (like cot_pipeline), so this
+    records its own success too — the generic health_refresh route must not
+    overwrite a genuine 'skipped' with a blanket 'success' once this returns
+    normally either way."""
+    health = db.get_source_health("census_trade")
+    if health and health.get("last_attempt_at"):
+        last_attempt = datetime.fromisoformat(health["last_attempt_at"])
+        days_since = (datetime.now(timezone.utc) - last_attempt).days
+        if days_since < CENSUS_TRADE_MIN_REFRESH_DAYS:
+            db.record_fetch_attempt(
+                "census_trade",
+                success=False,
+                skipped=True,
+                error="Last fetch attempt is less than 25 days old — skipped to respect Census's monthly release cadence.",
+            )
+            return
+    await _fetch_and_persist_census_trade()
+    db.record_fetch_attempt("census_trade", success=True)
+
+
+async def _census_trade_startup():
+    """Monthly, not daily — too slow for either tiered loop, so this is
+    startup-only (gated) plus manual force-refresh via the Data tab's
+    per-source button, same as LBMA. Silently skips if CENSUS_API_KEY isn't
+    set — a nice-to-have layer, not a hard boot requirement."""
+    if "CENSUS_API_KEY" not in os.environ:
+        print("[census_trade] CENSUS_API_KEY not set — skipping Census trade fetch")
+        return
+    try:
+        await _refresh_census_trade()
+    except Exception as e:
+        print(f"[census_trade] warning: {e}")
+        db.record_fetch_attempt("census_trade", success=False, error=str(e))
+
+
+@app.get("/api/census-trade/db")
+async def census_trade_db(
+    metal: str = Query("XAG"),
+    flow: str = Query(None),
+    hs_code: str = Query(None),
+):
+    rows = db.get_census_trade(metal, flow=flow, hs_code=hs_code)
     return {"success": True, "data": rows}
 
 
@@ -1275,6 +1442,7 @@ _ON_DEMAND_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
     "metals_prices": metals_prices_refresh,
     "cot_pipeline": _refresh_cot_pipeline,
     "lbma_fix": _fetch_and_persist_lbma_fix,
+    "census_trade": _refresh_census_trade,
 }
 _SOURCE_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
     **_FAST_TIER_REGISTRY,
@@ -1290,8 +1458,11 @@ _SOURCE_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
 # money_supply/metals_prices also record internally, but that's a harmless
 # duplicate of the identical outcome (and skipping the record here would
 # leave their FRED_API_KEY-missing pre-check, which raises before its own
-# try/except, unrecorded) — only cot_pipeline is exempted.
-_SELF_RECORDING_KEYS = {"cot_pipeline"}
+# try/except, unrecorded) — only cot_pipeline is exempted. census_trade is
+# exempted for the same reason as cot_pipeline: _refresh_census_trade's own
+# skip branch records "skipped" itself, which the generic route must not
+# overwrite with "success" once the wrapper returns normally either way.
+_SELF_RECORDING_KEYS = {"cot_pipeline", "census_trade"}
 
 
 @app.get("/api/health/db")
@@ -1301,6 +1472,8 @@ async def health_db():
         rows[source_key].pop("source_key", None)
     if "cot_pipeline" in rows:
         rows["cot_pipeline"]["last_report_date"] = db.get_latest_cot_report_date()
+    if "census_trade" in rows:
+        rows["census_trade"]["last_period"] = db.get_latest_census_trade_period()
     return {"success": True, "sources": rows}
 
 

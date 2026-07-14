@@ -9,3 +9,7 @@ export const CATCOR_EVENT_COLORS = {
   NFP: "#4caf76",
   observed: "#d9a441",
 };
+
+export const TRADE_FLOW_COLORS = [
+  "#7b9fff", "#4caf76", "#c9a227", "#e05252", "#94a3b8",
+];
