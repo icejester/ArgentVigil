@@ -1,4 +1,4 @@
-# ArgentVigil v1.1.0
+# ArgentVigil v1.1.1
 
 Silver speculative-positioning monitor with gold as comparative context. Framing is **"selling dollars, not buying metals"** — is the speculative futures crowd genuinely capitulated, or just pulling back. Not a trading system: no price targets, no prediction framing, no risk-tolerance commentary. See `SPEC.MD` (gitignored, local-only — do not assume it exists in fresh clones) for the full Stock & Flow panel spec and CATCOR feature map, `deliveryBehavior-spec.md` (also gitignored, local-only) for the Delivery Behavior layer's full spec and story list, `dataHealth-spec.md` (gitignored, local-only) for the Data Health/Fetch Status spec, `international-trade-spec.md` (also gitignored, local-only) for the Census international-trade ingestion spec, and `README.md` for the user-facing feature/data-source overview.
 
@@ -341,7 +341,8 @@ frontend/
   vite.config.js              publicDir points at pipeline/cache (legacy); /api proxied to :8000
 
 utils/
-  dev.sh              Boots venv, installs deps if missing, kills anything already listening on :8000/:5173, runs FastAPI + Vite together
+  vigil.sh            Process manager for backend/frontend as background daemons (start/stop/restart/status, PID-tracked, logs to runtime/logs/) — the standing way to run/stop/restart services, always allowed to run (see Development Notes). Backend picks up Python edits via `vigil.sh restart backend` (no --reload); frontend gets Vite HMR automatically either way.
+  dev.sh              Legacy foreground runner (Ctrl-C to stop, uvicorn --reload) — superseded by vigil.sh for a single-user local app; kept only if you want auto-restart-on-save for the backend without typing `vigil.sh restart`.
   sniff-metal-charts.py, sniffer.sh   Tools for reverse-engineering metalcharts.org API responses
 ```
 
@@ -361,21 +362,52 @@ utils/
 ## Running it
 
 ```bash
-bash utils/dev.sh          # everything (venv bootstrap + backend :8000 + frontend :5173)
-python3 pipeline/run.py    # CoT pipeline only, no server needed
+bash utils/vigil.sh start         # everything, as background daemons (venv bootstrap + backend :8000 + frontend :5173)
+bash utils/vigil.sh restart backend   # after backend Python edits — picks up the change (no --reload running)
+bash utils/vigil.sh stop          # stop everything
+python3 pipeline/run.py           # CoT pipeline only, no server needed
 ```
 
 Run the pipeline at least once before the frontend, since the CoT tab reads from `/api/cot/db`, which reads `cot_silver`/`cot_gold` from `runtime/argentvigil.db` — empty tables make that route return a `500` ("No CoT data persisted yet. Run pipeline/run.py first.").
 
 The exchange-inventory/FRED/spot-price data populates itself on first backend startup regardless (a one-time unconditional refresh runs in `main.py`'s `lifespan`) — the tiered background refresh only *repeats* on a schedule if explicitly enabled via `POST /api/refresh/settings` or forced via `POST /api/refresh/force`. CATCOR's event calendar and reaction backfill also run automatically on every startup — no manual trigger needed, though `/api/catcor/refresh` exists for an on-demand re-run. ALFRED calls need `FRED_API_KEY` set in whatever shell launches the backend — without it, the event calendar and price reactions still populate, but `actual_value`/`surprise_delta` stay `NULL`. Research's Anthropic backend needs `ANTHROPIC_API_KEY` only if `AI_BACKEND=anthropic` is explicitly set (default is `forge`, which needs no key but does need the `amp-forge` LAN service reachable). The LBMA fix (see Silver/Gold sections above) needs `GAPI_API_KEY` (GoldAPI.io, free tier) — without it, `_lbma_fix_startup` logs a skip message and the rest of the app boots normally; `lbma_fix` just stays empty and `LbmaFixBadge` renders nothing.
 
-**Always run Python through `.venv`, never bare `python3`.** `bash utils/dev.sh` creates
+**Always run Python through `.venv`, never bare `python3`.** `bash utils/vigil.sh start` creates
 `.venv` on first run and installs `requirements.txt` into it (`fastapi`, `uvicorn`, `httpx`,
 `python-dotenv` — none of these are on system Python). Before running any Python command
 against this repo — import checks, one-off scripts, `python -c "..."` sanity tests — run
 `source .venv/bin/activate` first, or invoke `.venv/bin/python` directly. `pipeline/` is the one
 exception: it's intentionally stdlib-only by design and *can* run under bare `python3`, but
 `main.py`/`db.py`/anything importing `fastapi`, `httpx`, or `dotenv` cannot.
+
+## Development Notes
+
+Standing instructions for every interaction in this repo — distinct from each tab's "known gaps" (which describe upstream/data limitations, not workflow). Add to this section directly as new quirks/preferences come up.
+
+- **Always run Python through `.venv`, never bare `python3`** — see the full rule under "Running it" above. `pipeline/` is the sole stdlib-only exception.
+- **Use `utils/vigil.sh` to stop/start services** — always allowed, no need to ask first.
+- **Bump the version number in this file's title (`# ArgentVigil vX.Y.Z`) on every feature completion** — a new spec, or any change bigger than a typo/doc tweak. Not on every edit; only when a development effort actually completes.
+
+### TODO
+
+- 📌 (none yet — add items here as they come up)
+
+## Coding Modes
+
+Two modes govern how work in this repo is done. **Learning mode is the default** — only switch to auto mode when explicitly told to.
+
+### Learning mode (default)
+
+- **Never validate UI changes yourself** — no headless browser, no automated screenshotting. The user is at the screen and will look; acknowledge their eyes are better than a headless check for this.
+- **Pause after delivering any "demo-able" change** for an interactive walkthrough — explain/demo it, be ready to defend the approach or change it. The user always makes the final call.
+- **The goal is learning** — everything AV touches, from physical vault volumes to how the AI pieces work, not just shipping the change.
+- **Ask rather than guess** when something is ambiguous.
+
+### Auto mode (explicit opt-in only)
+
+- **Maximize work done before stopping.**
+- **Ask no questions** — if a decision is unavoidable, pick the option that would have been recommended anyway.
+- **Guess rather than ask.**
 
 ## Data sources (see README.md for full table)
 

@@ -60,7 +60,7 @@ bash utils/vigil.sh restart          # restart both
 bash utils/vigil.sh start backend    # target one component (backend|frontend|all, default all)
 ```
 
-**Active development**, use `bash utils/dev.sh` instead — runs both processes in the foreground with `--reload`, Ctrl-C to stop. Boots `.venv` and installs `requirements.txt`/`npm install` if missing, same as `vigil.sh`.
+`bash utils/dev.sh` also exists (foreground, `--reload`, Ctrl-C to stop) but is legacy — for a single-user local app, `vigil.sh restart backend` after Python edits covers the same need without a second script to remember.
 
 **CoT pipeline** (no server needed, run at least once before the frontend — the CoT tab reads from `/api/cot/db`, which reads the tables this populates):
 
