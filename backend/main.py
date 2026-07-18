@@ -25,7 +25,12 @@ from pipeline.config import (
     FRED_M2_YOY_LOOKBACK,
     FRED_SERIES_CPI,
     FRED_SERIES_M2,
+    FRED_SERIES_RRPONTSYD,
     FRED_SERIES_WALCL,
+    FRED_SERIES_WLCFLPCL,
+    FRED_SERIES_WRESBAL,
+    FRED_SERIES_WSHOMCB,
+    FRED_SERIES_WSHOTSL,
     FRED_WALCL_YOY_LOOKBACK,
     METAL_PRICE_FETCH_YEARS,
     XAG_SERIES_ID,
@@ -1293,6 +1298,20 @@ async def _fetch_fred_series(series_id: str, observation_start: str) -> list[dic
     return rows
 
 
+def _millions_to_trillions(rows: list[dict]) -> list[dict]:
+    """WRESBAL/WSHOTSL/WSHOMCB/WLCFLPCL all report in millions of USD (same
+    convention as WALCL) — confirmed live against FRED's /fred/series
+    metadata. RRPONTSYD/M2SL report in billions instead; do not reuse this
+    helper for those."""
+    return [
+        {
+            "date": r["date"],
+            "value_trillions": round(r["value"] / 1_000_000, 3) if r["value"] is not None else None,
+        }
+        for r in rows
+    ]
+
+
 def _compute_yoy(rows: list[dict], lookback: int) -> list[dict]:
     out = []
     for i, r in enumerate(rows):
@@ -1315,9 +1334,19 @@ async def fred_money_supply_refresh():
         m2_rows = await _fetch_fred_series(FRED_SERIES_M2, observation_start)
         walcl_rows = await _fetch_fred_series(FRED_SERIES_WALCL, observation_start)
         cpi_rows = await _fetch_fred_series(FRED_SERIES_CPI, observation_start)
+        wresbal_rows = await _fetch_fred_series(FRED_SERIES_WRESBAL, observation_start)
+        rrpontsyd_rows = await _fetch_fred_series(FRED_SERIES_RRPONTSYD, observation_start)
+        wshotsl_rows = await _fetch_fred_series(FRED_SERIES_WSHOTSL, observation_start)
+        wshomcb_rows = await _fetch_fred_series(FRED_SERIES_WSHOMCB, observation_start)
+        wlcflpcl_rows = await _fetch_fred_series(FRED_SERIES_WLCFLPCL, observation_start)
         db.upsert_fred_observations(FRED_SERIES_M2, m2_rows)
         db.upsert_fred_observations(FRED_SERIES_WALCL, walcl_rows)
         db.upsert_fred_observations(FRED_SERIES_CPI, cpi_rows)
+        db.upsert_fred_observations(FRED_SERIES_WRESBAL, wresbal_rows)
+        db.upsert_fred_observations(FRED_SERIES_RRPONTSYD, rrpontsyd_rows)
+        db.upsert_fred_observations(FRED_SERIES_WSHOTSL, wshotsl_rows)
+        db.upsert_fred_observations(FRED_SERIES_WSHOMCB, wshomcb_rows)
+        db.upsert_fred_observations(FRED_SERIES_WLCFLPCL, wlcflpcl_rows)
         db.record_fetch_attempt("money_supply", success=True)
         return {
             "success": True,
@@ -1325,6 +1354,11 @@ async def fred_money_supply_refresh():
                 FRED_SERIES_M2: m2_rows,
                 FRED_SERIES_WALCL: walcl_rows,
                 FRED_SERIES_CPI: cpi_rows,
+                FRED_SERIES_WRESBAL: wresbal_rows,
+                FRED_SERIES_RRPONTSYD: rrpontsyd_rows,
+                FRED_SERIES_WSHOTSL: wshotsl_rows,
+                FRED_SERIES_WSHOMCB: wshomcb_rows,
+                FRED_SERIES_WLCFLPCL: wlcflpcl_rows,
             },
         }
     except httpx.HTTPError as e:
@@ -1510,12 +1544,26 @@ def _index_to_100(rows: list[dict]) -> list[dict]:
 
 
 @app.get("/api/metals/prices/db")
-async def metals_prices_db(window: str = Query("20y")):
-    years = FRED_WINDOW_YEARS.get(window, 20)
-    since = str(date.today() - timedelta(days=365 * years))
+async def metals_prices_db(
+    window: str = Query("20y"),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    # Same window="custom" + start/end convention as /api/fred/money-supply/db
+    # — Money Supply's frontend fetches both routes together with the same
+    # window params, so this chart's own window must stay in sync with that
+    # one rather than only supporting the fixed-years presets.
+    if window == "custom" and start:
+        since = start
+    else:
+        years = FRED_WINDOW_YEARS.get(window, 20)
+        since = str(date.today() - timedelta(days=365 * years))
 
     xag_rows = db.get_fred_observations(XAG_SERIES_ID, since)
     xau_rows = db.get_fred_observations(XAU_SERIES_ID, since)
+    if end is not None:
+        xag_rows = [r for r in xag_rows if r["date"] <= end]
+        xau_rows = [r for r in xau_rows if r["date"] <= end]
     xag_index = _index_to_100(xag_rows)
     xau_index = _index_to_100(xau_rows)
 
@@ -1535,15 +1583,44 @@ async def metals_prices_db(window: str = Query("20y")):
 
 
 @app.get("/api/fred/money-supply/db")
-async def fred_money_supply_db(window: str = Query("5y")):
-    years = FRED_WINDOW_YEARS.get(window, 5)
-    since = str(date.today() - timedelta(days=365 * years))
-    # Fetch extra lookback history (>1yr) so YoY is computable at the start of the window.
-    fetch_since = str(date.today() - timedelta(days=365 * (years + 2)))
+async def fred_money_supply_db(
+    window: str = Query("5y"),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    # window="custom" + explicit start/end (both YYYY-MM-DD) bypasses the
+    # fixed years-back presets entirely — start becomes `since`, end trims
+    # the fetched rows client-side-of-the-route (get_fred_observations has
+    # no upper bound of its own, so this route does the trimming itself
+    # rather than adding an end-date param to every caller of that helper).
+    if window == "custom" and start:
+        since = start
+        # A real bug caught by the user ("no M2 YoY stats earlier than
+        # 2021?"): fetch_since was originally just `start`, giving
+        # _compute_yoy zero lookback before the requested window — YoY needs
+        # 12 real prior months to diff against, so every custom-range M2/
+        # WALCL YoY value came back null regardless of how far back `start`
+        # was. Fetch 2 extra years before `start`, same margin the preset
+        # branch below already uses, so YoY is computable from day one of a
+        # custom range too.
+        fetch_since = str(date.fromisoformat(start) - timedelta(days=365 * 2))
+    else:
+        years = FRED_WINDOW_YEARS.get(window, 5)
+        since = str(date.today() - timedelta(days=365 * years))
+        # Fetch extra lookback history (>1yr) so YoY is computable at the start of the window.
+        fetch_since = str(date.today() - timedelta(days=365 * (years + 2)))
 
-    m2_all = db.get_fred_observations(FRED_SERIES_M2, fetch_since)
-    walcl_all = db.get_fred_observations(FRED_SERIES_WALCL, fetch_since)
-    cpi_all = db.get_fred_observations(FRED_SERIES_CPI, fetch_since)
+    def _trim(rows: list[dict]) -> list[dict]:
+        return [r for r in rows if end is None or r["date"] <= end]
+
+    m2_all = _trim(db.get_fred_observations(FRED_SERIES_M2, fetch_since))
+    walcl_all = _trim(db.get_fred_observations(FRED_SERIES_WALCL, fetch_since))
+    cpi_all = _trim(db.get_fred_observations(FRED_SERIES_CPI, fetch_since))
+    wresbal_all = _trim(db.get_fred_observations(FRED_SERIES_WRESBAL, since))
+    rrpontsyd_all = _trim(db.get_fred_observations(FRED_SERIES_RRPONTSYD, since))
+    wshotsl_all = _trim(db.get_fred_observations(FRED_SERIES_WSHOTSL, since))
+    wshomcb_all = _trim(db.get_fred_observations(FRED_SERIES_WSHOMCB, since))
+    wlcflpcl_all = _trim(db.get_fred_observations(FRED_SERIES_WLCFLPCL, since))
 
     m2_yoy = [r for r in _compute_yoy(m2_all, FRED_M2_YOY_LOOKBACK) if r["date"] >= since]
     walcl_yoy = [r for r in _compute_yoy(walcl_all, FRED_WALCL_YOY_LOOKBACK) if r["date"] >= since]
@@ -1583,6 +1660,17 @@ async def fred_money_supply_db(window: str = Query("5y")):
                 for r in walcl_yoy
             ],
             "purchasing_power": purchasing_power,
+            "wresbal": _millions_to_trillions(wresbal_all),
+            "rrpontsyd": [
+                {
+                    "date": r["date"],
+                    "value_trillions": round(r["value"] / 1000, 3) if r["value"] is not None else None,
+                }
+                for r in rrpontsyd_all
+            ],
+            "wshotsl": _millions_to_trillions(wshotsl_all),
+            "wshomcb": _millions_to_trillions(wshomcb_all),
+            "wlcflpcl": _millions_to_trillions(wlcflpcl_all),
         },
     }
 

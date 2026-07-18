@@ -410,6 +410,15 @@ curl "https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api
         note: "Fetched by /api/fred/money-supply/refresh, on-demand only (source_key money_supply).",
       },
       {
+        name: "fred_observations — WRESBAL, RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL",
+        fields: [
+          ["series_id", "'WRESBAL' / 'RRPONTSYD' / 'WSHOTSL' / 'WSHOMCB' / 'WLCFLPCL' — all 5 of FRED's H.4.1 candidate series", "Money Supply tab — Fed Balance Sheet Composition chart"],
+          ["date", "Observation date (all five weekly, FRED's native cadence)", "Chart x-axis"],
+          ["value", "Raw level, FRED's native unit per series — NOT all shared: WRESBAL/WSHOTSL/WSHOMCB/WLCFLPCL are millions of USD (like WALCL), RRPONTSYD is billions of USD (like M2SL). Confirmed live against FRED's /fred/series metadata. All converted to trillions in /api/fred/money-supply/db with their own correct divisor (_millions_to_trillions helper for the four millions-denominated series).", "—"],
+        ],
+        note: "Fed Balance Sheet Composition (fed-balance-spec.md) — a look inside WALCL's top-line number. All 5 candidate H.4.1 series now shipped (v1 shipped WRESBAL/RRPONTSYD only; WSHOTSL/WSHOMCB/WLCFLPCL added in a follow-up pass). Fetched by /api/fred/money-supply/refresh alongside M2SL/WALCL/CPIAUCSL, same source_key (money_supply). Raw value only, no YoY yet — frontend defaults WRESBAL/RRPONTSYD visible, the other three hidden behind a checkbox to avoid an overcrowded initial chart.",
+      },
+      {
         name: "fred_observations — CPIAUCSL",
         fields: [
           ["series_id", "'CPIAUCSL' — one series_id, two different fetch paths write to it", "—"],

@@ -30,6 +30,21 @@ FRED_FETCH_YEARS = 20        # how far back to fetch on refresh
 FRED_M2_YOY_LOOKBACK = 12    # months
 FRED_WALCL_YOY_LOOKBACK = 52  # weeks
 
+# Fed Balance Sheet Composition (fed-balance-spec.md) — a look inside WALCL's
+# top-line number. Raw value only, no YoY, per the spec's "start simplest"
+# framing (WRESBAL/RRPONTSYD were floated as the two simplest candidate
+# series of the five in H.4.1; WSHOTSL/WSHOMCB/WLCFLPCL are the remaining
+# three, added in the same v1 shape). NOT all the same native unit:
+# confirmed live against FRED's /fred/series metadata — WRESBAL, WSHOTSL,
+# WSHOMCB, and WLCFLPCL all report in millions of USD (like WALCL), while
+# RRPONTSYD reports in billions (like M2SL) — main.py's
+# /api/fred/money-supply/db converts each accordingly.
+FRED_SERIES_WRESBAL = "WRESBAL"        # bank reserves held at the Fed
+FRED_SERIES_RRPONTSYD = "RRPONTSYD"    # overnight reverse repo facility
+FRED_SERIES_WSHOTSL = "WSHOTSL"        # Treasuries held outright
+FRED_SERIES_WSHOMCB = "WSHOMCB"        # MBS held outright
+FRED_SERIES_WLCFLPCL = "WLCFLPCL"      # discount window (primary credit) lending
+
 # Metal price history (Yahoo Finance), for the purchasing-power comparison chart
 METAL_PRICE_FETCH_YEARS = 20
 XAG_SERIES_ID = "XAG_CLOSE"

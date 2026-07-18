@@ -302,6 +302,14 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-panel-note {
   font-size: 11px; color: #3e4860; line-height: 1.55;
 }
+/* eli5 tooltip text uses \n\n for paragraph breaks — pre-wrap (not
+   pre-line) so a blank line actually renders between paragraphs, not just
+   collapse to a single line break. Scoped to its own class rather than
+   changing .comex-panel-note itself, since that class is also used
+   elsewhere for plain single-line notes that shouldn't change behavior. */
+.comex-panel-note--eli5 {
+  white-space: pre-wrap;
+}
 .live-toggle {
   display: flex; align-items: center; gap: 5px; cursor: pointer;
   font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
@@ -317,6 +325,12 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 
 .comex-legend-list {
   display: flex; flex-direction: column; gap: 5px; margin-top: 10px;
+}
+/* Composition pie's legend spans horizontally instead of stacking, so all 5
+   series fit in one row (wraps to a second row on narrow viewports rather
+   than truncating). */
+.comex-legend-list--horizontal {
+  flex-direction: row; flex-wrap: wrap; gap: 14px; justify-content: center;
 }
 .comex-legend-item {
   display: flex; align-items: baseline; gap: 8px;
@@ -340,6 +354,20 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   display: flex; align-items: center; gap: 8px;
 }
 .metals-legend-row .legend-btn-row { flex: 1; }
+/* Purchasing-power legend spans horizontally (UI_STANDARDS.md), same
+   .comex-legend-list--horizontal container the Composition/M2/QE-QT
+   legends use — but these rows carry a checkbox AND a baseline-select
+   button with its own "— baseline (X at 0%)" note, so they don't shrink to
+   a bare swatch+label chip the way those simpler legends do. Cancel the
+   flex:1 full-row-stretch behavior in this context specifically so rows
+   size to content and wrap naturally instead of each fighting to fill the
+   remaining horizontal space. */
+.comex-legend-list--horizontal .metals-legend-row {
+  width: auto;
+}
+.comex-legend-list--horizontal .metals-legend-row .legend-btn-row {
+  flex: 0 0 auto;
+}
 .metals-legend-checkbox {
   flex-shrink: 0; cursor: pointer; accent-color: #7b9fff;
 }
