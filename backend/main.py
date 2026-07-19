@@ -349,15 +349,6 @@ async def _fetch_and_persist_silver_history(range: str = "ALL") -> list[dict]:
     return rows
 
 
-@app.get("/api/silver/history")
-async def silver_history(range: str = Query("ALL")):
-    try:
-        rows = await _fetch_and_persist_silver_history(range)
-        return {"success": True, "data": rows}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
-
-
 @app.get("/api/silver/db/history")
 async def silver_db_history():
     rows = db.get_aggregate_history()
@@ -393,15 +384,6 @@ async def _fetch_and_persist_silver_depositories() -> list[dict]:
     raw = resp.json().get("data", [])
     db.upsert_depository_rows(_depository_rows(raw))
     return raw
-
-
-@app.get("/api/silver/depositories")
-async def silver_depositories():
-    try:
-        raw = await _fetch_and_persist_silver_depositories()
-        return {"success": True, "data": raw}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
 
 
 @app.get("/api/silver/db/depositories")
@@ -446,15 +428,6 @@ async def _fetch_and_persist_silver_leverage() -> dict:
             "paper_leverage": None,
         })
     return {"enriched": enriched, "raw": raw}
-
-
-@app.get("/api/silver/leverage")
-async def silver_leverage():
-    try:
-        result = await _fetch_and_persist_silver_leverage()
-        return {"success": True, "data": [result["enriched"]], "raw": result["raw"]}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
 
 
 @app.get("/api/silver/db/leverage")
@@ -509,15 +482,6 @@ async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
     return rows
 
 
-@app.get("/api/gold/history")
-async def gold_history(range: str = Query("ALL")):
-    try:
-        rows = await _fetch_and_persist_gold_history(range)
-        return {"success": True, "data": rows}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
-
-
 @app.get("/api/gold/db/history")
 async def gold_db_history():
     rows = db.get_gold_aggregate_history()
@@ -536,15 +500,6 @@ async def _fetch_and_persist_gold_depositories() -> list[dict]:
     raw = resp.json().get("data", [])
     db.upsert_gold_depository_rows(_depository_rows(raw))
     return raw
-
-
-@app.get("/api/gold/depositories")
-async def gold_depositories():
-    try:
-        raw = await _fetch_and_persist_gold_depositories()
-        return {"success": True, "data": raw}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
 
 
 @app.get("/api/gold/db/depositories")
@@ -587,15 +542,6 @@ async def _fetch_and_persist_gold_leverage() -> dict:
             "paper_leverage": None,
         })
     return {"enriched": enriched, "raw": raw}
-
-
-@app.get("/api/gold/leverage")
-async def gold_leverage():
-    try:
-        result = await _fetch_and_persist_gold_leverage()
-        return {"success": True, "data": [result["enriched"]], "raw": result["raw"]}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
 
 
 @app.get("/api/gold/db/leverage")
@@ -657,14 +603,6 @@ async def _fetch_and_persist_delivery(type: str = "mtd") -> dict:
     return raw
 
 
-@app.get("/api/silver/delivery")
-async def silver_delivery(type: str = Query("mtd")):
-    try:
-        return await _fetch_and_persist_delivery(type)
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
-
-
 @app.get("/api/silver/db/delivery")
 async def silver_db_delivery(type: str = Query("mtd")):
     rows = db.get_delivery_history(type)
@@ -692,15 +630,6 @@ async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
         })
     db.upsert_shfe_rows(rows)
     return rows
-
-
-@app.get("/api/shfe/history")
-async def shfe_history(range: str = Query("ALL")):
-    try:
-        rows = await _fetch_and_persist_shfe_history(range)
-        return {"success": True, "data": rows}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
 
 
 @app.get("/api/shfe/db/history")
@@ -741,15 +670,6 @@ async def _fetch_and_persist_shfe_warehouses() -> list[dict]:
     return enriched
 
 
-@app.get("/api/shfe/warehouses")
-async def shfe_warehouses():
-    try:
-        enriched = await _fetch_and_persist_shfe_warehouses()
-        return {"success": True, "data": enriched}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
-
-
 @app.get("/api/shfe/db/warehouses")
 async def shfe_db_warehouses():
     rows = db.get_latest_shfe_warehouses()
@@ -787,15 +707,6 @@ async def _fetch_and_persist_pslv() -> dict:
     }
     db.upsert_pslv_row(result)
     return result
-
-
-@app.get("/api/pslv")
-async def pslv():
-    try:
-        result = await _fetch_and_persist_pslv()
-        return {"success": True, **result}
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
 
 
 @app.get("/api/pslv/db")
