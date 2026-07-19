@@ -152,6 +152,45 @@ CREATE TABLE IF NOT EXISTS census_trade (
     PRIMARY KEY (metal, flow, hs_code, cty_code, year, month)
 );
 
+-- Front-month vs. next-month COMEX futures settlement spread (Squeeze
+-- Context Story #1, see squeeze-context-spec.md). Sourced from Yahoo
+-- Finance's chart API against real deferred-month contract symbols (e.g.
+-- SIU26.CMX), resolved daily via a hand-maintained active-delivery-months
+-- list per metal + delivery_behavior.last_trade_day for rollover timing —
+-- see main.py's _resolve_front_next_contracts. curve_spread_pct is NULL
+-- (not 0) on any day either leg has no real price, per the standing
+-- nulls-over-zeros convention.
+CREATE TABLE IF NOT EXISTS futures_curve_spread (
+    metal TEXT NOT NULL,
+    date TEXT NOT NULL,
+    front_month_symbol TEXT,
+    front_month_price REAL,
+    next_month_symbol TEXT,
+    next_month_price REAL,
+    curve_spread_pct REAL,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (metal, date)
+);
+
+-- Hand-maintained historical squeeze/dislocation case log (Squeeze Context
+-- Story #3). Flat reference data, not a fetched table — no upstream source,
+-- rows are entered by hand/script. curve_reading_snapshot is nullable since
+-- curve spread backfill for cases predating this feature's ingestion start
+-- is best-effort, not guaranteed.
+CREATE TABLE IF NOT EXISTS squeeze_case_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_name TEXT NOT NULL,
+    metal TEXT NOT NULL,
+    date_range_start TEXT NOT NULL,
+    date_range_end TEXT NOT NULL,
+    cot_reading_snapshot TEXT,
+    curve_reading_snapshot TEXT,
+    mechanism_tag TEXT,
+    outcome_notes TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS event_calendar (
     event_id TEXT PRIMARY KEY,
     event_name TEXT NOT NULL,
@@ -550,36 +589,54 @@ def get_latest_gold_volume_oi() -> dict | None:
         return dict(row) if row else None
 
 
-def get_volume_oi_series() -> list[dict]:
+def get_volume_series(metal: str) -> list[dict]:
+    """Real daily volume history — metalcharts.org's only field this
+    codebase still trusts from volume_oi/gold_volume_oi (see
+    _leverage_backfill_from_cot's docstring: open_interest/paper_leverage
+    from this table were dropped from every leverage computation after a
+    2026-07 investigation confirmed metalcharts.org's OI figure runs
+    ~15% below CFTC's real open_interest_all; volume has no CFTC
+    equivalent at all, so it's still the only source). Only accumulates
+    forward from whenever the slow tier first started polling — no
+    historical backfill exists or is possible (metalcharts.org's own
+    volume-oi endpoint has no range/date param support, confirmed live)."""
+    table = "volume_oi" if metal == "XAG" else "gold_volume_oi"
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT date, open_interest, volume, paper_leverage FROM volume_oi ORDER BY date"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def get_gold_volume_oi_series() -> list[dict]:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT date, open_interest, volume, paper_leverage FROM gold_volume_oi ORDER BY date"
+            f"SELECT date, volume FROM {table} WHERE volume IS NOT NULL ORDER BY date"
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 def _leverage_backfill_from_cot(cot_table: str, aggregate_table: str, contract_oz: int) -> list[dict]:
-    """Derives a historical paper_leverage series from two tables AV
-    already ingests for unrelated reasons: cot_{silver,gold}'s weekly
-    open_interest (CFTC, real history back to 2011 — open_interest here is
-    CFTC's open_interest_all field, i.e. total OI across every trader
-    category, the same quantity metalcharts.org's volume-oi endpoint
-    returns as openInterest, so the two are a valid substitute for each
-    other) joined against {inventory,gold_inventory}_aggregate's daily
-    registered oz. Exists because metalcharts.org's volume-oi endpoint
-    itself has NO historical range support (confirmed live — a range/date
-    param is silently ignored, always returns only today's single
-    snapshot), so volume_oi/gold_volume_oi (daily, INSERT OR REPLACE per
-    date) only ever accumulates forward from whenever the slow-tier
-    refresh first ran.
+    """Computes the real paper_leverage series from two tables AV already
+    ingests for unrelated reasons: cot_{silver,gold}'s weekly open_interest
+    (CFTC's own open_interest_all field — total OI across every reportable
+    and non-reportable position, real weekly history back to 2011, the
+    government's own documented figure for the contract) joined against
+    {inventory,gold_inventory}_aggregate's daily registered oz.
+
+    This is now the ONLY source get_leverage_history uses for the OI side
+    of the ratio — metalcharts.org's own volume-oi endpoint used to supply
+    a second, daily-resolution OI figure for recent dates, stitched in
+    ahead of this backfill. That was removed after a real investigation
+    (2026-07) found the two sources do NOT measure the same thing: on
+    every date checked where both existed, metalcharts.org's openInterest
+    ran a stable ~15% below CFTC's open_interest_all for the same contract
+    (e.g. 2026-06-30: metalcharts.org 108,964 contracts vs. CFTC's real
+    127,000) — not noise, a consistent gap, most plausibly metalcharts.org
+    excluding some category CFTC's total includes (spread positions,
+    non-reportable small traders — unconfirmed which). Splicing two
+    non-equivalent OI numbers together produced a real, visible
+    discontinuity in the leverage chart right at the CoT-backfill/real-
+    daily-data seam (open interest and the derived ratio both stepped
+    sharply at the boundary even though neither underlying input actually
+    moved that much week over week) — a data-source bug, not a math bug.
+    CFTC-only removes the seam entirely: one source, one weekly-resolution
+    series, no boundary to disagree with itself. volume_oi/gold_volume_oi
+    still exist and are still fetched, but only for the `volume` figure
+    now (a real quantity CFTC doesn't report at all) — their own
+    open_interest/paper_leverage columns are no longer populated.
 
     Real ceiling is set by `registered` specifically, NOT by `total`
     (which does go back to 1992 for both metals) or by CoT's 2011 OI
@@ -591,11 +648,9 @@ def _leverage_backfill_from_cot(cot_table: str, aggregate_table: str, contract_o
     2019 and not CoT's full 2011 range, because that's where registered
     itself actually starts being reported, not a query-side limitation.
 
-    This backfill is weekly-resolution (CoT's own publish cadence), a
-    real granularity step down from volume_oi's daily rows — see
-    get_leverage_history, which stitches this in only for dates strictly
-    before the real daily series begins, the same pattern
-    get_price_history uses for its own tiered resolutions."""
+    Weekly resolution throughout (CoT's own publish cadence) — the whole
+    series, not just an early segment; there is no longer a denser daily
+    tail to hand off to."""
     with get_conn() as conn:
         cot_rows = conn.execute(
             f"SELECT report_date AS date, open_interest FROM {cot_table} "
@@ -633,25 +688,40 @@ def _leverage_backfill_from_cot(cot_table: str, aggregate_table: str, contract_o
 
 
 def get_leverage_history(metal: str) -> list[dict]:
-    """Stitched paper_leverage series: CoT-derived weekly points (see
-    _leverage_backfill_from_cot) for any date strictly before the real
-    daily volume_oi/gold_volume_oi series begins, then the real daily
-    series itself. One continuous line, sparser/weekly further back,
-    denser/daily for recent history — mirrors get_price_history's
-    tiered-resolution stitching."""
+    """The real paper_leverage series, CFTC-only (see
+    _leverage_backfill_from_cot for the full reasoning) — weekly
+    resolution throughout, no metalcharts.org OI stitched on top. Each
+    row's `volume` is always None here (CFTC's CoT report has no volume
+    field); callers that want a same-week volume figure should look it up
+    separately from volume_oi/gold_volume_oi (see get_latest_leverage)."""
     if metal == "XAG":
-        daily_rows = get_volume_oi_series()
-        backfill = _leverage_backfill_from_cot("cot_silver", "inventory_aggregate", 5000)
-    else:
-        daily_rows = get_gold_volume_oi_series()
-        backfill = _leverage_backfill_from_cot("cot_gold", "gold_inventory_aggregate", 100)
+        return _leverage_backfill_from_cot("cot_silver", "inventory_aggregate", 5000)
+    return _leverage_backfill_from_cot("cot_gold", "gold_inventory_aggregate", 100)
 
-    earliest_daily_date = daily_rows[0]["date"] if daily_rows else None
-    older_backfill = [
-        r for r in backfill
-        if earliest_daily_date is None or r["date"] < earliest_daily_date
-    ]
-    return older_backfill + daily_rows
+
+def get_latest_leverage(metal: str) -> dict | None:
+    """Current paper_leverage reading: CFTC's latest weekly OI ÷ latest
+    registered inventory (same computation as get_leverage_history's own
+    rows, just the single most recent one) — replaces the old
+    get_latest_volume_oi/get_latest_gold_volume_oi as the leverage
+    current-value source, per the same CFTC-only fix. `volume` is looked
+    up separately from volume_oi/gold_volume_oi's own latest row (still
+    metalcharts.org-sourced — CFTC has no volume field at all) since it's
+    a real, useful, genuinely-daily figure with no CFTC equivalent; a
+    volume reading one or two days older than the OI reading is expected
+    and not a bug, since the two now come from sources with different
+    natural cadences (weekly CoT vs. metalcharts.org's own daily poll)."""
+    history = get_leverage_history(metal)
+    if not history:
+        return None
+    latest = history[-1]
+    vol_row = get_latest_volume_oi() if metal == "XAG" else get_latest_gold_volume_oi()
+    return {
+        "date": latest["date"],
+        "open_interest": latest["open_interest"],
+        "volume": vol_row["volume"] if vol_row else None,
+        "paper_leverage": latest["paper_leverage"],
+    }
 
 
 def upsert_lbma_fix_row(row: dict):
@@ -753,6 +823,59 @@ def get_latest_census_trade_period() -> str | None:
         if ym is None:
             return None
         return f"{ym // 100:04d}-{ym % 100:02d}"
+
+
+def upsert_curve_spread_row(row: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO futures_curve_spread
+                   (metal, date, front_month_symbol, front_month_price,
+                    next_month_symbol, next_month_price, curve_spread_pct)
+               VALUES (:metal, :date, :front_month_symbol, :front_month_price,
+                       :next_month_symbol, :next_month_price, :curve_spread_pct)
+               ON CONFLICT (metal, date) DO UPDATE SET
+                   front_month_symbol = excluded.front_month_symbol,
+                   front_month_price = excluded.front_month_price,
+                   next_month_symbol = excluded.next_month_symbol,
+                   next_month_price = excluded.next_month_price,
+                   curve_spread_pct = excluded.curve_spread_pct,
+                   fetched_at = datetime('now')""",
+            row,
+        )
+
+
+def get_curve_spread_series(metal: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, front_month_symbol, front_month_price,
+                      next_month_symbol, next_month_price, curve_spread_pct
+               FROM futures_curve_spread
+               WHERE metal = ? ORDER BY date""",
+            (metal,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def insert_squeeze_case(row: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO squeeze_case_log
+                   (event_name, metal, date_range_start, date_range_end,
+                    cot_reading_snapshot, curve_reading_snapshot,
+                    mechanism_tag, outcome_notes)
+               VALUES (:event_name, :metal, :date_range_start, :date_range_end,
+                       :cot_reading_snapshot, :curve_reading_snapshot,
+                       :mechanism_tag, :outcome_notes)""",
+            row,
+        )
+
+
+def get_squeeze_cases() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM squeeze_case_log ORDER BY date_range_start"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def upsert_delivery_rows(rows: list[dict]):

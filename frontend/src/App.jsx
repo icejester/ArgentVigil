@@ -8,7 +8,7 @@ import ResearchPanel from "./research_panel";
 import { DATA_SOURCES } from "./data_map";
 
 const SECTIONS = [
-  { key: "cot", label: "CoT" },
+  { key: "cot", label: "Trading" },
   { key: "moneySupply", label: "Money Supply" },
   { key: "inventory", label: "Inventory" },
   { key: "catcor", label: "CATCOR" },

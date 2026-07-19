@@ -629,4 +629,57 @@ curl -X POST localhost:8000/api/catcor/research/sessions/<id>/messages \\
       },
     ],
   },
+  {
+    key: "futures_curve_spread",
+    label: "Yahoo Finance — futures curve spread",
+    origin: "Yahoo Finance chart API (query1.finance.yahoo.com/v8/finance/chart), real deferred-month COMEX contract symbols (e.g. SIU26.CMX, GCZ26.CMX) — no key required. Front/next-month resolution is liquidity-ranked, not calendar-adjacency-ranked: a hand-maintained 'active delivery months' list was tried first and abandoned after confirming live (2026-07) that Yahoo happily returns a price for thin/illiquid months too (e.g. silver's textbook 'Jul' contract showed vol=5 against Sep's vol=14,445) — see squeeze-context-spec.md Story #1. Each slow-tier cycle probes 8 upcoming calendar-month symbols per metal and picks the top 2 by real reported volume as front/next.",
+    cadence: "Slow tier (default OFF, runs once at startup) — see main.py lifespan. Daily is sufficient; this is not intraday-moving the way spot price is.",
+    sourceKeys: ["futures_curve_spread"],
+    healthMeta: {
+      futures_curve_spread: { expectedIntervalS: 1200, tier: "slow" },
+    },
+    rateLimit: "Unofficial/unauthenticated endpoint, no published quota or rate-limit response headers (confirmed live). ~8 requests/metal/day (16 total) riding the slow tier's own cycle spacing — a small fraction of what catcor.py's startup backfill already does safely in one burst against this same endpoint. Single retry with short backoff on 429/5xx, then skip-and-log without failing the rest of the slow tier.",
+    curl: `curl "https://query1.finance.yahoo.com/v8/finance/chart/SIU26.CMX?interval=1d&range=370d" \\
+  -H "User-Agent: Mozilla/5.0" -H "Accept: application/json"
+# candidate months are generated, not hardcoded — see main.py's _candidate_contract_symbols`,
+    tables: [
+      {
+        name: "futures_curve_spread",
+        fields: [
+          ["metal", "PK — 'XAG' or 'XAU'"],
+          ["date", "PK"],
+          ["front_month_symbol", "Yahoo contract symbol picked as front month that day (e.g. 'SIU26.CMX') — highest real volume among probed candidates, not necessarily the nearest calendar month"],
+          ["front_month_price", "Front-month daily settlement close, USD"],
+          ["next_month_symbol", "Second-highest-volume candidate's symbol"],
+          ["next_month_price", "Next-month daily settlement close, USD"],
+          ["curve_spread_pct", "(next_month_price - front_month_price) / front_month_price. Positive = contango, negative = backwardation. NULL (not 0) if either leg has no real price that day."],
+          ["fetched_at", "Row upsert timestamp"],
+        ],
+        note: "Upsert (INSERT ... ON CONFLICT), not append-only — front_month_symbol/next_month_symbol can legitimately change day to day as contracts roll. Nulls over zeros, standing convention.",
+      },
+    ],
+  },
+  {
+    key: "squeeze_case_log",
+    label: "Squeeze case log (hand-maintained)",
+    origin: "Manual, hand-maintained — a small dedicated table of known historical squeeze/dislocation cases (e.g. 2011 silver, 2020 COVID gold liquidity crisis, January 2026 silver) for pattern reference. Not fetched from any upstream source. See squeeze-context-spec.md Story #3.",
+    cadence: "Manual only — rows inserted by hand/script, no periodic fetch, no tier, no Data tab 'Re-run now' button (nothing to re-run).",
+    tables: [
+      {
+        name: "squeeze_case_log",
+        fields: [
+          ["id", "PK, autoincrement"],
+          ["event_name", "Human label, e.g. '2011 Silver Blow-off'"],
+          ["metal", "silver / gold"],
+          ["date_range_start / date_range_end", "The window this case covers"],
+          ["cot_reading_snapshot", "Free text/small JSON — MM net-long %ile at relevant points, hand-recorded"],
+          ["curve_reading_snapshot", "Free text/small JSON, nullable — curve spread at relevant points, where backfill data was obtainable (best-effort, not guaranteed for cases predating futures_curve_spread's own ingestion start)"],
+          ["mechanism_tag", "e.g. 'squeeze', 'liquidity_panic', 'other' — 2020 gold is a different mechanism than 2011/2026 silver and is not conflated with it"],
+          ["outcome_notes", "Free text description of what actually happened to price after — descriptive, not predictive framing, per AV Voice Rules"],
+          ["created_at / updated_at", "Standard bookkeeping"],
+        ],
+        note: "No frontend panel yet — DB + GET /api/squeeze-cases/db only this pass, per squeeze-context-spec.md's explicit scope for Story #3.",
+      },
+    ],
+  },
 ];

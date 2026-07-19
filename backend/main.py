@@ -427,16 +427,23 @@ async def _fetch_and_persist_silver_leverage() -> dict:
     latest_reg = reg_row[0]["registered"] if reg_row else None
     oi = row.get("openInterest") or row.get("open_interest")
     vol = row.get("volume")
-    # OI is in contracts (5,000 oz each); registered is in oz
+    # OI is in contracts (5,000 oz each); registered is in oz. Still
+    # computed here for the live /api/silver/leverage debug route's own
+    # response shape, but — since a 2026-07 investigation confirmed this
+    # metalcharts.org OI figure runs a stable ~15% below CFTC's real
+    # open_interest_all for the same contract/date, not a substitutable
+    # equivalent — it's no longer persisted. Leverage math everywhere
+    # else (the /db routes, the history chart) is CFTC-only now; see
+    # db._leverage_backfill_from_cot's docstring for the full reasoning.
     oi_oz = oi * 5000 if oi else None
     paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
     enriched = {**row, "paper_leverage": paper_leverage}
-    if oi and vol:
+    if vol:
         db.upsert_volume_oi_row({
             "date": row.get("date", str(date.today())),
-            "open_interest": oi_oz,
+            "open_interest": None,
             "volume": vol,
-            "paper_leverage": paper_leverage,
+            "paper_leverage": None,
         })
     return {"enriched": enriched, "raw": raw}
 
@@ -452,7 +459,7 @@ async def silver_leverage():
 
 @app.get("/api/silver/db/leverage")
 async def silver_db_leverage():
-    row = db.get_latest_volume_oi()
+    row = db.get_latest_leverage("XAG")
     if row is None:
         return {"success": True, "data": []}
     enriched = {
@@ -479,6 +486,12 @@ async def silver_db_leverage_history():
             for r in rows
         ],
     }
+
+
+@app.get("/api/volume/db/history")
+async def volume_db_history(metal: str = Query("XAG")):
+    rows = db.get_volume_series(metal)
+    return {"success": True, "data": rows}
 
 
 async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
@@ -557,16 +570,21 @@ async def _fetch_and_persist_gold_leverage() -> dict:
     latest_reg = reg_row[0]["registered"] if reg_row else None
     oi = row.get("openInterest") or row.get("open_interest")
     vol = row.get("volume")
-    # OI is in contracts (100 oz each for gold); registered is in oz
+    # OI is in contracts (100 oz each for gold); registered is in oz.
+    # Still computed here for the live /api/gold/leverage debug route's
+    # own response shape, but no longer persisted — see
+    # _fetch_and_persist_silver_leverage's comment for the full reasoning
+    # (CFTC-only leverage math now, metalcharts.org's OI confirmed ~15%
+    # off from CFTC's real open_interest_all on every date checked).
     oi_oz = oi * 100 if oi else None
     paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
     enriched = {**row, "paper_leverage": paper_leverage}
-    if oi and vol:
+    if vol:
         db.upsert_gold_volume_oi_row({
             "date": row.get("date", str(date.today())),
-            "open_interest": oi_oz,
+            "open_interest": None,
             "volume": vol,
-            "paper_leverage": paper_leverage,
+            "paper_leverage": None,
         })
     return {"enriched": enriched, "raw": raw}
 
@@ -582,7 +600,7 @@ async def gold_leverage():
 
 @app.get("/api/gold/db/leverage")
 async def gold_db_leverage():
-    row = db.get_latest_gold_volume_oi()
+    row = db.get_latest_leverage("XAU")
     if row is None:
         return {"success": True, "data": []}
     enriched = {
@@ -1056,14 +1074,37 @@ async def _fetch_and_persist_lbma_fix() -> dict:
         # GoldAPI.io's historical endpoint confirmed live to have no data
         # for "today" until some lag later in the day (returns
         # {"error": "No data available..."} — no "price" key at all, not
-        # just null) — fall back to yesterday so the badge/history always
-        # reflects the most recent real fix instead of going empty for
-        # part of each day.
-        payload = await _fetch_goldapi_fix(symbol, api_key, today)
-        fetched_date = today
+        # just null) — fall back to the most recent real business day so
+        # the badge/history always reflects the most recent real fix
+        # instead of going empty for part of each day.
+        #
+        # A real bug caught live (2026-07): GoldAPI.io does NOT error for a
+        # WEEKEND date the way it does for "today, not yet published" — it
+        # silently returns Friday's real fix under a non-null "price" field,
+        # re-timestamped as if it were Saturday's/Sunday's own fix (no LBMA
+        # fix is ever actually set on a weekend). The original fallback only
+        # retried once, on "price is None," which weekends never trigger —
+        # so a fetch that happened to run on a Saturday/Sunday would have
+        # silently persisted Friday's real number mislabeled with a
+        # weekend's date. No contaminated rows were found in lbma_fix by
+        # the time this was caught (pure luck of when the backend happened
+        # to restart), but the bug was real and latent. Fixed by walking
+        # `for_date` back to the nearest real weekday BEFORE ever calling
+        # GoldAPI, not by trying to detect the silent-carry-forward after
+        # the fact (which would require guessing whether two consecutive
+        # real prices are "coincidentally equal" vs "the same forward-
+        # filled response" — the weekday check is unambiguous, that
+        # inference isn't).
+        fetch_date = today
+        while fetch_date.weekday() >= 5:
+            fetch_date -= timedelta(days=1)
+        payload = await _fetch_goldapi_fix(symbol, api_key, fetch_date)
+        fetched_date = fetch_date
         if payload.get("price") is None:
-            payload = await _fetch_goldapi_fix(symbol, api_key, today - timedelta(days=1))
-            fetched_date = today - timedelta(days=1)
+            fetched_date = fetch_date - timedelta(days=1)
+            while fetched_date.weekday() >= 5:
+                fetched_date -= timedelta(days=1)
+            payload = await _fetch_goldapi_fix(symbol, api_key, fetched_date)
         price = payload.get("price")
         if price is not None:
             db.upsert_lbma_fix_row({
@@ -1086,6 +1127,207 @@ async def lbma_db(metal: str = Query("XAU")):
 async def lbma_db_history(metal: str = Query("XAU"), fix_type: str = Query(None)):
     resolved_fix_type = fix_type or _LBMA_METAL_SYMBOLS.get(metal, "daily")
     rows = db.get_lbma_fix_series(metal, resolved_fix_type)
+    return {"success": True, "data": rows}
+
+
+# Front-month vs. next-month futures curve spread (Squeeze Context Story
+# #1, see squeeze-context-spec.md). Yahoo's chart API returns a price for
+# EVERY calendar-month contract symbol, including thin/illiquid ones, and
+# which months are genuinely liquid does NOT match the textbook COMEX
+# delivery-cycle description — confirmed live (2026-07): silver's real
+# near-term depth was Sep (SIU26.CMX, vol=14,445) and Dec (SIZ26.CMX,
+# vol=1,123) only, while the textbook "Mar/May/Jul/Sep/Dec" cycle's Jul
+# (SIN26.CMX) showed just vol=5; gold's real depth was Aug (GCQ26.CMX,
+# vol=22,196) and Dec (GCZ26.CMX, vol=1,429), while Jul/Sep/Oct/Nov were
+# all <200. A hand-maintained "active months" list was tried first and
+# abandoned — same reasoning delivery_behavior.py's own module docstring
+# gives for why FND/LTD are computed per-month on demand rather than off a
+# small fixed list: COMEX's real listed/liquid months don't fit one. This
+# resolves front/next by fetching a spread of near-term candidate months
+# and picking the two with the highest real reported volume, every time,
+# rather than trusting a static list to stay accurate.
+_FUTURES_MONTH_CODE = {
+    1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
+    7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z",
+}
+CURVE_SPREAD_CANDIDATE_MONTHS_AHEAD = 8   # how many upcoming calendar months to probe for liquidity
+CURVE_SPREAD_CANDIDATE_MONTHS_BEHIND = 14 # >CURVE_SPREAD_FETCH_DAYS/30, so per-date backfill ranking
+                                           # (see _fetch_and_persist_curve_spread) has every symbol that
+                                           # could have been genuinely front/next at any date in that window
+                                           # — a real gap in an earlier version, which only swept forward
+                                           # from today and silently missed already-thinning contracts
+                                           # (e.g. SIN26.CMX/Jul26) that were the true front month months ago.
+CURVE_SPREAD_FETCH_DAYS = 370      # >1y so a fresh slow-tier row always has a full trailing year
+
+
+_MONTH_CODE_TO_NUM = {v: k for k, v in _FUTURES_MONTH_CODE.items()}
+
+
+def _candidate_contract_symbols(metal: str, today: date, months_ahead: int, months_behind: int) -> list[str]:
+    root = "SI" if metal == "XAG" else "GC"
+    symbols = []
+    year, month = today.year, today.month
+    for _ in range(months_behind):
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    for _ in range(months_ahead + months_behind):
+        symbols.append(f"{root}{_FUTURES_MONTH_CODE[month]}{year % 100:02d}.CMX")
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
+    return symbols
+
+
+def _delivery_sort_key(symbol: str) -> tuple[int, int]:
+    """(year, month) parsed from a Yahoo .CMX futures symbol, e.g.
+    'SIN26.CMX' -> (2026, 7) — lets ranking enforce real delivery order,
+    not just raw volume rank. Assumes 2-digit years land in 2000-2099,
+    fine for this codebase's near-term contract horizon."""
+    month_code = symbol[2]
+    year = 2000 + int(symbol[3:5])
+    return (year, _MONTH_CODE_TO_NUM[month_code])
+
+
+async def _fetch_yahoo_contract_daily(ticker: str, days: int) -> dict[str, tuple[float, float]]:
+    """Daily (close, volume) pairs keyed by YYYY-MM-DD for a single futures
+    contract symbol, sourced from the response's own per-bar arrays (NOT
+    meta.regularMarketVolume, which is only today's snapshot) — real daily
+    volume is what makes per-historical-date liquidity ranking possible, see
+    module note above. Single retry with short backoff on 429/5xx, then
+    raises — see squeeze-context-spec.md's rate-limit investigation: this
+    endpoint has no published quota or rate-limit response headers
+    (confirmed live), but has been hit repeatedly elsewhere in this
+    codebase (catcor.py's startup backfill, Money Supply's on-demand
+    refresh) with no documented 429, unlike ForexFactory's confirmed one —
+    a single retry is a defensive margin, not evidence of a known problem.
+    A 404 (contract symbol not yet listed / already delisted) is treated as
+    "no data" rather than retried, since a retry can't fix a symbol that
+    doesn't exist."""
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            resp = await _client.get(
+                f"{YAHOO_CHART_BASE}/{ticker}",
+                params={"interval": "1d", "range": f"{days}d"},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                timeout=30,
+            )
+            if resp.status_code == 404:
+                return {}
+            resp.raise_for_status()
+            data = resp.json()
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            quote = result["indicators"]["quote"][0]
+            closes = quote["close"]
+            volumes = quote.get("volume") or [None] * len(timestamps)
+            bars = {}
+            for ts, close, vol in zip(timestamps, closes, volumes):
+                if close is None:
+                    continue
+                d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                bars[d.isoformat()] = (round(close, 4), vol or 0)
+            return bars
+        except httpx.HTTPError as e:
+            last_error = e
+            if attempt == 0:
+                await asyncio.sleep(2)
+    raise last_error
+
+
+async def _fetch_and_persist_curve_spread() -> dict:
+    """Front/next-month resolution is liquidity-ranked PER HISTORICAL DATE,
+    not just for today — a real mislabeling bug caught after inspecting the
+    persisted data (confirmed live 2026-07): the original version ranked
+    liquidity once for today, then backfilled those two symbols' entire
+    trailing-year price history under that single label. Since which
+    contract is genuinely front/next changes as contracts approach and pass
+    their own delivery window (confirmed live: during the real January 2026
+    silver squeeze, the actually-liquid front month was SIN26.CMX/Jul26,
+    not SIU26.CMX/Sep26, which is what today's ranking would have wrongly
+    applied retroactively), a fixed label across the whole backfill window
+    was itself wrong — not the underlying Yahoo prices, which are real,
+    independently-traded, and carry real daily volume. This fetches each
+    candidate symbol's full daily (close, volume) history once, then re-
+    ranks front/next independently for every date in that history using
+    that date's own real volume."""
+    today = date.today()
+    results = {}
+    for metal in ("XAG", "XAU"):
+        candidates = _candidate_contract_symbols(
+            metal, today, CURVE_SPREAD_CANDIDATE_MONTHS_AHEAD, CURVE_SPREAD_CANDIDATE_MONTHS_BEHIND
+        )
+        fetched: dict[str, dict[str, tuple[float, float]]] = {}
+        for symbol in candidates:
+            bars = await _fetch_yahoo_contract_daily(symbol, CURVE_SPREAD_FETCH_DAYS)
+            if bars:
+                fetched[symbol] = bars
+
+        all_dates = sorted(set(d for bars in fetched.values() for d in bars))
+        rows = []
+        for d in all_dates:
+            # Rank every candidate symbol with real volume on THIS date by
+            # volume, highest = front. "Next" is the highest-volume REMAINING
+            # candidate whose delivery month is strictly later than front's —
+            # a real second bug caught during verification: pure volume
+            # ranking with no delivery-order check could pair an about-to-
+            # expire contract's trailing volume (e.g. SIZ25.CMX/Dec25, still
+            # winding down) against a newer front month (e.g. SIN26.CMX/
+            # Jul26) and call the EARLIER contract "next," producing a
+            # spurious negative spread that wasn't real backwardation, just
+            # a chronologically-backwards pairing.
+            day_ranked = sorted(
+                (
+                    (symbol, bars[d][0], bars[d][1])
+                    for symbol, bars in fetched.items()
+                    if d in bars and bars[d][1] > 0
+                ),
+                key=lambda t: t[2],
+                reverse=True,
+            )
+            if len(day_ranked) < 2:
+                continue
+            front_symbol, front_price, _ = day_ranked[0]
+            front_delivery = _delivery_sort_key(front_symbol)
+            later_candidates = [
+                c for c in day_ranked[1:] if _delivery_sort_key(c[0]) > front_delivery
+            ]
+            if not later_candidates:
+                continue
+            next_symbol, next_price, _ = later_candidates[0]
+            # Nulls over zeros: only compute a real spread when both legs
+            # reported a real price that day (standing convention).
+            spread_pct = (
+                (next_price - front_price) / front_price
+                if front_price and next_price else None
+            )
+            row = {
+                "metal": metal,
+                "date": d,
+                "front_month_symbol": front_symbol,
+                "front_month_price": front_price,
+                "next_month_symbol": next_symbol,
+                "next_month_price": next_price,
+                "curve_spread_pct": spread_pct,
+            }
+            db.upsert_curve_spread_row(row)
+            rows.append(row)
+        results[metal] = rows
+    return results
+
+
+@app.get("/api/curve-spread/db")
+async def curve_spread_db(metal: str = Query("XAG")):
+    rows = db.get_curve_spread_series(metal)
+    return {"success": True, "data": rows}
+
+
+@app.get("/api/squeeze-cases/db")
+async def squeeze_cases_db():
+    rows = db.get_squeeze_cases()
     return {"success": True, "data": rows}
 
 
@@ -1467,6 +1709,7 @@ _SLOW_TIER_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
     "shfe_silver_history": _fetch_and_persist_shfe_history,
     "shfe_warehouses": _fetch_and_persist_shfe_warehouses,
     "pslv": _fetch_and_persist_pslv,
+    "futures_curve_spread": _fetch_and_persist_curve_spread,
 }
 # On-demand-only sources (not part of either recurring tier), added to the
 # same registry the health-refresh route reads from, per Decision 6's "one
