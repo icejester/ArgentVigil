@@ -486,6 +486,9 @@ utils/
   vigil.sh            Process manager for backend/frontend as background daemons (start/stop/restart/status, PID-tracked, logs to runtime/logs/) — the standing way to run/stop/restart services, always allowed to run (see Development Notes). Backend picks up Python edits via `vigil.sh restart backend` (no --reload); frontend gets Vite HMR automatically either way.
   dev.sh              Legacy foreground runner (Ctrl-C to stop, uvicorn --reload) — superseded by vigil.sh for a single-user local app; kept only if you want auto-restart-on-save for the backend without typing `vigil.sh restart`.
   sniff-metal-charts.py, sniffer.sh   Tools for reverse-engineering metalcharts.org API responses
+  gen_data_dictionary.py   Generates docs/data-dictionary.md from backend/db.py's DDL + backend/sources.py's registry + frontend/src/data_editorial.js's prose (datasources-spec.md Story #2). Requires the venv (imports backend.main to populate SOURCE_REGISTRY), not stdlib-only like pipeline/.
+  gen_source_scaffold.py   Deterministic scaffold generator for onboarding a new data source (datasources-spec.md Story #4) — takes a YAML file (see example_source.yaml), emits reviewable SourceDefinition/fetch-function/DDL/route/data_editorial.js boilerplate. Never writes files directly — prints for manual review/apply, per this repo's Learning Mode standing rule. Paired with `.claude/commands/onboard-source.md`, which walks the judgment half (real response shape, quirks, cadence) that produces the YAML this script consumes.
+  example_source.yaml      Worked example input for gen_source_scaffold.py.
 ```
 
 **Convention:** runnable scripts live in `utils/`, not the repo root.
