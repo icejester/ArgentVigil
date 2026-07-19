@@ -17,7 +17,9 @@ from . import catcor
 from . import catcor_research
 from . import db
 from . import delivery_behavior
+from . import sources
 from .mc_token import authed_headers
+from .sources import CadenceSpec, RateLimitSpec, SourceDefinition
 from pipeline import run as pipeline_run
 from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
@@ -107,10 +109,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_lbma_fix_startup())
     asyncio.create_task(_census_trade_startup())
     asyncio.create_task(_catcor_startup())
-    _refresh_tasks.append(asyncio.create_task(_fast_tier_loop()))
-    _refresh_tasks.append(asyncio.create_task(_slow_tier_loop()))
-    _refresh_tasks.append(asyncio.create_task(_event_tier_loop()))
-    _refresh_tasks.append(asyncio.create_task(_consensus_tier_loop()))
+    _refresh_tasks.append(asyncio.create_task(_schedule_loop()))
     yield
     for t in _refresh_tasks:
         t.cancel()
@@ -120,9 +119,9 @@ async def lifespan(app: FastAPI):
 async def _lbma_fix_startup():
     """LBMA fix updates 1-2x/day (per metal) — too slow for either tiered
     loop, so per the price-spec decision this is startup-only plus manual
-    force-refresh via the Data tab's per-source button (lbma_fix is in
-    _ON_DEMAND_REGISTRY, not either tier), not a third recurring loop.
-    Silently skips if GAPI_API_KEY isn't set, same as CATCOR's ALFRED calls
+    force-refresh via the Data tab's per-source button (lbma_fix's
+    CadenceSpec.trigger is "startup", not "interval"), not a third
+    recurring loop. Silently skips if GAPI_API_KEY isn't set, same as CATCOR's ALFRED calls
     silently degrade without FRED_API_KEY — this is a nice-to-have layer,
     not a hard requirement to boot the app."""
     if "GAPI_API_KEY" not in os.environ:
@@ -180,56 +179,78 @@ async def _catcor_startup():
 CATCOR_CONSENSUS_INTERVAL_S = 1800  # how often to re-check for newly-in-window events; catcor.py caches the actual ForexFactory fetch per calendar week, so most of these ticks do zero network I/O
 
 
-async def _event_tier_loop():
-    """Snapshot capture needs a tight interval (real T+5m precision
-    requires it) — always on, not gated by an enabled flag, since a missed
-    snapshot window is a real, permanent data loss (no tick existed at
-    that instant), unlike fast/slow tier data which is always
-    re-fetchable on the next cycle."""
+async def _catcor_snapshot_tick():
+    """catcor_snapshot's fetch_fn — snapshot capture needs a tight
+    interval (real T+5m precision requires it). Registered with
+    trigger="always_on" in SOURCE_REGISTRY, which the generic scheduler
+    (_schedule_loop) fires unconditionally, never gated by an enabled
+    flag, since a missed snapshot window is a real, permanent data loss
+    (no tick existed at that instant), unlike fast/slow tier data which
+    is always re-fetchable on the next cycle."""
+    for event_id, window in catcor.due_snapshots():
+        catcor.capture_snapshot(event_id, window)
+
+
+async def _catcor_consensus_tick():
+    """catcor_consensus_actuals' fetch_fn — ForexFactory consensus +
+    ALFRED actuals. catcor.fetch_and_persist_consensus caches the raw
+    ForexFactory response per calendar week (confirmed live that repeat
+    hits trip its rate limit — 429 — so the actual network fetch happens
+    at most once a week; every other call here is a cache read matching
+    already-fetched entries against event_calendar). ALFRED actuals are
+    cheap/infrequent by nature (one real print per event per month) and
+    share this tick rather than getting their own, since there's no
+    benefit to checking more often than consensus does anyway."""
+    await catcor.fetch_and_persist_consensus(_client)
+    await catcor.fetch_and_persist_actuals(_client)
+
+
+async def _schedule_loop():
+    """Single generic scheduler replacing the old _fast_tier_loop /
+    _slow_tier_loop / _event_tier_loop / _consensus_tier_loop. Ticks every
+    second and, per source in sources.SOURCE_REGISTRY, fires fetch_fn when
+    its CadenceSpec says it's due:
+      - trigger == "always_on": fires every interval_seconds, unconditionally.
+      - trigger == "interval": fires every interval_seconds, but only if
+        enabled_flag is None or _refresh_settings[enabled_flag] is true.
+      - trigger in ("manual_only", "startup"): never ticked here — reached
+        only via POST /api/health/refresh/{key} (manual_only) or once at
+        boot from lifespan (startup; see _catcor_startup/_lbma_fix_startup/
+        _census_trade_startup, whose call ordering is load-bearing and is
+        deliberately not folded into this generic dispatch in this pass).
+    Seeds last_fired with the loop's own start time for every source, so
+    each source's first real fire waits a full interval rather than firing
+    immediately on the first tick — matching the old per-tier loops, which
+    all slept before their first fire, and avoiding a startup burst
+    stacked directly on top of lifespan's explicit one-shot startup calls
+    (_backfill_if_needed, _refresh_fast_tier, _refresh_slow_tier, etc)."""
+    start = datetime.now(timezone.utc)
+    last_fired: dict[str, datetime] = {key: start for key in sources.SOURCE_REGISTRY}
     while True:
-        await asyncio.sleep(60)
-        try:
-            for event_id, window in catcor.due_snapshots():
-                catcor.capture_snapshot(event_id, window)
-            db.record_fetch_attempt("catcor_snapshot", success=True)
-        except Exception as e:
-            print(f"[catcor] warning: event tier loop: {e}")
-            db.record_fetch_attempt("catcor_snapshot", success=False, error=str(e))
-
-
-async def _consensus_tier_loop():
-    """Separate, much slower loop for ForexFactory consensus + ALFRED
-    actuals. catcor.fetch_and_persist_consensus caches the raw ForexFactory
-    response per calendar week (confirmed live that repeat hits trip its
-    rate limit — 429 — so the actual network fetch happens at most once a
-    week; every other call here is a cache read matching already-fetched
-    entries against event_calendar). ALFRED actuals are cheap/infrequent by
-    nature (one real print per event per month) and share this loop rather
-    than getting their own, since there's no benefit to checking more often
-    than consensus does anyway."""
-    while True:
-        try:
-            await catcor.fetch_and_persist_consensus(_client)
-            await catcor.fetch_and_persist_actuals(_client)
-            db.record_fetch_attempt("catcor_consensus_actuals", success=True)
-        except Exception as e:
-            print(f"[catcor] warning: consensus tier loop: {e}")
-            db.record_fetch_attempt("catcor_consensus_actuals", success=False, error=str(e))
-        await asyncio.sleep(CATCOR_CONSENSUS_INTERVAL_S)
-
-
-async def _fast_tier_loop():
-    while True:
-        await asyncio.sleep(_refresh_settings["fast_interval_s"])
-        if _refresh_settings["fast_enabled"]:
-            await _refresh_fast_tier()
-
-
-async def _slow_tier_loop():
-    while True:
-        await asyncio.sleep(_refresh_settings["slow_interval_s"])
-        if _refresh_settings["slow_enabled"]:
-            await _refresh_slow_tier()
+        await asyncio.sleep(1)
+        now = datetime.now(timezone.utc)
+        for key, source in sources.SOURCE_REGISTRY.items():
+            cadence = source.cadence
+            if cadence.trigger not in ("always_on", "interval"):
+                continue
+            if cadence.trigger == "interval" and cadence.enabled_flag is not None:
+                if not _refresh_settings.get(cadence.enabled_flag, False):
+                    continue
+            interval = cadence.interval_seconds
+            if interval is None:
+                continue
+            due_at = last_fired.get(key)
+            if due_at is not None and (now - due_at).total_seconds() < interval:
+                continue
+            last_fired[key] = now
+            try:
+                await source.fetch_fn()
+                if not source.self_recording:
+                    db.record_fetch_attempt(key, success=True)
+            except Exception as e:
+                print(f"[schedule] warning ({key}): {e}")
+                if not source.self_recording:
+                    db.record_fetch_attempt(key, success=False, error=str(e))
 
 
 # _fetch_and_persist_delivery defaults to type="mtd", but confirmed live
@@ -245,10 +266,16 @@ async def _fetch_and_persist_delivery_ytd():
 
 
 async def _refresh_fast_tier() -> dict:
+    """Used by lifespan's one-shot startup call and by POST /api/refresh/force
+    — not by _schedule_loop, which fires each source on its own cadence
+    independently. Reads sources.sources_by_tier("fast") (derived from each
+    SourceDefinition's CadenceSpec.enabled_flag == "fast_enabled") rather
+    than a separate hardcoded registry, so this can't drift from what
+    _schedule_loop itself fires."""
     succeeded, failed, errors = 0, 0, []
-    for source_key, fn in _FAST_TIER_REGISTRY.items():
+    for source_key, source in sources.sources_by_tier("fast").items():
         try:
-            await fn()
+            await source.fetch_fn()
             db.record_fetch_attempt(source_key, success=True)
             succeeded += 1
         except Exception as e:
@@ -260,10 +287,11 @@ async def _refresh_fast_tier() -> dict:
 
 
 async def _refresh_slow_tier() -> dict:
+    """See _refresh_fast_tier's docstring — same reasoning, "slow" tier."""
     succeeded, failed, errors = 0, 0, []
-    for source_key, fn in _SLOW_TIER_REGISTRY.items():
+    for source_key, source in sources.sources_by_tier("slow").items():
         try:
-            await fn()
+            await source.fetch_fn()
             db.record_fetch_attempt(source_key, success=True)
             succeeded += 1
         except Exception as e:
@@ -1318,24 +1346,27 @@ async def _fetch_and_persist_census_trade() -> dict:
     return results
 
 
-CENSUS_TRADE_MIN_REFRESH_DAYS = 25  # Census releases monthly — no point re-pulling more often
+CENSUS_TRADE_MIN_REFRESH_DAYS = 25  # Census releases monthly — no point re-pulling more often; also feeds census_trade's CadenceSpec.min_gap below, single source of truth for the number
 
 
 async def _refresh_census_trade():
-    """census_trade's registry entry — a rate-limit gate wrapping the real
-    fetch, same shape as _refresh_cot_pipeline. Gates on wall-clock time
-    since the LAST FETCH ATTEMPT (source_health.last_attempt_at), not on
-    the persisted data's own age — confirmed live that Census's real
+    """census_trade's fetch_fn — a rate-limit gate wrapping the real fetch,
+    same shape as _refresh_cot_pipeline. Gates on wall-clock time since the
+    LAST FETCH ATTEMPT (source_health.last_attempt_at), not on the
+    persisted data's own age — confirmed live that Census's real
     publication lag is ~2 months (both the current calendar month and the
     immediately-prior one return HTTP 204 until released), so "latest
     persisted month is under 25 days old" is never true in practice and
     would make the gate a permanent no-op, unlike cot_pipeline's CFTC data
     (published within ~3 days of its as-of date, so report age closely
-    tracks fetch recency there). Records a 'skipped' attempt rather than a
-    failure when gated. In _SELF_RECORDING_KEYS (like cot_pipeline), so this
-    records its own success too — the generic health_refresh route must not
-    overwrite a genuine 'skipped' with a blanket 'success' once this returns
-    normally either way."""
+    tracks fetch recency there) — see census_trade's CadenceSpec, which
+    sets gate_on="last_attempt_at" for exactly this reason, vs.
+    cot_pipeline's gate_on="persisted_data_age". Records a 'skipped'
+    attempt rather than a failure when gated. census_trade's
+    SourceDefinition.self_recording=True (like cot_pipeline), so this
+    records its own success too — the generic health_refresh route must
+    not overwrite a genuine 'skipped' with a blanket 'success' once this
+    returns normally either way."""
     health = db.get_source_health("census_trade")
     if health and health.get("last_attempt_at"):
         last_attempt = datetime.fromisoformat(health["last_attempt_at"])
@@ -1572,12 +1603,15 @@ async def metals_prices_refresh():
         raise HTTPException(502, str(e))
 
 
-COT_MIN_REFRESH_DAYS = 7  # CFTC only publishes a new report ~weekly — no point re-pulling more often
+COT_MIN_REFRESH_DAYS = 7  # CFTC only publishes a new report ~weekly — no point re-pulling more often; also feeds cot_pipeline's CadenceSpec.min_gap below, single source of truth for the number
 
 
 async def _refresh_cot_pipeline():
-    """cot_pipeline's registry entry — the only one that's a rate-limit gate
-    wrapping a call rather than a bare fetch-and-persist function. Skips
+    """cot_pipeline's fetch_fn — the only source whose gate keys on
+    persisted-data age (gate_on="persisted_data_age" in its CadenceSpec)
+    rather than last-attempt time, since CFTC publishes within ~3 days of
+    its as-of date, so report age closely tracks fetch recency here (see
+    census_trade's CadenceSpec/gate for the contrasting case). Skips
     entirely (no CFTC request at all) if the latest persisted report is
     still within COT_MIN_REFRESH_DAYS, recording a 'skipped' attempt rather
     than a failure. Otherwise runs the real pipeline in a thread (it's a
@@ -1598,66 +1632,129 @@ async def _refresh_cot_pipeline():
     await asyncio.to_thread(pipeline_run.run_pipeline_once)
 
 
-# Single source of truth for "what gets fetched, on which tier, under which
-# source_health key" — both the tiered background loops (_refresh_fast_tier/
-# _refresh_slow_tier above) and the on-demand per-source health-refresh
-# route (POST /api/health/refresh/{source_key}, below) read from this
-# registry rather than each owning their own hardcoded function list, so the
-# two paths can't drift apart. Defined here (not near the top of the file)
-# since every function it references — including the on-demand-only ones —
-# must already exist as a real name by this point.
-_FAST_TIER_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
-    "spot_prices": _fetch_and_persist_prices,
+# Canonical registry population (datasources-spec.md Story #1 + #3):
+# every source's fetch function, cadence, and rate limit is defined here,
+# once, as a SourceDefinition — sources.SOURCE_REGISTRY is what
+# _schedule_loop, _refresh_fast_tier/_refresh_slow_tier, health_db, and
+# health_refresh (below) all read from, replacing the old four separate
+# dicts (_FAST_TIER_REGISTRY/_SLOW_TIER_REGISTRY/_ON_DEMAND_REGISTRY/
+# _SOURCE_REGISTRY) and the module-level _SELF_RECORDING_KEYS set. Defined
+# here (not near the top of the file) since every function it references
+# must already exist as a real name by this point — same ordering
+# constraint the old registries had.
+sources.register(SourceDefinition(
+    key="spot_prices", label="Spot Prices (metalcharts.org)",
+    affinity_group="exchange_market", fetch_fn=_fetch_and_persist_prices,
+    tables=["spot_price_snapshot", "spot_price_tick"],
+    cadence=CadenceSpec(trigger="interval", interval_seconds=_refresh_settings["fast_interval_s"], enabled_flag="fast_enabled"),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Reverse-engineered metalcharts.org endpoint, no published quota."),
+))
+_SLOW_TIER_FETCH_FNS: dict[str, tuple[Callable[[], Awaitable[None]], list[str], str]] = {
+    "comex_silver_history": (_fetch_and_persist_silver_history, ["inventory_aggregate"], "COMEX silver registered/eligible/total, daily."),
+    "comex_gold_history": (_fetch_and_persist_gold_history, ["gold_inventory_aggregate"], "COMEX gold registered/eligible/total, daily."),
+    "comex_silver_depositories": (_fetch_and_persist_silver_depositories, ["inventory_depository"], "COMEX silver per-vault snapshot, daily."),
+    "comex_gold_depositories": (_fetch_and_persist_gold_depositories, ["gold_inventory_depository"], "COMEX gold per-vault snapshot, daily."),
+    "silver_leverage": (_fetch_and_persist_silver_leverage, ["volume_oi"], "Silver COMEX volume (leverage/OI computed from cot_silver + inventory_aggregate, see db.get_leverage_history)."),
+    "gold_leverage": (_fetch_and_persist_gold_leverage, ["gold_volume_oi"], "Gold COMEX volume (leverage/OI computed from cot_gold + gold_inventory_aggregate)."),
+    "delivery_notices": (_fetch_and_persist_delivery_ytd, ["delivery_notices"], "COMEX silver daily issued/stopped delivery notices, YTD window."),
+    "shfe_silver_history": (_fetch_and_persist_shfe_history, ["shfe_inventory"], "SHFE silver inventory, daily."),
+    "shfe_warehouses": (_fetch_and_persist_shfe_warehouses, ["shfe_warehouse"], "SHFE per-warehouse warrant snapshot, daily."),
+    "pslv": (_fetch_and_persist_pslv, ["pslv_snapshot"], "Sprott PSLV custodial ounces, direct from Sprott's API."),
+    "futures_curve_spread": (_fetch_and_persist_curve_spread, ["futures_curve_spread"], "COMEX front/next-month futures spread (Yahoo Finance), daily."),
 }
-_SLOW_TIER_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
-    "comex_silver_history": _fetch_and_persist_silver_history,
-    "comex_gold_history": _fetch_and_persist_gold_history,
-    "comex_silver_depositories": _fetch_and_persist_silver_depositories,
-    "comex_gold_depositories": _fetch_and_persist_gold_depositories,
-    "silver_leverage": _fetch_and_persist_silver_leverage,
-    "gold_leverage": _fetch_and_persist_gold_leverage,
-    "delivery_notices": _fetch_and_persist_delivery_ytd,
-    "shfe_silver_history": _fetch_and_persist_shfe_history,
-    "shfe_warehouses": _fetch_and_persist_shfe_warehouses,
-    "pslv": _fetch_and_persist_pslv,
-    "futures_curve_spread": _fetch_and_persist_curve_spread,
-}
-# On-demand-only sources (not part of either recurring tier), added to the
-# same registry the health-refresh route reads from, per Decision 6's "one
-# generic route, not one bespoke route per source."
-_ON_DEMAND_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
-    "money_supply": fred_money_supply_refresh,
-    "metals_prices": metals_prices_refresh,
-    "cot_pipeline": _refresh_cot_pipeline,
-    "lbma_fix": _fetch_and_persist_lbma_fix,
-    "census_trade": _refresh_census_trade,
-}
-_SOURCE_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {
-    **_FAST_TIER_REGISTRY,
-    **_SLOW_TIER_REGISTRY,
-    **_ON_DEMAND_REGISTRY,
-}
-# cot_pipeline is the one entry whose self-recording health_refresh must not
-# clobber: a skip is deliberately not a failure (see _refresh_cot_pipeline),
-# and the real run's outcome is recorded inside run_pipeline_once itself
-# (used by the CLI/cron path too, not just this route) — an outer generic
-# record_fetch_attempt call here would overwrite a genuine "skipped" with a
-# blanket "success" once _refresh_cot_pipeline returns normally either way.
-# money_supply/metals_prices also record internally, but that's a harmless
-# duplicate of the identical outcome (and skipping the record here would
-# leave their FRED_API_KEY-missing pre-check, which raises before its own
-# try/except, unrecorded) — only cot_pipeline is exempted. census_trade is
-# exempted for the same reason as cot_pipeline: _refresh_census_trade's own
-# skip branch records "skipped" itself, which the generic route must not
-# overwrite with "success" once the wrapper returns normally either way.
-_SELF_RECORDING_KEYS = {"cot_pipeline", "census_trade"}
+for _key, (_fn, _tables, _note) in _SLOW_TIER_FETCH_FNS.items():
+    sources.register(SourceDefinition(
+        key=_key, label=_key.replace("_", " ").title(),
+        affinity_group="exchange_market", fetch_fn=_fn, tables=_tables,
+        cadence=CadenceSpec(trigger="interval", interval_seconds=_refresh_settings["slow_interval_s"], enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note=_note),
+    ))
+del _key, _fn, _tables, _note
+
+sources.register(SourceDefinition(
+    key="money_supply", label="FRED — Money Supply (M2, WALCL, Composition)",
+    affinity_group="gov_regulatory", fetch_fn=fred_money_supply_refresh,
+    tables=["fred_observations"], requires_env=["FRED_API_KEY"],
+    cadence=CadenceSpec(trigger="startup"),
+    rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern."),
+))
+sources.register(SourceDefinition(
+    key="metals_prices", label="Yahoo Finance — Monthly Metal Closes",
+    affinity_group="exchange_market", fetch_fn=metals_prices_refresh,
+    tables=["fred_observations"],
+    cadence=CadenceSpec(trigger="startup"),
+    rate_limit=RateLimitSpec(kind="undocumented", note="No published quota; conservative-by-design per CLAUDE.md's Yahoo Finance dev note."),
+))
+# cot_pipeline gates on PERSISTED DATA age (CFTC publishes within ~3 days
+# of its as-of date, so report age closely tracks fetch recency) — the
+# one source using gate_on="persisted_data_age" instead of the default
+# "last_attempt_at". self_recording=True: run_pipeline_once records its
+# own outcome to source_health (see pipeline/run.py), so the generic
+# health_refresh route below must not double-record.
+sources.register(SourceDefinition(
+    key="cot_pipeline", label="CFTC Commitment of Traders (Legacy + Disaggregated)",
+    affinity_group="gov_regulatory", fetch_fn=_refresh_cot_pipeline,
+    tables=["cot_silver", "cot_gold", "cot_disaggregated", "cot_prices", "pipeline_runs"],
+    cadence=CadenceSpec(
+        trigger="manual_only",
+        min_gap=timedelta(days=COT_MIN_REFRESH_DAYS),
+        gate_on="persisted_data_age",
+        persisted_age_fn=lambda: (date.fromisoformat(db.get_latest_cot_report_date()) if db.get_latest_cot_report_date() else None),
+    ),
+    rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=COT_MIN_REFRESH_DAYS), note="CFTC publishes a new report ~weekly."),
+    self_recording=True,
+))
+sources.register(SourceDefinition(
+    key="lbma_fix", label="GoldAPI.io — LBMA Fix",
+    affinity_group="exchange_market", fetch_fn=_fetch_and_persist_lbma_fix,
+    tables=["lbma_fix"], requires_env=["GAPI_API_KEY"],
+    cadence=CadenceSpec(trigger="startup"),
+    rate_limit=RateLimitSpec(kind="numeric_quota", quota_per_period="500/month"),
+))
+# census_trade gates on LAST ATTEMPT time (Census's ~2-month publication
+# lag means persisted-data age is never a useful gate — see
+# _refresh_census_trade's own docstring for the full reasoning).
+# self_recording=True for the same reason as cot_pipeline: its own skip
+# branch already records "skipped", which health_refresh must not
+# overwrite with a blanket "success".
+sources.register(SourceDefinition(
+    key="census_trade", label="U.S. Census Bureau — International Trade",
+    affinity_group="gov_regulatory", fetch_fn=_refresh_census_trade,
+    tables=["census_trade"], requires_env=["CENSUS_API_KEY"],
+    cadence=CadenceSpec(trigger="startup", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
+    rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), note="Census releases monthly, ~2-month publication lag."),
+    self_recording=True,
+))
+# CATCOR's two recurring loops were never in any registry before this
+# pass — folding them in per datasources-spec.md Story #3's explicit
+# instruction. catcor_snapshot MUST stay trigger="always_on" (see
+# CadenceSpec's docstring) — a missed reaction-capture window is
+# permanent data loss, unlike every other source here.
+sources.register(SourceDefinition(
+    key="catcor_snapshot", label="CATCOR — Reaction Snapshot Capture",
+    affinity_group="calendar_events", fetch_fn=_catcor_snapshot_tick,
+    tables=["macro_price_reaction"],
+    cadence=CadenceSpec(trigger="always_on", interval_seconds=60),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Internal — reads already-fetched spot_price_tick rows, no new upstream call."),
+))
+sources.register(SourceDefinition(
+    key="catcor_consensus_actuals", label="CATCOR — ForexFactory Consensus + ALFRED Actuals",
+    affinity_group="calendar_events", fetch_fn=_catcor_consensus_tick,
+    tables=["forexfactory_calendar", "event_calendar"],
+    cadence=CadenceSpec(trigger="interval", interval_seconds=CATCOR_CONSENSUS_INTERVAL_S),
+    rate_limit=RateLimitSpec(kind="undocumented", note="ForexFactory: per-calendar-week cache, real fetch at most weekly; confirmed live to 429 on repeat hits within the same week."),
+))
 
 
 @app.get("/api/health/db")
 async def health_db():
     rows = {r["source_key"]: dict(r) for r in db.get_all_source_health()}
-    for source_key in rows:
-        rows[source_key].pop("source_key", None)
+    for source_key, row in rows.items():
+        row.pop("source_key", None)
+        source = sources.SOURCE_REGISTRY.get(source_key)
+        if source is not None:
+            row["expected_interval_s"] = source.cadence.expected_interval_s
+            row["tier"] = source.tier
     if "cot_pipeline" in rows:
         rows["cot_pipeline"]["last_report_date"] = db.get_latest_cot_report_date()
     if "census_trade" in rows:
@@ -1667,16 +1764,16 @@ async def health_db():
 
 @app.post("/api/health/refresh/{source_key}")
 async def health_refresh(source_key: str):
-    fn = _SOURCE_REGISTRY.get(source_key)
-    if fn is None:
+    source = sources.SOURCE_REGISTRY.get(source_key)
+    if source is None:
         raise HTTPException(404, f"Unknown source_key: {source_key}")
     try:
-        await fn()
-        if source_key not in _SELF_RECORDING_KEYS:
+        await source.fetch_fn()
+        if not source.self_recording:
             db.record_fetch_attempt(source_key, success=True)
         return {"success": True, "error": None}
     except Exception as e:
-        if source_key not in _SELF_RECORDING_KEYS:
+        if not source.self_recording:
             db.record_fetch_attempt(source_key, success=False, error=str(e))
         return {"success": False, "error": str(e)}
 
