@@ -13,6 +13,9 @@ import {
   ReferenceLine,
   ResponsiveContainer,
   Legend,
+  PieChart,
+  Pie,
+  Cell,
 } from "recharts";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
@@ -31,10 +34,45 @@ const CATEGORY_DEFINITIONS = {
   other_reportable: "Large traders not classified into the other three categories.",
 };
 
-const CATEGORY_ORDER = ["producer_merchant", "swap_dealer", "managed_money", "other_reportable"];
+const CATEGORY_ORDER = ["managed_money", "other_reportable", "swap_dealer", "producer_merchant"];
 
 const CROWDED_THRESHOLD = 90;
 const CAPITULATED_THRESHOLD = 10;
+const WINDOW_2YR = 104; // ~2 years of weekly CoT reports
+const WINDOW_5YR = 260; // ~5 years of weekly CoT reports
+
+function classifySignal(percentile) {
+  if (percentile >= CROWDED_THRESHOLD) return "Specs crowded long — caution";
+  if (percentile <= CAPITULATED_THRESHOLD) return "Specs capitulated — back-up-the-truck zone";
+  return "Normal range — no signal";
+}
+
+// Client-side port of pipeline/compute.py's compute_from_series, applied as
+// of an arbitrary historical date instead of always the latest report — so
+// a pinned date's SignalDetail reflects what the percentile/classification
+// actually were AT that date, not today's. Same trailing-window definition
+// (rank against the n reports strictly before the as-of report, never
+// including it), so a pinned reading matches what compute_from_series would
+// have returned had it been run that week.
+function windowStatsAsOf(series, pinnedDate) {
+  if (!series || series.length === 0 || !pinnedDate) return null;
+  const idx = series.findLastIndex((r) => r.date <= pinnedDate);
+  if (idx === -1) return null;
+  const asOf = series[idx];
+  const currentVal = asOf.net_long_pct_oi;
+
+  function stats(n) {
+    const start = idx > n ? idx - n : 0;
+    const window = series.slice(start, idx).map((r) => r.net_long_pct_oi);
+    const below = window.filter((v) => v < currentVal).length;
+    const percentile = window.length ? Math.round((below / window.length) * 1000) / 10 : NaN;
+    return { percentile, window_size: window.length, classification: classifySignal(percentile) };
+  }
+
+  const windows = { "2yr": stats(WINDOW_2YR), "5yr": stats(WINDOW_5YR) };
+  windows.disagree = windows["2yr"].classification !== windows["5yr"].classification;
+  return { latest: asOf, windows };
+}
 
 // Same helper as money_supply.jsx's own nearestRowDate — Recharts'
 // category-axis ReferenceLine only renders when its x= value exists
@@ -123,12 +161,13 @@ function SignalDetail({ latest, windows }) {
       <div>
         <span style={{ color: "#8a94a6" }}>Net Long % of Open Interest:</span>{" "}
         <strong style={{ color: rawValueColor }}>{latest.net_long_pct_oi?.toFixed(2)}%</strong>
-        {" · "}
+      </div>
+      <div>
         <span style={{ color: "#8a94a6" }}>2-Year:</span>{" "}
         <strong style={{ color: signalDetailColor(w2.classification) }}>
           {w2.percentile}th pct
         </strong>
-        {" · "}
+        <span className="signal-detail-gap">·</span>
         <span style={{ color: "#8a94a6" }}>5-Year:</span>{" "}
         <strong style={{ color: signalDetailColor(w5.classification) }}>
           {w5.percentile}th pct
@@ -298,6 +337,35 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
 
   const pinnedDateSnapped = nearestRowDate(chartData, pinnedDate);
 
+  // When a date is pinned, SignalDetail should reflect that date's real
+  // percentile/classification, not always "latest" — same standing rule
+  // Money Supply's own summaries follow when pinned. Recomputed client-side
+  // from the full, unfiltered series (not chartData, which is windowed to
+  // the "Paper Games" selector and would truncate the trailing lookback
+  // window a percentile needs).
+  const silverAsOf = pinnedDateSnapped ? windowStatsAsOf(silverSeries, pinnedDateSnapped) : null;
+  const goldAsOf = pinnedDateSnapped && goldSeries ? windowStatsAsOf(goldSeries, pinnedDateSnapped) : null;
+  const silverSignal = silverAsOf ?? (silverLatest && silverWindows ? { latest: silverLatest, windows: silverWindows } : null);
+  const goldSignal = goldAsOf ?? (goldLatest && goldWindows ? { latest: goldLatest, windows: goldWindows } : null);
+
+  // Legend-heading visual cue: flags a metal's own legend row (independent
+  // of whether it's currently clicked/expanded) when either window reads
+  // outside normal range, so "something's flagged here" is visible without
+  // having to click in to SignalDetail first. Same crowded-beats-capitulated
+  // priority SignalDetail's own rawValueColor uses when windows disagree.
+  function signalFlag(signal) {
+    if (!signal) return null;
+    const { "2yr": w2, "5yr": w5 } = signal.windows;
+    if (w2.classification.includes("crowded") || w5.classification.includes("crowded")) {
+      return { glyph: "⚠", color: "#e05252" };
+    }
+    if (w2.classification.includes("capitulated") || w5.classification.includes("capitulated")) {
+      return { glyph: "⚠", color: "#4caf76" };
+    }
+    return null;
+  }
+  const legendFlags = { silver: signalFlag(silverSignal), gold: signalFlag(goldSignal) };
+
   return (
     <div className="chart-container">
       <ResponsiveContainer width="100%" height={360}>
@@ -386,18 +454,29 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
             onClick={() => toggle(key)}
           >
             <span className="comex-legend-swatch" style={{ background: color }} />
-            <span><strong>{legendLabel}</strong></span>
+            <span>
+              <strong>{legendLabel}</strong>
+              {legendFlags[key] && (
+                <span
+                  className="signal-legend-flag"
+                  style={{ color: legendFlags[key].color }}
+                  title="Outside 2yr/5yr historical norms — click for detail"
+                >
+                  {legendFlags[key].glyph}
+                </span>
+              )}
+            </span>
           </button>
         ))}
       </div>
       {clickedKey && (
         <div className="comex-panel-note comex-panel-note--eli5">
           {COMBINED_CHART_LEGEND.find((d) => d.key === clickedKey)?.eli5}
-          {clickedKey === "silver" && silverLatest && silverWindows && (
-            <SignalDetail latest={silverLatest} windows={silverWindows} />
+          {clickedKey === "silver" && silverSignal && (
+            <SignalDetail latest={silverSignal.latest} windows={silverSignal.windows} />
           )}
-          {clickedKey === "gold" && goldLatest && goldWindows && (
-            <SignalDetail latest={goldLatest} windows={goldWindows} />
+          {clickedKey === "gold" && goldSignal && (
+            <SignalDetail latest={goldSignal.latest} windows={goldSignal.windows} />
           )}
         </div>
       )}
@@ -424,61 +503,202 @@ const METAL_CONFIG = {
   },
 };
 
-function CategoryCompositionChart({ weeks }) {
-  const rows = weeks.map((w) => ({
-    report_date: w.report_date,
-    ...Object.fromEntries(CATEGORY_ORDER.map((c) => [c, w.long_share_pct[c] ?? null])),
-  }));
+// UI_STANDARDS.md legend shape, same convention as metalChartLegend/
+// COMBINED_CHART_LEGEND — the eli5 text is CATEGORY_DEFINITIONS' existing
+// prose, just moved from always-visible inline text into click-revealed
+// legend detail like every other chart's legend in this panel.
+const CATEGORY_LEGEND = CATEGORY_ORDER.map((c, i) => ({
+  key: c,
+  legendLabel: CATEGORY_LABELS[c],
+  color: VAULT_COLORS[i],
+  eli5: CATEGORY_DEFINITIONS[c],
+}));
+
+// Shared by CategoryCompositionChart's live Recharts <Tooltip> (hover) and
+// the pinned-tooltip box (click-to-pin) — same content, two triggers, same
+// convention as CombinedChartTooltipContent/MetalLeverageCurveVolumeTooltipContent.
+function CategoryCompositionTooltipContent({ active, label, rows }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.report_date === label);
+  if (!row) return null;
+
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      {CATEGORY_ORDER.map((c, i) =>
+        row[c] != null ? (
+          <div key={c} style={{ color: VAULT_COLORS[i] }}>
+            {CATEGORY_LABELS[c]}: {row[c].toFixed(1)}%
+          </div>
+        ) : null
+      )}
+    </div>
+  );
+}
+
+function CategoryCompositionChart({ weeks, since, until, pinnedDate, onPin }) {
+  const [clickedKey, setClickedKey] = useState(null);
+
+  const rows = weeks
+    .filter((w) => {
+      const d = new Date(w.report_date);
+      return (since == null || d >= since) && (until == null || d <= until);
+    })
+    .map((w) => ({
+      report_date: w.report_date,
+      // Also carried as `date` — nearestRowDate (shared with CombinedChart/
+      // MetalLeverageCurveVolumeChart) reads row.date, not report_date; a
+      // real bug found live where the pin's ReferenceLine silently never
+      // rendered here because every row's row.date was undefined.
+      date: w.report_date,
+      ...Object.fromEntries(CATEGORY_ORDER.map((c) => [c, w.long_share_pct[c] ?? null])),
+    }));
+
+  if (rows.length === 0) {
+    return <div className="comex-empty comex-empty-note">No data in the selected window.</div>;
+  }
+
+  const activeEntry = CATEGORY_LEGEND.find((d) => d.key === clickedKey);
+  const pinnedDateSnapped = nearestRowDate(rows, pinnedDate);
+
+  // Pie is a single-date "point in time" snapshot beside the range chart —
+  // same "As of {date}" pattern money_supply.jsx's Composition pie uses.
+  // Pinned date wins when set (snapped to the nearest real row, same as the
+  // ReferenceLine above); otherwise falls back to the true latest row.
+  const pieRow = pinnedDateSnapped
+    ? rows.find((r) => r.report_date === pinnedDateSnapped)
+    : rows[rows.length - 1];
+  const pieData = pieRow
+    ? CATEGORY_LEGEND
+        .filter(({ key }) => pieRow[key] != null && pieRow[key] > 0)
+        .map(({ key, legendLabel, color }) => ({ key, name: legendLabel, value: pieRow[key], color }))
+    : [];
+
+  // Each category keeps its own fixed color regardless of render/stack
+  // order — colors are looked up by key against CATEGORY_ORDER's fixed
+  // index, not by position in whatever order the Areas actually render in.
+  function categoryColor(c) {
+    return VAULT_COLORS[CATEGORY_ORDER.indexOf(c)];
+  }
+
+  // Clicking a legend row moves that category to the bottom of the stack
+  // (rendered first — Recharts/SVG stacks later-rendered Areas on top of
+  // earlier ones) in addition to the existing highlight/dim treatment, so
+  // the selected category's own band sits flush against the x-axis where
+  // its shape is easiest to read. Falls back to CATEGORY_ORDER when nothing
+  // is clicked.
+  const stackOrder = clickedKey
+    ? [clickedKey, ...CATEGORY_ORDER.filter((c) => c !== clickedKey)]
+    : CATEGORY_ORDER;
 
   return (
     <>
-      <ResponsiveContainer width="100%" height={260}>
-        <AreaChart data={rows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-          <XAxis
-            dataKey="report_date"
-            tickFormatter={(d) => new Date(d).toLocaleString(undefined, { month: "short", year: "2-digit" })}
-            interval="preserveStartEnd"
-            minTickGap={40}
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
-          />
-          <YAxis
-            domain={[0, 100]}
-            tickFormatter={(v) => `${v}%`}
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
-          />
-          <Tooltip
-            contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-            labelStyle={{ color: "#c8d0de" }}
-            formatter={(v, name) => [v != null ? v.toFixed(1) + "%" : "—", CATEGORY_LABELS[name] ?? name]}
-          />
-          {CATEGORY_ORDER.map((c, i) => (
-            <Area
-              key={c}
-              type="monotone"
-              dataKey={c}
-              stackId="1"
-              stroke={VAULT_COLORS[i]}
-              fill={VAULT_COLORS[i]}
-              fillOpacity={0.65}
-              connectNulls={false}
-            />
-          ))}
-        </AreaChart>
-      </ResponsiveContainer>
-      <div className="comex-legend-list">
-        {CATEGORY_ORDER.map((c, i) => (
-          <div className="comex-legend-item" key={c}>
-            <span className="comex-legend-swatch" style={{ background: VAULT_COLORS[i] }} />
-            <span><strong>{CATEGORY_LABELS[c]}</strong> — {CATEGORY_DEFINITIONS[c]}</span>
-          </div>
+      <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart
+              data={rows}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onClick={(state) => {
+                if (state?.activeLabel && onPin) onPin(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis
+                dataKey="report_date"
+                tickFormatter={(d) => new Date(d).toLocaleString(undefined, { month: "short", year: "2-digit" })}
+                interval="preserveStartEnd"
+                minTickGap={40}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+              />
+              <YAxis
+                domain={[0, 100]}
+                tickFormatter={(v) => `${v}%`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+              />
+              <Tooltip content={<CategoryCompositionTooltipContent rows={rows} />} />
+              {pinnedDateSnapped && (
+                <ReferenceLine x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
+              )}
+              {stackOrder.map((c) => (
+                <Area
+                  key={c}
+                  type="monotone"
+                  dataKey={c}
+                  stackId="1"
+                  stroke={categoryColor(c)}
+                  fill={categoryColor(c)}
+                  fillOpacity={clickedKey && clickedKey !== c ? 0.15 : 0.65}
+                  strokeWidth={clickedKey === c ? 2.5 : 1}
+                  connectNulls={false}
+                />
+              ))}
+            </AreaChart>
+          </ResponsiveContainer>
+          {pinnedDateSnapped && (
+            <div style={{ marginTop: 4 }}>
+              <CategoryCompositionTooltipContent active label={pinnedDateSnapped} rows={rows} />
+            </div>
+          )}
+        </div>
+
+        <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+          <ResponsiveContainer width={180} height={180}>
+            <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+              <Pie
+                data={pieData}
+                dataKey="value"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                outerRadius={70}
+                innerRadius={36}
+                paddingAngle={1}
+              >
+                {pieData.map((entry) => (
+                  <Cell
+                    key={entry.key}
+                    fill={entry.color}
+                    fillOpacity={clickedKey && clickedKey !== entry.key ? 0.35 : 1}
+                    stroke={clickedKey === entry.key ? "#e8ecf4" : undefined}
+                    strokeWidth={clickedKey === entry.key ? 2 : undefined}
+                  />
+                ))}
+              </Pie>
+              <Tooltip
+                contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                formatter={(v, name) => [`${v.toFixed(1)}%`, name]}
+              />
+            </PieChart>
+          </ResponsiveContainer>
+          {pieRow?.report_date && (
+            <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+              {pinnedDateSnapped ? `As of ${pieRow.report_date}` : `Latest — ${pieRow.report_date}`}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="comex-legend-list comex-legend-list--horizontal">
+        {CATEGORY_LEGEND.map(({ key, legendLabel, color }) => (
+          <button
+            key={key}
+            className={`comex-legend-item legend-btn-row${clickedKey === key ? " legend-btn-row--baseline" : ""}`}
+            style={{ "--legend-color": color }}
+            onClick={() => setClickedKey((prev) => (prev === key ? null : key))}
+          >
+            <span className="comex-legend-swatch" style={{ background: color }} />
+            <span><strong>{legendLabel}</strong></span>
+          </button>
         ))}
       </div>
+      {activeEntry && (
+        <div className="comex-panel-note comex-panel-note--eli5">{activeEntry.eli5}</div>
+      )}
     </>
   );
 }
 
-function CategoryCompositionPanel() {
+function CategoryCompositionPanel({ since, until, pinnedDate, onPin }) {
   const [metal, setMetal] = useState("XAG");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -503,9 +723,8 @@ function CategoryCompositionPanel() {
   const composition = data?.category_composition;
 
   return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">
-        Who's Holding Long Positions
+    <>
+      <div className="comex-chart-subheader">
         <select value={metal} onChange={(e) => setMetal(e.target.value)}>
           <option value="XAG">Silver</option>
           <option value="XAU">Gold</option>
@@ -521,7 +740,13 @@ function CategoryCompositionPanel() {
       {composition?.available === false ? (
         <div className="comex-empty">{composition.reason}</div>
       ) : composition?.weeks?.length > 0 ? (
-        <CategoryCompositionChart weeks={composition.weeks} />
+        <CategoryCompositionChart
+          weeks={composition.weeks}
+          since={since}
+          until={until}
+          pinnedDate={pinnedDate}
+          onPin={onPin}
+        />
       ) : error ? (
         <div className="comex-empty">
           No data available.
@@ -530,7 +755,7 @@ function CategoryCompositionPanel() {
       ) : (
         <div className="comex-empty">Loading…</div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -1037,7 +1262,12 @@ export default function SilverCoTTracker() {
           <details className="collapsible-pane">
             <summary className="collapsible-pane-title">Who's Holding Long Positions</summary>
             <div className="collapsible-pane-body">
-              <CategoryCompositionPanel />
+              <CategoryCompositionPanel
+                since={customRangeIncomplete ? null : effectiveSince}
+                until={customRangeIncomplete ? null : effectiveUntil}
+                pinnedDate={pinnedDate}
+                onPin={setPinnedDate}
+              />
             </div>
           </details>
         </div>
