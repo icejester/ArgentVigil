@@ -15,18 +15,18 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `metal` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `flow` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `hs_code` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `cty_code` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `cty_name` | TEXT |  | <!-- TODO: describe field --> |
-| `year` | INTEGER | ✓ | <!-- TODO: describe field --> |
-| `month` | INTEGER | ✓ | <!-- TODO: describe field --> |
-| `value_general_usd` | INTEGER |  | <!-- TODO: describe field --> |
-| `value_consumption_usd` | INTEGER |  | <!-- TODO: describe field --> |
-| `qty` | REAL |  | <!-- TODO: describe field --> |
-| `qty_unit` | TEXT |  | <!-- TODO: describe field --> |
-| `fetched_at` | TEXT |  | <!-- TODO: describe field --> |
+| `metal` | TEXT | ✓ | PK — 'XAG' (HS 7106) or 'XAU' (HS 7108, comparison-only) |
+| `flow` | TEXT | ✓ | PK — 'import' or 'export' |
+| `hs_code` | TEXT | ✓ | PK — '7106' or '7108' |
+| `cty_code` | TEXT | ✓ | PK — Census country code, '-' = all countries total |
+| `cty_name` | TEXT |  | Country name |
+| `year` | INTEGER | ✓ | PK |
+| `month` | INTEGER | ✓ | PK |
+| `value_general_usd` | INTEGER |  | Imports: GEN_VAL_MO (general import value). Exports: ALL_VAL_MO. |
+| `value_consumption_usd` | INTEGER |  | Imports only, CON_VAL_MO (value for consumption — excludes bonded-warehouse/re-export flow). NULL for exports. |
+| `qty` | REAL |  | Confirmed live (2025-01, 2024-06, both flows, both metals): always NULL today — Census reports no quantity/weight for HS 7106 or 7108 (GEN_QY1_MO/CON_QY1_MO/QTY_1_MO are always "0"). Not an error case; do not build oz-conversion logic against this field. |
+| `qty_unit` | TEXT |  | Same confirmed-live gap as qty — always NULL today (UNIT_QY1 is always Census's '-' not-applicable sentinel for these two HS codes). |
+| `fetched_at` | TEXT |  | Row upsert timestamp |
 
 ## `cot_disaggregated`
 
@@ -36,13 +36,13 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `report_date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `metal` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `category` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `long` | REAL |  | <!-- TODO: describe field --> |
-| `short` | REAL |  | <!-- TODO: describe field --> |
-| `spreading` | REAL |  | <!-- TODO: describe field --> |
-| `open_interest` | REAL |  | <!-- TODO: describe field --> |
+| `report_date` | TEXT | ✓ | PK (with metal, category) — CFTC report date |
+| `metal` | TEXT | ✓ | PK — 'silver' or 'gold' |
+| `category` | TEXT | ✓ | PK — producer_merchant / swap_dealer / managed_money / other_reportable |
+| `long` | REAL |  | Long contracts for this category |
+| `short` | REAL |  | Short contracts for this category |
+| `spreading` | REAL |  | Spread contracts (always NULL for producer_merchant — no spread field in CFTC's schema for that category) |
+| `open_interest` | REAL |  | Total open interest for the report |
 
 ## `cot_gold`
 
@@ -52,13 +52,13 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `report_date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `noncomm_long` | REAL |  | <!-- TODO: describe field --> |
-| `noncomm_short` | REAL |  | <!-- TODO: describe field --> |
-| `open_interest` | REAL |  | <!-- TODO: describe field --> |
-| `net_long` | REAL |  | <!-- TODO: describe field --> |
-| `net_long_pct_oi` | REAL |  | <!-- TODO: describe field --> |
-| `fetched_at` | TEXT |  | <!-- TODO: describe field --> |
+| `report_date` | TEXT | ✓ | PK — CFTC report date (Tuesday) |
+| `noncomm_long` | REAL |  | Non-commercial (speculative) long contracts, gold futures |
+| `noncomm_short` | REAL |  | Non-commercial (speculative) short contracts, gold futures |
+| `open_interest` | REAL |  | Total gold futures open interest, contracts |
+| `net_long` | REAL |  | noncomm_long - noncomm_short |
+| `net_long_pct_oi` | REAL |  | net_long as % of open_interest |
+| `fetched_at` | TEXT |  | Row insert timestamp (not report date) |
 
 ## `cot_prices`
 
@@ -68,9 +68,9 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `ticker` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `price` | REAL |  | <!-- TODO: describe field --> |
+| `ticker` | TEXT | ✓ | PK — e.g. SI=F, GC=F |
+| `date` | TEXT | ✓ | PK — weekly close date |
+| `price` | REAL |  | Close price |
 
 ## `cot_silver`
 
@@ -80,13 +80,13 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `report_date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `noncomm_long` | REAL |  | <!-- TODO: describe field --> |
-| `noncomm_short` | REAL |  | <!-- TODO: describe field --> |
-| `open_interest` | REAL |  | <!-- TODO: describe field --> |
-| `net_long` | REAL |  | <!-- TODO: describe field --> |
-| `net_long_pct_oi` | REAL |  | <!-- TODO: describe field --> |
-| `fetched_at` | TEXT |  | <!-- TODO: describe field --> |
+| `report_date` | TEXT | ✓ | PK — CFTC report date (Tuesday) |
+| `noncomm_long` | REAL |  | Non-commercial (speculative) long contracts |
+| `noncomm_short` | REAL |  | Non-commercial (speculative) short contracts |
+| `open_interest` | REAL |  | Total open interest, contracts |
+| `net_long` | REAL |  | noncomm_long - noncomm_short |
+| `net_long_pct_oi` | REAL |  | net_long as % of open_interest |
+| `fetched_at` | TEXT |  | Row insert timestamp (not report date) |
 
 ## `delivery_notices`
 
@@ -96,10 +96,10 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `type` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `daily_issued` | REAL |  | <!-- TODO: describe field --> |
-| `daily_stopped` | REAL |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK (with type) |
+| `type` | TEXT | ✓ | PK — 'mtd' or 'ytd' (Delivery Behavior uses ytd for ~85 days of coverage) |
+| `daily_issued` | REAL |  | Delivery notices issued that day, contracts |
+| `daily_stopped` | REAL |  | Delivery notices stopped that day, contracts |
 
 ## `event_calendar`
 
@@ -109,15 +109,15 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `event_id` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `event_name` | TEXT |  | <!-- TODO: describe field --> |
-| `event_type` | TEXT |  | <!-- TODO: describe field --> |
-| `scheduled_time` | TEXT |  | <!-- TODO: describe field --> |
-| `consensus_value` | REAL |  | <!-- TODO: describe field --> |
-| `actual_value` | REAL |  | <!-- TODO: describe field --> |
-| `surprise_delta` | REAL |  | <!-- TODO: describe field --> |
-| `source_url` | TEXT |  | <!-- TODO: describe field --> |
-| `source_tier` | TEXT |  | <!-- TODO: describe field --> |
+| `event_id` | TEXT | ✓ | PK — deterministic, f'{event_type}_{date}' |
+| `event_name` | TEXT |  | Human label |
+| `event_type` | TEXT |  | FOMC / CPI / NFP |
+| `scheduled_time` | TEXT |  | Event datetime |
+| `consensus_value` | REAL |  | From ForexFactory, current-week only |
+| `actual_value` | REAL |  | From ALFRED |
+| `surprise_delta` | REAL |  | actual - consensus, once both known |
+| `source_url` | TEXT |  | Reference link |
+| `source_tier` | TEXT |  | Currently always 'government' |
 
 ## `forexfactory_calendar`
 
@@ -127,13 +127,13 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `week_key` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `title` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `country` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `event_date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `impact` | TEXT |  | <!-- TODO: describe field --> |
-| `forecast` | TEXT |  | <!-- TODO: describe field --> |
-| `previous` | TEXT |  | <!-- TODO: describe field --> |
+| `week_key` | TEXT | ✓ | PK — that week's Sunday date |
+| `title` | TEXT | ✓ | PK — event title, e.g. 'Non-Farm Employment Change' |
+| `country` | TEXT | ✓ | PK — currency/country code |
+| `event_date` | TEXT | ✓ | PK — scheduled date |
+| `impact` | TEXT |  | Low/Medium/High |
+| `forecast` | TEXT |  | Consensus forecast as given by the feed |
+| `previous` | TEXT |  | Previous period's value |
 
 ## `fred_observations`
 
@@ -143,9 +143,9 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `series_id` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `value` | REAL |  | <!-- TODO: describe field --> |
+| `series_id` | TEXT | ✓ | PK (with date) — one of 8 values, see the split-out rows below |
+| `date` | TEXT | ✓ | PK — observation date |
+| `value` | REAL |  | Series value in native FRED/upstream units — NOT normalized across series_id |
 
 ## `futures_curve_spread`
 
@@ -155,14 +155,14 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `metal` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `front_month_symbol` | TEXT |  | <!-- TODO: describe field --> |
-| `front_month_price` | REAL |  | <!-- TODO: describe field --> |
-| `next_month_symbol` | TEXT |  | <!-- TODO: describe field --> |
-| `next_month_price` | REAL |  | <!-- TODO: describe field --> |
-| `curve_spread_pct` | REAL |  | <!-- TODO: describe field --> |
-| `fetched_at` | TEXT |  | <!-- TODO: describe field --> |
+| `metal` | TEXT | ✓ | PK — 'XAG' or 'XAU' |
+| `date` | TEXT | ✓ | PK |
+| `front_month_symbol` | TEXT |  | Yahoo contract symbol picked as front month that day (e.g. 'SIU26.CMX') — highest real volume among probed candidates, not necessarily the nearest calendar month |
+| `front_month_price` | REAL |  | Front-month daily settlement close, USD |
+| `next_month_symbol` | TEXT |  | Second-highest-volume candidate's symbol |
+| `next_month_price` | REAL |  | Next-month daily settlement close, USD |
+| `curve_spread_pct` | REAL |  | (next_month_price - front_month_price) / front_month_price. Positive = contango, negative = backwardation. NULL (not 0) if either leg has no real price that day. |
+| `fetched_at` | TEXT |  | Row upsert timestamp |
 
 ## `gold_inventory_aggregate`
 
@@ -218,12 +218,12 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `total` | REAL |  | <!-- TODO: describe field --> |
-| `registered` | REAL |  | <!-- TODO: describe field --> |
-| `eligible` | REAL |  | <!-- TODO: describe field --> |
-| `reg_eligible_ratio` | REAL |  | <!-- TODO: describe field --> |
-| `created_at` | TEXT |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK |
+| `total` | REAL |  | Total COMEX silver vault holdings, troy oz |
+| `registered` | REAL |  | Registered (deliverable) oz |
+| `eligible` | REAL |  | Eligible (non-deliverable) oz |
+| `reg_eligible_ratio` | REAL |  | registered / eligible |
+| `created_at` | TEXT |  | Row insert timestamp |
 
 ## `inventory_depository`
 
@@ -233,11 +233,11 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `depository` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `registered` | REAL |  | <!-- TODO: describe field --> |
-| `eligible` | REAL |  | <!-- TODO: describe field --> |
-| `total` | REAL |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK (with depository) |
+| `depository` | TEXT | ✓ | PK — vault name, e.g. 'JPMorgan' |
+| `registered` | REAL |  | This vault's registered oz |
+| `eligible` | REAL |  | This vault's eligible oz |
+| `total` | REAL |  | This vault's total oz |
 | `prev_registered` | REAL |  | <!-- TODO: describe field --> |
 | `prev_eligible` | REAL |  | <!-- TODO: describe field --> |
 | `prev_total` | REAL |  | <!-- TODO: describe field --> |
@@ -250,11 +250,11 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `metal` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `fix_type` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `price_usd` | REAL |  | <!-- TODO: describe field --> |
-| `fetched_at` | TEXT |  | <!-- TODO: describe field --> |
+| `metal` | TEXT | ✓ | PK — 'XAU' or 'XAG' |
+| `fix_type` | TEXT | ✓ | PK — 'AM' for gold (GoldAPI.io exposes no PM-fix-distinct field — gold's real 15:00 London PM fix is NOT available from this source), 'daily' for silver |
+| `date` | TEXT | ✓ | PK — calendar date requested, not a verified per-metal fix-moment timestamp (see note) |
+| `price_usd` | REAL |  | Fix price, USD/oz |
+| `fetched_at` | TEXT |  | Row upsert timestamp |
 
 ## `macro_price_reaction`
 
@@ -264,12 +264,12 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `event_id` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `metal` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `window` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `price` | REAL |  | <!-- TODO: describe field --> |
-| `price_delta_pct` | REAL |  | <!-- TODO: describe field --> |
-| `surprise_magnitude` | REAL |  | <!-- TODO: describe field --> |
+| `event_id` | TEXT | ✓ | PK (with metal, window) |
+| `metal` | TEXT | ✓ | PK — XAG or XAU |
+| `window` | TEXT | ✓ | PK — T-30m / T+5m / T+30m / T+2h |
+| `price` | REAL |  | Captured price at that window |
+| `price_delta_pct` | REAL |  | % change vs. pre-event price |
+| `surprise_magnitude` | REAL |  | Copied from event's surprise_delta at capture time |
 
 ## `pipeline_runs`
 
@@ -279,8 +279,8 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `id` | INTEGER | ✓ | <!-- TODO: describe field --> |
-| `ran_at` | TEXT |  | <!-- TODO: describe field --> |
+| `id` | INTEGER | ✓ | Always 1 — single-row table |
+| `ran_at` | TEXT |  | Timestamp of the last completed pipeline/run.py run |
 
 ## `pslv_snapshot`
 
@@ -290,11 +290,11 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `total_oz` | REAL |  | <!-- TODO: describe field --> |
-| `nav_per_unit` | REAL |  | <!-- TODO: describe field --> |
-| `total_nav` | REAL |  | <!-- TODO: describe field --> |
-| `units` | REAL |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK |
+| `total_oz` | REAL |  | PSLV trust's total silver holdings, oz |
+| `nav_per_unit` | REAL |  | Net asset value per unit |
+| `total_nav` | REAL |  | Total NAV |
+| `units` | REAL |  | Units outstanding |
 
 ## `research_log`
 
@@ -302,14 +302,14 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `id` | INTEGER | ✓ | <!-- TODO: describe field --> |
-| `session_id` | TEXT |  | <!-- TODO: describe field --> |
-| `claim_text` | TEXT |  | <!-- TODO: describe field --> |
-| `source_url` | TEXT |  | <!-- TODO: describe field --> |
-| `user_read` | TEXT |  | <!-- TODO: describe field --> |
-| `dismissed_at` | TEXT |  | <!-- TODO: describe field --> |
-| `dismiss_reason` | TEXT |  | <!-- TODO: describe field --> |
-| `validation_status` | TEXT |  | <!-- TODO: describe field --> |
+| `id` | INTEGER | ✓ | PK, autoincrement |
+| `session_id` | TEXT |  | FK -> research_sessions |
+| `claim_text` | TEXT |  | Denormalized copy from the session |
+| `source_url` | TEXT |  | Optional |
+| `user_read` | TEXT |  | bullish | bearish | neutral |
+| `dismissed_at` | TEXT |  | ISO timestamp |
+| `dismiss_reason` | TEXT |  | Required, non-empty — why this claim didn't hold up |
+| `validation_status` | TEXT |  | correct | incorrect | mixed — reserved for a later validation pass, always NULL today |
 
 ## `research_messages`
 
@@ -317,18 +317,18 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `id` | INTEGER | ✓ | <!-- TODO: describe field --> |
-| `session_id` | TEXT |  | <!-- TODO: describe field --> |
-| `role` | TEXT |  | <!-- TODO: describe field --> |
-| `content` | TEXT |  | <!-- TODO: describe field --> |
-| `created_at` | TEXT |  | <!-- TODO: describe field --> |
-| `backend` | TEXT |  | <!-- TODO: describe field --> |
-| `model` | TEXT |  | <!-- TODO: describe field --> |
-| `persona` | TEXT |  | <!-- TODO: describe field --> |
-| `context_blocks` | TEXT |  | <!-- TODO: describe field --> |
-| `memory_mode` | TEXT |  | <!-- TODO: describe field --> |
-| `memory_changed` | INTEGER |  | <!-- TODO: describe field --> |
-| `assembled_prompt` | TEXT |  | <!-- TODO: describe field --> |
+| `id` | INTEGER | ✓ | PK, autoincrement |
+| `session_id` | TEXT |  | FK -> research_sessions |
+| `role` | TEXT |  | user | assistant |
+| `content` | TEXT |  | Raw turn text (user) or a small JSON envelope {"final_text": ...} (assistant) |
+| `created_at` | TEXT |  | ISO timestamp, preserves ordering |
+| `backend` | TEXT |  | assistant rows only — 'anthropic' | 'forge', which backend answered |
+| `model` | TEXT |  | assistant rows only — resolved model string actually used |
+| `persona` | TEXT |  | assistant rows only — persona filename stem active for this turn |
+| `context_blocks` | TEXT |  | user rows only — JSON array of the context blocks checked for this turn |
+| `memory_mode` | TEXT |  | user rows only — stateless | accumulating, the mode this turn was sent under |
+| `memory_changed` | INTEGER |  | user rows only — 1 if this turn's memory_mode differs from the session's previous turn, else 0; drives the transcript's memory-switch divider |
+| `assembled_prompt` | TEXT |  | user rows only — the exact system+messages payload sent to the model, for transcript replay |
 
 ## `research_sessions`
 
@@ -336,14 +336,14 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `session_id` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `claim_text` | TEXT |  | <!-- TODO: describe field --> |
-| `source_url` | TEXT |  | <!-- TODO: describe field --> |
-| `status` | TEXT |  | <!-- TODO: describe field --> |
-| `user_read` | TEXT |  | <!-- TODO: describe field --> |
-| `memory_mode` | TEXT |  | <!-- TODO: describe field --> |
-| `created_at` | TEXT |  | <!-- TODO: describe field --> |
-| `updated_at` | TEXT |  | <!-- TODO: describe field --> |
+| `session_id` | TEXT | ✓ | PK — UUID |
+| `claim_text` | TEXT |  | The pasted claim/first message, as originally entered |
+| `source_url` | TEXT |  | Optional |
+| `status` | TEXT |  | active | promoted | dismissed — discarded sessions are deleted outright, never a 4th stored value |
+| `user_read` | TEXT |  | bullish | bearish | neutral — settable via POST .../read |
+| `memory_mode` | TEXT |  | stateless | accumulating — the session's current setting, defaults to accumulating; used to default the turn composer's toggle to wherever it was left |
+| `created_at` | TEXT |  | ISO timestamp |
+| `updated_at` | TEXT |  | Bumped on every message |
 
 ## `shfe_inventory`
 
@@ -353,9 +353,9 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `total_kg` | REAL |  | <!-- TODO: describe field --> |
-| `total_oz` | REAL |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK |
+| `total_kg` | REAL |  | Total SHFE silver warehouse stock, kg (native unit) |
+| `total_oz` | REAL |  | Converted, 1 kg = 32.1507 oz |
 | `created_at` | TEXT |  | <!-- TODO: describe field --> |
 
 ## `shfe_warehouse`
@@ -366,10 +366,10 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `warehouse` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `warrant_kg` | REAL |  | <!-- TODO: describe field --> |
-| `warrant_change_kg` | REAL |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK (with warehouse) |
+| `warehouse` | TEXT | ✓ | PK — individual SHFE warehouse name |
+| `warrant_kg` | REAL |  | Warrant stock at this warehouse, kg |
+| `warrant_change_kg` | REAL |  | Day-over-day change, kg |
 
 ## `source_health`
 
@@ -392,10 +392,10 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `series_id` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `price` | REAL |  | <!-- TODO: describe field --> |
-| `change_pct_24h` | REAL |  | <!-- TODO: describe field --> |
+| `series_id` | TEXT | ✓ | PK (with date) — e.g. XAG, XAU |
+| `date` | TEXT | ✓ | PK — one row per calendar day, overwritten on every fast-tier tick |
+| `price` | REAL |  | Latest price |
+| `change_pct_24h` | REAL |  | 24h % change, from upstream |
 
 ## `spot_price_tick`
 
@@ -405,9 +405,9 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `series_id` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `ts` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `price` | REAL |  | <!-- TODO: describe field --> |
+| `series_id` | TEXT | ✓ | PK (with ts) — "XAG"/"XAU" (real metalcharts.org spot ticks, this card's source) or "XAG_FUTURES"/"XAU_FUTURES" (Yahoo SI=F/GC=F futures bars, a different instrument backfilled by CATCOR — see the catcor_reactions card) |
+| `ts` | TEXT | ✓ | PK — timestamp of this tick |
+| `price` | REAL |  | Price at that tick |
 
 ## `sqlite_sequence`
 
@@ -424,15 +424,15 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `id` | INTEGER | ✓ | <!-- TODO: describe field --> |
-| `event_name` | TEXT |  | <!-- TODO: describe field --> |
-| `metal` | TEXT |  | <!-- TODO: describe field --> |
+| `id` | INTEGER | ✓ | PK, autoincrement |
+| `event_name` | TEXT |  | Human label, e.g. '2011 Silver Blow-off' |
+| `metal` | TEXT |  | silver / gold |
 | `date_range_start` | TEXT |  | <!-- TODO: describe field --> |
 | `date_range_end` | TEXT |  | <!-- TODO: describe field --> |
-| `cot_reading_snapshot` | TEXT |  | <!-- TODO: describe field --> |
-| `curve_reading_snapshot` | TEXT |  | <!-- TODO: describe field --> |
-| `mechanism_tag` | TEXT |  | <!-- TODO: describe field --> |
-| `outcome_notes` | TEXT |  | <!-- TODO: describe field --> |
+| `cot_reading_snapshot` | TEXT |  | Free text/small JSON — MM net-long %ile at relevant points, hand-recorded |
+| `curve_reading_snapshot` | TEXT |  | Free text/small JSON, nullable — curve spread at relevant points, where backfill data was obtainable (best-effort, not guaranteed for cases predating futures_curve_spread's own ingestion start) |
+| `mechanism_tag` | TEXT |  | e.g. 'squeeze', 'liquidity_panic', 'other' — 2020 gold is a different mechanism than 2011/2026 silver and is not conflated with it |
+| `outcome_notes` | TEXT |  | Free text description of what actually happened to price after — descriptive, not predictive framing, per AV Voice Rules |
 | `created_at` | TEXT |  | <!-- TODO: describe field --> |
 | `updated_at` | TEXT |  | <!-- TODO: describe field --> |
 
@@ -453,15 +453,15 @@
 
 | Field | Type | PK | Description |
 |---|---|---|---|
-| `date` | TEXT | ✓ | <!-- TODO: describe field --> |
-| `open_interest` | REAL |  | <!-- TODO: describe field --> |
-| `volume` | REAL |  | <!-- TODO: describe field --> |
-| `paper_leverage` | REAL |  | <!-- TODO: describe field --> |
+| `date` | TEXT | ✓ | PK |
+| `open_interest` | REAL |  | COMEX silver open interest, contracts |
+| `volume` | REAL |  | Daily volume, contracts |
+| `paper_leverage` | REAL |  | Derived ratio, powers Paper Leverage cards |
 | `created_at` | TEXT |  | <!-- TODO: describe field --> |
 
 ---
 
-**Coverage**: 0/187 fields documented, 187 pending (`<!-- TODO: describe field -->`).
+**Coverage**: 149/187 fields documented, 38 pending (`<!-- TODO: describe field -->`).
 
 ## Entity groups (by affinity group)
 

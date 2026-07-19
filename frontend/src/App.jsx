@@ -3,9 +3,8 @@ import SilverCoTTracker from "./silver_cot_tracker";
 import ComexInventoryDashboard from "./comex_inventory";
 import MoneySupply from "./money_supply";
 import CatcorPanel from "./catcor_panel";
-import DataPanel from "./data_panel";
+import DataPanel, { computeStatus } from "./data_panel";
 import ResearchPanel from "./research_panel";
-import { DATA_SOURCES } from "./data_map";
 
 const SECTIONS = [
   { key: "cot", label: "Trading" },
@@ -21,7 +20,12 @@ const HEALTH_POLL_INTERVAL_MS = 60000;
 // Small passive-visibility dot (Story #7) — red if any tracked source is
 // erroring, yellow if any is stale with no errors, green otherwise. Links
 // nowhere; the Data tab nav button is already one click away for the
-// per-source drill-down (Decision 4).
+// per-source drill-down (Decision 4). Shares data_panel.jsx's exported
+// computeStatus rather than re-implementing the same ok/stale/error rule
+// inline (a real duplication that existed before this fix) — its numeric
+// threshold (expected_interval_s) now ships directly on each /api/health/db
+// row (derived server-side from backend/sources.py's CadenceSpec), so this
+// component no longer needs a separate static import for that number at all.
 function HeaderHealthDot() {
   const [status, setStatus] = useState(null);
 
@@ -30,19 +34,12 @@ function HeaderHealthDot() {
       fetch("/api/health/db")
         .then((r) => r.json())
         .then((j) => {
-          const sources = j.sources ?? {};
+          const rows = Object.values(j.sources ?? {});
           let worst = "ok";
-          for (const source of DATA_SOURCES) {
-            for (const [sourceKey, meta] of Object.entries(source.healthMeta ?? {})) {
-              const row = sources[sourceKey];
-              if (!row) continue;
-              if (row.last_attempt_status === "error") {
-                worst = "error";
-              } else if (row.last_success_at) {
-                const ageS = (Date.now() - new Date(row.last_success_at).getTime()) / 1000;
-                if (ageS > 2 * meta.expectedIntervalS && worst !== "error") worst = "stale";
-              }
-            }
+          for (const row of rows) {
+            const rowStatus = computeStatus(row, row.expected_interval_s);
+            if (rowStatus === "error") worst = "error";
+            else if (rowStatus === "stale" && worst !== "error") worst = "stale";
           }
           setStatus(worst);
         })

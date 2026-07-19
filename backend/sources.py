@@ -171,3 +171,35 @@ def register(source: SourceDefinition) -> SourceDefinition:
 
 def sources_by_tier(tier: str) -> dict[str, SourceDefinition]:
     return {k: s for k, s in SOURCE_REGISTRY.items() if s.tier == tier}
+
+
+def serialize(source: SourceDefinition) -> dict:
+    """JSON-safe view of a SourceDefinition for GET /api/data-sources/db —
+    excludes fetch_fn/persisted_age_fn (not serializable, and not
+    something the frontend needs), converts timedelta fields to seconds."""
+    cadence = source.cadence
+    rate_limit = source.rate_limit
+    return {
+        "key": source.key,
+        "label": source.label,
+        "affinity_group": source.affinity_group,
+        "tables": source.tables,
+        "requires_env": source.requires_env,
+        "curl_example": source.curl_example,
+        "self_recording": source.self_recording,
+        "tier": source.tier,
+        "cadence": {
+            "trigger": cadence.trigger,
+            "interval_seconds": cadence.interval_seconds,
+            "min_gap_seconds": int(cadence.min_gap.total_seconds()) if cadence.min_gap else None,
+            "gate_on": cadence.gate_on,
+            "enabled_flag": cadence.enabled_flag,
+            "expected_interval_s": cadence.expected_interval_s,
+        },
+        "rate_limit": {
+            "kind": rate_limit.kind,
+            "quota_per_period": rate_limit.quota_per_period,
+            "min_gap_seconds": int(rate_limit.min_gap.total_seconds()) if rate_limit.min_gap else None,
+            "note": rate_limit.note,
+        },
+    }

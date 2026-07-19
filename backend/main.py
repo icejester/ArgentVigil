@@ -1762,6 +1762,18 @@ async def health_db():
     return {"success": True, "sources": rows}
 
 
+@app.get("/api/data-sources/db")
+async def data_sources_db():
+    """Thin serialization of sources.SOURCE_REGISTRY — affinity_group,
+    cadence, rate_limit, requires_env, curl_example for every registered
+    source. Read-only, no fetch triggered. Fetched once per Data-tab
+    mount (not polled like /api/health/db) to feed SourceCard's cadence/
+    rate-limit display and Story #6's per-source countdown; HeaderHealthDot
+    does not need this route — its numeric threshold (expected_interval_s)
+    already ships in /api/health/db's own enriched payload."""
+    return {"success": True, "sources": {k: sources.serialize(s) for k, s in sources.SOURCE_REGISTRY.items()}}
+
+
 @app.post("/api/health/refresh/{source_key}")
 async def health_refresh(source_key: str):
     source = sources.SOURCE_REGISTRY.get(source_key)

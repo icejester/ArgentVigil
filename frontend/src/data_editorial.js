@@ -1,20 +1,21 @@
-// Static map of every persisted table -> source -> cadence -> fields.
-// Hand-maintained (not introspected from SQLite) since provenance/cadence
-// is not something the DB schema itself encodes. Keep in sync with
-// backend/db.py's DDL and CLAUDE.md's Data flow section when either changes.
+// Editorial per-source documentation: provenance, curl examples, and
+// per-field descriptions. Hand-maintained (not introspected from SQLite)
+// since provenance/field-purpose is not something the DB schema itself
+// encodes. Split from the former data_map.js (datasources-spec.md Story
+// #1's operational/editorial split) -- operational metadata (cadence,
+// rate limits, expectedIntervalS) now lives backend-side in
+// backend/sources.py, served via GET /api/data-sources/db and the
+// enriched GET /api/health/db, not duplicated here. Keep this file's
+// prose in sync with backend/db.py's DDL when either changes; keep
+// `key`/`sourceKeys` in sync with backend/sources.py's registry keys
+// so DataPanel's editorial+operational join keeps working.
 
-export const DATA_SOURCES = [
+export const DATA_EDITORIAL = [
   {
     key: "cot",
     label: "CFTC CoT (Legacy)",
     origin: "CFTC PRE Socrata API — Legacy Futures-Only dataset (jun7-fc8e). CFTC publishes a new report every Friday, covering positions as of the prior Tuesday.",
-    cadenceFrequency: "Weekly",
-    cadenceMechanism: "pipeline/run.py — manual or cron only, plus an in-app 'Re-run now' button (rate-limited to once per 7 days, see the Fetch status row below)",
     sourceKeys: ["cot_pipeline"],
-    healthMeta: {
-      cot_pipeline: { expectedIntervalS: 604800, tier: "pipeline" }, // weekly — CFTC publishes a new report every Friday
-    },
-    rateLimit: "Socrata public API — no key required, but a full historical pull is slow; incremental since pipeline/fetch.py fetches only rows newer than the latest persisted report_date",
     curl: `curl -G "https://publicreporting.cftc.gov/resource/jun7-fc8e.json" \\
   -H "Accept: application/json" \\
   --data-urlencode "\\$where=cftc_contract_market_code='084691' AND report_date_as_yyyy_mm_dd >= '2011-07-07T00:00:00.000'" \\
@@ -61,12 +62,7 @@ export const DATA_SOURCES = [
     key: "cot_disaggregated",
     label: "CFTC CoT (Disaggregated)",
     origin: "CFTC PRE Socrata API — Disaggregated Futures-Only dataset (72hh-3qpy)",
-    cadence: "Weekly — fetched by pipeline/run.py alongside Legacy CoT",
     sourceKeys: ["cot_pipeline"],
-    healthMeta: {
-      cot_pipeline: { expectedIntervalS: 604800, tier: "pipeline" },
-    },
-    rateLimit: "Same Socrata API as Legacy CoT, different dataset ID",
     curl: `curl -G "https://publicreporting.cftc.gov/resource/72hh-3qpy.json" \\
   -H "Accept: application/json" \\
   --data-urlencode "\\$where=cftc_contract_market_code='084691' AND report_date_as_yyyy_mm_dd >= '2011-07-07T00:00:00.000'" \\
@@ -93,12 +89,7 @@ export const DATA_SOURCES = [
     key: "prices_weekly",
     label: "Yahoo Finance (weekly, CoT pipeline)",
     origin: "Yahoo Finance chart API — SI=F / GC=F, via pipeline/price_fetch.py (urllib, stdlib only)",
-    cadence: "Weekly, alongside CoT pipeline runs",
     sourceKeys: ["cot_pipeline"],
-    healthMeta: {
-      cot_pipeline: { expectedIntervalS: 604800, tier: "pipeline" },
-    },
-    rateLimit: "Unofficial/unauthenticated endpoint — no documented limit, keep call volume low",
     curl: `curl "https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1wk&range=8y" \\
   -H "User-Agent: Mozilla/5.0" -H "Accept: application/json"
 # gold: /v8/finance/chart/GC=F`,
@@ -118,15 +109,7 @@ export const DATA_SOURCES = [
     key: "metalcharts_silver",
     label: "metalcharts.org — Silver (COMEX)",
     origin: "metalcharts.org reverse-engineered API, authenticated via backend/mc_token.py",
-    cadence: "Slow tier (default OFF, runs once at startup) — see main.py lifespan",
     sourceKeys: ["comex_silver_history", "comex_silver_depositories", "silver_leverage", "delivery_notices"],
-    healthMeta: {
-      comex_silver_history: { expectedIntervalS: 1200, tier: "slow" },
-      comex_silver_depositories: { expectedIntervalS: 1200, tier: "slow" },
-      silver_leverage: { expectedIntervalS: 1200, tier: "slow" },
-      delivery_notices: { expectedIntervalS: 1200, tier: "slow" },
-    },
-    rateLimit: "Undocumented (reverse-engineered) — treat conservatively, this is why the tiered refresh defaults off",
     curl: `# 1. get a token (short-lived, must be fetched fresh)
 curl "https://metalcharts.org/api/security/token" \\
   -H "Referer: https://metalcharts.org/comex/silver" \\
@@ -191,14 +174,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "metalcharts_gold",
     label: "metalcharts.org — Gold (COMEX)",
     origin: "Same source as Silver, symbol=XAU / 100oz contracts",
-    cadence: "Slow tier, same as Silver",
     sourceKeys: ["comex_gold_history", "comex_gold_depositories", "gold_leverage"],
-    healthMeta: {
-      comex_gold_history: { expectedIntervalS: 1200, tier: "slow" },
-      comex_gold_depositories: { expectedIntervalS: 1200, tier: "slow" },
-      gold_leverage: { expectedIntervalS: 1200, tier: "slow" },
-    },
-    rateLimit: "Same as Silver",
     curl: `curl "https://metalcharts.org/api/comex/inventory?symbol=XAU&range=ALL" \\
   -H "x-mc-token: <token>" \\
   -H "Referer: https://metalcharts.org/comex/gold" \\
@@ -215,13 +191,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "shfe",
     label: "metalcharts.org — SHFE (Shanghai)",
     origin: "Same reverse-engineered metalcharts.org API",
-    cadence: "Slow tier",
     sourceKeys: ["shfe_silver_history", "shfe_warehouses"],
-    healthMeta: {
-      shfe_silver_history: { expectedIntervalS: 1200, tier: "slow" },
-      shfe_warehouses: { expectedIntervalS: 1200, tier: "slow" },
-    },
-    rateLimit: "Same as COMEX routes",
     curl: `curl "https://metalcharts.org/api/comex/inventory?symbol=AG&range=ALL" \\
   -H "x-mc-token: <token>" \\
   -H "Referer: https://metalcharts.org/comex/silver" \\
@@ -251,12 +221,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "pslv",
     label: "Sprott (PSLV)",
     origin: "Sprott direct API",
-    cadence: "Slow tier",
     sourceKeys: ["pslv"],
-    healthMeta: {
-      pslv: { expectedIntervalS: 1200, tier: "slow" },
-    },
-    rateLimit: "Undocumented — treat conservatively, same tiering as metalcharts.org routes",
     curl: `curl "https://sprott.com/api/FinancialData/v1/BullionCalculatorData" \\
   -H "Accept: application/json"`,
     tables: [
@@ -276,12 +241,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "spot_prices",
     label: "Spot prices (live quote)",
     origin: "main.py's own fetch (fast tier) — feeds Paper Leverage cards' spot badge and 6H–12M price chart",
-    cadence: "Fast tier (default ON, 60s) — the one genuinely intraday source",
     sourceKeys: ["spot_prices"],
-    healthMeta: {
-      spot_prices: { expectedIntervalS: 60, tier: "fast" },
-    },
-    rateLimit: "Whatever upstream main.py's spot-price fetch uses — kept on the fast tier deliberately since it's the one figure that's actually intraday-moving",
     curl: `curl "https://metalcharts.org/api/prices" \\
   -H "x-mc-token: <token>" \\
   -H "Referer: https://metalcharts.org/comex/silver" \\
@@ -314,12 +274,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "lbma_fix",
     label: "GoldAPI.io — LBMA fix",
     origin: "GoldAPI.io, free tier (500 req/month) — requires GAPI_API_KEY. Only the date-suffixed historical endpoint (/api/{SYMBOL}/USD/{YYYYMMDD}) returns exchange=\"LBMA\"; the bare current-price endpoint is a FOREXCOM spot feed, not LBMA, and is never used by this source.",
-    cadence: "Startup-only + manual force-refresh (Data tab's per-source button) — deliberately not on either tiered loop, since the fix only updates 1-2x/day and both existing tiers assume daily-or-faster cadence. See price-spec.md Section 2.",
     sourceKeys: ["lbma_fix"],
-    healthMeta: {
-      lbma_fix: { expectedIntervalS: 86400, tier: "on-demand" },
-    },
-    rateLimit: "500 requests/month free tier — 2 fetches/day (gold + silver) keeps this far under cap even fetched daily",
     curl: `curl "https://www.goldapi.io/api/XAU/USD/$(date +%Y%m%d)" \\
   -H "x-access-token: \${GAPI_API_KEY}"
 # silver: /api/XAG/USD/{YYYYMMDD}`,
@@ -341,13 +296,7 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "census_trade",
     label: "U.S. Census Bureau — International Trade",
     origin: "Census Bureau International Trade API, free/CC0, requires CENSUS_API_KEY (self-service signup, https://api.census.gov/data/key_signup.html). HS 7106 (silver, unwrought/semi-manufactured/powder, including silver plated with gold or platinum) and HS 7108 (gold, non-monetary only — excludes central-bank/reserve gold movements). Gold's presence here is comparison-only per CLAUDE.md's \"gold as context, not a tracked asset\" rule — no gold-specific signal or panel. No frontend panel yet for either metal (v1 is backend + DB + this Data tab entry only).",
-    cadenceFrequency: "Monthly",
-    cadenceMechanism: "On-demand, rate-limit gated (~25 days since the last fetch attempt, not since the data's own age — see note below) — startup-only plus manual force-refresh (Data tab's per-source button), same pattern as cot_pipeline/lbma_fix. Not on either tiered loop; both existing tiers assume daily-or-faster cadence.",
     sourceKeys: ["census_trade"],
-    healthMeta: {
-      census_trade: { expectedIntervalS: 2160000, tier: "monthly" }, // 25 days, matching the gate threshold
-    },
-    rateLimit: "Census's published API rate limit applies; a monthly-cadence fetch (~20 requests per run — 2 metals × 2 flows × 5 months checked per flow, since ~2 of those months return 204/unpublished) stays far under it even fetched daily",
     curl: `curl "https://api.census.gov/data/timeseries/intltrade/imports/hs?get=CTY_CODE,CTY_NAME,GEN_VAL_MO,CON_VAL_MO,GEN_QY1_MO,UNIT_QY1&I_COMMODITY=7106&time=2025-01&key=\${CENSUS_API_KEY}"
 # exports: /exports/hs?get=CTY_CODE,CTY_NAME,ALL_VAL_MO,QTY_1_MO,UNIT_QY1&E_COMMODITY=7106&time=2025-01&key=...`,
     tables: [
@@ -375,16 +324,10 @@ curl "https://metalcharts.org/api/comex/inventory?symbol=XAG&range=ALL" \\
     key: "fred",
     label: "FRED / ALFRED",
     origin: "FRED API (money supply) and ALFRED point-in-time vintage API (CATCOR actuals) — requires FRED_API_KEY",
-    cadence: "Money Supply: on-demand via /api/fred/money-supply/refresh. ALFRED: CATCOR's 30min consensus/actuals loop.",
     // Two source_keys with different cadences under one card — health.js
     // (health metadata) is keyed per source_key, not per card, since a
     // single expectedIntervalS/tier wouldn't fit both.
     sourceKeys: ["money_supply", "catcor_consensus_actuals"],
-    healthMeta: {
-      money_supply: { expectedIntervalS: 86400, tier: "on-demand" }, // no periodic loop; treat "healthy" window as a day so a quiet card doesn't read stale within hours
-      catcor_consensus_actuals: { expectedIntervalS: 1800, tier: "catcor-consensus" },
-    },
-    rateLimit: "Pre-authorized for reads per prior guidance — avoid hammering, but no explicit throttle needed",
     curl: `# FRED (Money Supply)
 curl "https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=\${FRED_API_KEY}&file_type=json&observation_start=2015-01-01"
 
@@ -460,12 +403,7 @@ curl "https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api
     key: "metals_prices_monthly",
     label: "Yahoo Finance (monthly, Money Supply)",
     origin: "Yahoo Finance chart API — SI=F/GC=F, httpx directly in main.py (separate from pipeline/price_fetch.py)",
-    cadence: "On-demand via /api/metals/prices/refresh",
     sourceKeys: ["metals_prices"],
-    healthMeta: {
-      metals_prices: { expectedIntervalS: 86400, tier: "on-demand" },
-    },
-    rateLimit: "Unofficial endpoint — same caution as the weekly CoT-pipeline fetch, different code path",
     curl: `curl "https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=5y" \\
   -H "User-Agent: Mozilla/5.0" -H "Accept: application/json"
 # gold: /v8/finance/chart/GC=F — resampled to one row per month-end server-side`,
@@ -477,8 +415,6 @@ curl "https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api
     key: "catcor_calendar",
     label: "CATCOR — event calendar (seed data)",
     origin: "seed_data/catcor_events_seed.py — manually maintained FOMC/CPI/NFP calendar, cross-checked against ALFRED + Fed meeting calendar",
-    cadence: "Re-seeded on every backend startup (idempotent — event_id is deterministic)",
-    rateLimit: "N/A — static local file, no upstream call",
     curl: `# no upstream call — loaded from seed_data/catcor_events_seed.py directly`,
     tables: [
       {
@@ -501,12 +437,7 @@ curl "https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api
     key: "catcor_forexfactory",
     label: "CATCOR — ForexFactory consensus",
     origin: "nfs.faireconomy.media's free 'this week' calendar export, no API key",
-    cadence: "At most once per calendar week (main.py's 30min consensus loop checks first, only fetches if that week isn't cached yet)",
     sourceKeys: ["catcor_consensus_actuals"],
-    healthMeta: {
-      catcor_consensus_actuals: { expectedIntervalS: 1800, tier: "catcor-consensus" },
-    },
-    rateLimit: "Confirmed live: repeat hits within the same week trip a 429, community reports of full IP lockout — never re-fetched within a week regardless of call frequency",
     curl: `curl "https://nfs.faireconomy.media/ff_calendar_thisweek.json" \\
   -H "User-Agent: Mozilla/5.0"
 # do not repeat within the same calendar week — see rate-limit note above`,
@@ -530,12 +461,7 @@ curl "https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api
     key: "catcor_reactions",
     label: "CATCOR — price reaction capture",
     origin: "Computed from spot_price_tick's XAG_FUTURES/XAU_FUTURES rows (Yahoo SI=F/GC=F futures bars — NOT the spot chart's XAG/XAU rows, a deliberately separate series_id family) / fred_observations (XAG_DAILY_CLOSE etc.) around each event's scheduled_time",
-    cadence: "Polled every 60s (main.py's _event_tier_loop, always-on — a missed window is permanent data loss)",
     sourceKeys: ["catcor_snapshot"],
-    healthMeta: {
-      catcor_snapshot: { expectedIntervalS: 60, tier: "catcor-event" },
-    },
-    rateLimit: "N/A — pure computation over already-persisted price data",
     curl: `# no upstream call — reads spot_price_tick / fred_observations already in SQLite.
 # The ticks themselves come from Yahoo's intraday backfill:
 curl "https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=5m&range=60d" \\
@@ -562,8 +488,6 @@ curl "https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=1
     key: "research",
     label: "CATCOR Research Pane",
     origin: "AV's own backend/catcor_research.py — not a third-party upstream. Each turn is one call to whichever model backend is selected for that turn (per-request, defaulting to AI_BACKEND's server-wide default).",
-    cadence: "On-demand only — one call per Send click in the Research tab, no background loop.",
-    rateLimit: "Whichever backend is chosen for a given turn: Anthropic Messages API (real cost/request) or amp-forge, a local Ollama-backed LAN service with no rate limit.",
     curl: `# Anthropic (backend: "anthropic" in the turn's request body)
 curl https://api.anthropic.com/v1/messages \\
   -H "x-api-key: \${ANTHROPIC_API_KEY}" \\
@@ -633,12 +557,7 @@ curl -X POST localhost:8000/api/catcor/research/sessions/<id>/messages \\
     key: "futures_curve_spread",
     label: "Yahoo Finance — futures curve spread",
     origin: "Yahoo Finance chart API (query1.finance.yahoo.com/v8/finance/chart), real deferred-month COMEX contract symbols (e.g. SIU26.CMX, GCZ26.CMX) — no key required. Front/next-month resolution is liquidity-ranked, not calendar-adjacency-ranked: a hand-maintained 'active delivery months' list was tried first and abandoned after confirming live (2026-07) that Yahoo happily returns a price for thin/illiquid months too (e.g. silver's textbook 'Jul' contract showed vol=5 against Sep's vol=14,445) — see squeeze-context-spec.md Story #1. Each slow-tier cycle probes 8 upcoming calendar-month symbols per metal and picks the top 2 by real reported volume as front/next.",
-    cadence: "Slow tier (default OFF, runs once at startup) — see main.py lifespan. Daily is sufficient; this is not intraday-moving the way spot price is.",
     sourceKeys: ["futures_curve_spread"],
-    healthMeta: {
-      futures_curve_spread: { expectedIntervalS: 1200, tier: "slow" },
-    },
-    rateLimit: "Unofficial/unauthenticated endpoint, no published quota or rate-limit response headers (confirmed live). ~8 requests/metal/day (16 total) riding the slow tier's own cycle spacing — a small fraction of what catcor.py's startup backfill already does safely in one burst against this same endpoint. Single retry with short backoff on 429/5xx, then skip-and-log without failing the rest of the slow tier.",
     curl: `curl "https://query1.finance.yahoo.com/v8/finance/chart/SIU26.CMX?interval=1d&range=370d" \\
   -H "User-Agent: Mozilla/5.0" -H "Accept: application/json"
 # candidate months are generated, not hardcoded — see main.py's _candidate_contract_symbols`,
@@ -663,7 +582,6 @@ curl -X POST localhost:8000/api/catcor/research/sessions/<id>/messages \\
     key: "squeeze_case_log",
     label: "Squeeze case log (hand-maintained)",
     origin: "Manual, hand-maintained — a small dedicated table of known historical squeeze/dislocation cases (e.g. 2011 silver, 2020 COVID gold liquidity crisis, January 2026 silver) for pattern reference. Not fetched from any upstream source. See squeeze-context-spec.md Story #3.",
-    cadence: "Manual only — rows inserted by hand/script, no periodic fetch, no tier, no Data tab 'Re-run now' button (nothing to re-run).",
     tables: [
       {
         name: "squeeze_case_log",
