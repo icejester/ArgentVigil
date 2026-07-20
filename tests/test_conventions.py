@@ -116,6 +116,28 @@ def test_frontend_only_fetches_db_routes_or_sanctioned_commands():
     )
 
 
+# --- Doc version binding: README.md tracks CLAUDE.md ----------------------
+
+# Both docs title themselves "# ArgentVigil vX.Y.Z" and are bumped
+# together on feature completion (Development Notes rule) — this guard
+# turns "they should match" into a suite failure when they drift.
+DOC_VERSION_RE = re.compile(r"^# ArgentVigil v(\d+\.\d+\.\d+)", re.MULTILINE)
+
+
+def _doc_version(filename: str) -> str:
+    m = DOC_VERSION_RE.search((REPO_ROOT / filename).read_text())
+    assert m, f"{filename} has no '# ArgentVigil vX.Y.Z' title line"
+    return m.group(1)
+
+
+def test_readme_version_matches_claude_md():
+    readme, claude = _doc_version("README.md"), _doc_version("CLAUDE.md")
+    assert readme == claude, (
+        f"README.md is v{readme} but CLAUDE.md is v{claude} — the two docs "
+        f"share one version number; bump both together on feature completion."
+    )
+
+
 # --- Registry invariants (backend/sources.py) ------------------------------
 
 

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Pre-commit: run the full test suite (~55 tests, <0.5s) — includes the
+# README.md <-> CLAUDE.md version-binding guard, so mismatched doc versions
+# can't be committed. Bypass deliberately with `git commit --no-verify`.
+#
+# Wired up via `git config core.hooksPath utils/githooks` (per-clone; see
+# README.md Housekeeping). Git already runs hooks from the repo root, but
+# resolve it explicitly so this also works under worktrees/submodule setups.
+repo_root="$(git rev-parse --show-toplevel)" || exit 1
+
+if [ ! -x "$repo_root/.venv/bin/python" ]; then
+    echo "pre-commit: .venv missing — run 'bash utils/vigil.sh start' once to bootstrap it." >&2
+    exit 1
+fi
+
+exec bash "$repo_root/utils/vigil.sh" test -q
