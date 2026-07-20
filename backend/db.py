@@ -261,6 +261,11 @@ CREATE TABLE IF NOT EXISTS source_health (
     consecutive_failures INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS interval_overrides (
+    source_key       TEXT PRIMARY KEY,
+    interval_seconds INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cot_disaggregated (
     report_date TEXT NOT NULL,
     metal TEXT NOT NULL,
@@ -1365,6 +1370,29 @@ def get_source_health(source_key: str) -> dict | None:
             "SELECT * FROM source_health WHERE source_key = ?", (source_key,)
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_interval_overrides() -> dict[str, int]:
+    """Full-table read, called once at boot to seed main.py's in-memory
+    _interval_overrides side-table — a deliberate per-source cadence
+    override should survive a backend restart, unlike the blanket
+    fast_interval_s/slow_interval_s tier settings, which are in-memory
+    only and reset on restart (a single admin toggling both tiers is a
+    cheap decision to redo; an admin who specifically slowed down one
+    noisy/rate-limited source made a more considered, source-specific
+    judgment that's more costly and more surprising to lose silently)."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT source_key, interval_seconds FROM interval_overrides").fetchall()
+        return {r["source_key"]: r["interval_seconds"] for r in rows}
+
+
+def set_interval_override(source_key: str, interval_seconds: int):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO interval_overrides (source_key, interval_seconds) VALUES (?, ?) "
+            "ON CONFLICT(source_key) DO UPDATE SET interval_seconds = excluded.interval_seconds",
+            (source_key, interval_seconds),
+        )
 
 
 def get_latest_cot_report_date() -> str | None:

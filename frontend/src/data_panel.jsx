@@ -132,6 +132,65 @@ function RateLimitDisplay({ rateLimit, healthRow }) {
   );
 }
 
+// Per-source configurable interval — one control per sourceKey, following
+// the same granularity SourceCard's cadence/rate-limit rows already use
+// (see the comment on SourceCard below: a card spanning multiple
+// sourceKeys, e.g. "metalcharts_silver"'s 4, needs independent controls
+// per key, never one shared control per card). Only rendered for
+// trigger === "interval" sources — matches the backend's 400 rejection
+// for always_on/manual_only sources (POST /api/data-sources/{key}/interval).
+function IntervalEditControl({ sourceKey, currentSeconds, onSaved }) {
+  const [value, setValue] = useState(String(currentSeconds ?? ""));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setValue(String(currentSeconds ?? ""));
+  }, [currentSeconds]);
+
+  const handleSave = () => {
+    const parsed = parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      setError("must be a positive number of seconds");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    fetch(`/api/data-sources/${sourceKey}/interval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ interval_seconds: parsed }),
+    })
+      .then((r) => r.json())
+      .then((j) => {
+        if (!j.success) {
+          setError(j.detail ?? "save failed");
+          return;
+        }
+        onSaved();
+      })
+      .catch(() => setError("save failed"))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <span className="data-interval-edit">
+      <input
+        type="number"
+        min="1"
+        className="data-interval-input"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        disabled={saving}
+      />
+      <button type="button" className="data-refresh-btn" onClick={handleSave} disabled={saving}>
+        {saving ? "Saving…" : "Set interval"}
+      </button>
+      {error && <span className="data-error-text">{error}</span>}
+    </span>
+  );
+}
+
 function SourceCard({ editorial, operationalBySourceKey, health, onRefreshed }) {
   // A card can span multiple sourceKeys (e.g. "metalcharts_silver" covers
   // 4 separate registry keys) — cadence/rate-limit are shown per sourceKey
@@ -163,6 +222,13 @@ function SourceCard({ editorial, operationalBySourceKey, health, onRefreshed }) 
                     {op ? `${op.cadence.trigger}${op.cadence.interval_seconds ? `, every ${op.cadence.interval_seconds}s` : ""}` : "unknown"}
                   </span>
                 </div>
+                {op?.cadence.trigger === "interval" && (
+                  <IntervalEditControl
+                    sourceKey={sourceKey}
+                    currentSeconds={op.cadence.interval_seconds}
+                    onSaved={onRefreshed}
+                  />
+                )}
               </div>
             );
           })}
@@ -296,16 +362,32 @@ export default function DataPanel() {
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
-    fetchHealth();
-    // Operational metadata (cadence/rate-limit/affinity_group) is fetched
-    // once per mount, not polled like health — it's derived from
-    // backend/sources.py's registry, which doesn't change at runtime.
+  const fetchOperational = useCallback(() => {
     fetch("/api/data-sources/db")
       .then((r) => r.json())
       .then((j) => setOperationalBySourceKey(j.sources ?? {}))
       .catch(() => {});
-  }, [fetchHealth]);
+  }, []);
+
+  // Combined refresh — passed to both FetchStatusRow's "Re-run now" (which
+  // only ever changes health) and the interval-edit control (which changes
+  // operational data too, since a saved override is reflected in
+  // GET /api/data-sources/db immediately). Re-fetching both on every
+  // refresh is simpler than tracking which one actually changed, and
+  // cheap — both routes are small, infrequent reads.
+  const refreshAll = useCallback(() => {
+    fetchHealth();
+    fetchOperational();
+  }, [fetchHealth, fetchOperational]);
+
+  useEffect(() => {
+    // Operational metadata (cadence/rate-limit/affinity_group) is fetched
+    // once per mount by default, not polled like health — it's derived
+    // from backend/sources.py's registry, which doesn't change at runtime
+    // except via an explicit interval-override save (handled by refreshAll).
+    fetchHealth();
+    fetchOperational();
+  }, [fetchHealth, fetchOperational]);
 
   return (
     <details className="collapsible-pane" open>
@@ -328,7 +410,7 @@ export default function DataPanel() {
             editorial={editorial}
             operationalBySourceKey={operationalBySourceKey}
             health={health}
-            onRefreshed={fetchHealth}
+            onRefreshed={refreshAll}
           />
         ))}
       </div>

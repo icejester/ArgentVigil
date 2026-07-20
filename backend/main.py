@@ -102,12 +102,22 @@ _refresh_tasks: list[asyncio.Task] = []
 # automatically (still reachable afterward only via
 # POST /api/health/refresh/{key}, same as any other manual_only source).
 _startup_fired: set[str] = set()
+# Per-source interval overrides — a mutable side-table _schedule_loop
+# consults BEFORE falling back to a SourceDefinition's own
+# cadence.interval_seconds, same pattern _refresh_settings already
+# establishes for the blanket fast/slow tier knobs (not a mutation of
+# CadenceSpec/SourceDefinition themselves, which stay genuinely frozen —
+# see backend/sources.py's own docstring on why that immutability is load
+# -bearing). Seeded from db.get_interval_overrides() in lifespan, kept in
+# sync with the DB by POST /api/data-sources/{key}/interval.
+_interval_overrides: dict[str, int] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client
     db.init_db()
+    _interval_overrides.update(db.get_interval_overrides())
     _client = httpx.AsyncClient()
     asyncio.create_task(_backfill_if_needed())
     asyncio.create_task(_refresh_fast_tier())
@@ -226,7 +236,9 @@ async def _schedule_loop():
     every second and, per source in sources.SOURCE_REGISTRY, fires
     fetch_fn when its CadenceSpec says it's due:
       - trigger == "always_on": fires every interval_seconds, unconditionally.
-      - trigger == "interval": fires every interval_seconds, but only if
+      - trigger == "interval": fires every interval_seconds (or
+        _interval_overrides[key] if a per-source override has been set —
+        see POST /api/data-sources/{key}/interval), but only if
         enabled_flag is None or _refresh_settings[enabled_flag] is true.
       - trigger == "manual_only": never ticked here on a recurring basis —
         reached only via POST /api/health/refresh/{key} — UNLESS
@@ -242,7 +254,7 @@ async def _schedule_loop():
     calls: _backfill_if_needed, _refresh_fast_tier, _refresh_slow_tier)."""
     start = datetime.now(timezone.utc)
     last_fired: dict[str, datetime] = {
-        key: (start - timedelta(seconds=(source.cadence.interval_seconds or 0) + 1))
+        key: (start - timedelta(seconds=_interval_overrides.get(key, source.cadence.interval_seconds) or 0) - timedelta(seconds=1))
         if source.cadence.fire_at_startup else start
         for key, source in sources.SOURCE_REGISTRY.items()
     }
@@ -259,7 +271,10 @@ async def _schedule_loop():
             if cadence.trigger == "interval" and cadence.enabled_flag is not None:
                 if not _refresh_settings.get(cadence.enabled_flag, False):
                     continue
-            interval = cadence.interval_seconds
+            # Interval overrides checked BEFORE the source's own registered
+            # default — see _interval_overrides' own module-level comment
+            # for why this is a side-table, not a CadenceSpec mutation.
+            interval = _interval_overrides.get(key, cadence.interval_seconds)
             if interval is None and not is_startup_only_fire:
                 continue
             if is_startup_only_fire:
@@ -1826,8 +1841,53 @@ async def data_sources_db():
     mount (not polled like /api/health/db) to feed SourceCard's cadence/
     rate-limit display and Story #6's per-source countdown; HeaderHealthDot
     does not need this route — its numeric threshold (expected_interval_s)
-    already ships in /api/health/db's own enriched payload."""
-    return {"success": True, "sources": {k: sources.serialize(s) for k, s in sources.SOURCE_REGISTRY.items()}}
+    already ships in /api/health/db's own enriched payload.
+
+    Overlays any live _interval_overrides value onto cadence.interval_seconds
+    (and re-derives expected_interval_s from it) before serializing, so a
+    per-source override is reflected here immediately — the frontend's
+    existing op.cadence.interval_seconds read picks it up for free, no
+    new response shape needed."""
+    result = {}
+    for k, s in sources.SOURCE_REGISTRY.items():
+        serialized = sources.serialize(s)
+        override = _interval_overrides.get(k)
+        if override is not None:
+            serialized["cadence"]["interval_seconds"] = override
+            serialized["cadence"]["expected_interval_s"] = override
+        result[k] = serialized
+    return {"success": True, "sources": result}
+
+
+@app.post("/api/data-sources/{source_key}/interval")
+async def set_source_interval(source_key: str, body: dict = Body(...)):
+    """Per-source cadence override (the next value-add after folding
+    startup sources into the scheduler — all 11 "slow tier" sources used
+    to share one _refresh_settings["slow_interval_s"] value, baked into
+    each SourceDefinition once at registry-build time; POST
+    /api/refresh/settings mutating that value afterward was already a
+    no-op for already-registered sources, a real pre-existing bug this
+    override mechanism fixes as a side effect, since _schedule_loop now
+    checks _interval_overrides before falling back to the baked-in
+    default either way). Only trigger="interval" sources are eligible —
+    rejects always_on (protects catcor_snapshot: a missed reaction-
+    capture window is permanent data loss, must never become skippable/
+    slowable by a stray override) and manual_only (overriding a cadence
+    that's never on a recurring timer in the first place is meaningless)."""
+    source = sources.SOURCE_REGISTRY.get(source_key)
+    if source is None:
+        raise HTTPException(404, f"Unknown source_key: {source_key}")
+    if source.cadence.trigger != "interval":
+        raise HTTPException(400, f"{source_key} is not an interval-triggered source — cannot override its cadence.")
+    try:
+        interval_seconds = int(body["interval_seconds"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "interval_seconds (integer, seconds) is required")
+    if interval_seconds < 1:
+        raise HTTPException(400, "interval_seconds must be positive")
+    _interval_overrides[source_key] = interval_seconds
+    db.set_interval_override(source_key, interval_seconds)
+    return {"success": True, "interval_seconds": interval_seconds}
 
 
 @app.post("/api/health/refresh/{source_key}")
