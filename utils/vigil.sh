@@ -4,6 +4,7 @@
 # processes, tracks them by PID file, and redirects logs to runtime/logs/.
 #
 # Usage: vigil.sh <start|stop|restart|status> [backend|frontend|all]
+#        vigil.sh test [pytest args...]
 #   component defaults to "all" if omitted.
 #
 # Examples:
@@ -11,6 +12,8 @@
 #   vigil.sh stop backend     # stop backend only
 #   vigil.sh restart          # restart both
 #   vigil.sh status           # show what's running
+#   vigil.sh test             # run the full test suite (see CLAUDE.md ## Tests)
+#   vigil.sh test -k leverage # pass-through pytest args (files, -k, -x, ...)
 
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -69,6 +72,23 @@ wait_for_backend() {
   log "backend ready."
 }
 
+# Creates .venv and installs requirements.txt if either is missing.
+# Probes for both a runtime dep (fastapi) and a test dep (pytest) so a venv
+# predating the requirements merge (when test tooling lived in a separate
+# requirements-dev.txt) gets topped up instead of silently lacking pytest.
+ensure_venv() {
+  if [ ! -f "$VENV/bin/activate" ]; then
+    log "creating .venv..."
+    python3 -m venv "$VENV"
+  fi
+  # shellcheck disable=SC1091
+  source "$VENV/bin/activate"
+  if ! python -c "import fastapi, pytest" 2>/dev/null; then
+    log "installing python dependencies..."
+    pip install -q -r "$REPO/requirements.txt"
+  fi
+}
+
 # ── start ────────────────────────────────────────────────────────────────────
 
 start_backend() {
@@ -77,16 +97,7 @@ start_backend() {
     return 0
   fi
 
-  if [ ! -f "$VENV/bin/activate" ]; then
-    log "creating .venv..."
-    python3 -m venv "$VENV"
-  fi
-  # shellcheck disable=SC1091
-  source "$VENV/bin/activate"
-  if ! python -c "import fastapi" 2>/dev/null; then
-    log "installing python dependencies..."
-    pip install -q -r "$REPO/requirements.txt"
-  fi
+  ensure_venv
 
   log "starting backend on :$BACKEND_PORT (log: $(log_file backend))"
   (
@@ -171,14 +182,40 @@ status_component() {
   fi
 }
 
+# ── test ─────────────────────────────────────────────────────────────────────
+
+# Runs the pytest suite (see CLAUDE.md's ## Tests) — no daemon involved, so
+# component words don't apply; extra args pass straight through to pytest.
+# "backend"/"all" are accepted as no-ops for start/stop muscle memory (the
+# whole suite is backend); "frontend" gets an honest notice instead of a
+# confusing pytest usage error.
+run_tests() {
+  case "${1:-}" in
+    backend|all) shift ;;
+    frontend)
+      log "no frontend tests exist (deliberate — see CLAUDE.md ## Tests); the suite is backend-only."
+      exit 0
+      ;;
+  esac
+  ensure_venv
+  cd "$REPO" && exec python -m pytest -q "$@"
+}
+
 # ── dispatch ─────────────────────────────────────────────────────────────────
 
 usage() {
   echo "Usage: $0 <start|stop|restart|status> [backend|frontend|all]"
+  echo "       $0 test [pytest args...]"
   exit 1
 }
 
 ACTION="${1:-}"
+
+if [ "$ACTION" = "test" ]; then
+  shift
+  run_tests "$@"
+fi
+
 COMPONENT="${2:-all}"
 
 case "$ACTION" in

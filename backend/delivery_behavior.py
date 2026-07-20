@@ -51,6 +51,7 @@ not meant as an exact trading-calendar reference.
 from datetime import date, timedelta
 
 from . import db
+from .units import SILVER_CONTRACT_OZ
 
 
 def _is_weekday(d: date) -> bool:
@@ -113,7 +114,6 @@ def days_to_fnd(report_date: date) -> int:
     return (fnd - report_date).days
 
 RECLASSIFICATION_SUPPORTED_METALS = {"XAG"}
-SILVER_CONTRACT_OZ = 5_000  # COMEX silver contract size, see CLAUDE.md's Units convention
 
 DISAGGREGATED_CATEGORIES = ("producer_merchant", "swap_dealer", "managed_money", "other_reportable")
 

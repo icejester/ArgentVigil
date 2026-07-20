@@ -2,3 +2,13 @@ fastapi
 uvicorn[standard]
 httpx
 python-dotenv
+
+# Test tooling (see CLAUDE.md's ## Tests) — deliberately in this one file,
+# not a separate requirements-dev.txt: nothing here deploys anywhere that
+# needs a runtime/dev split, and one file means vigil.sh's bootstrap
+# installs everything, so a fresh clone can run the suite immediately.
+# pipeline/ stays stdlib-only regardless (that rule is about pipeline's
+# own imports, not this list).
+pytest
+pytest-asyncio
+respx

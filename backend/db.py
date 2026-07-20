@@ -4,6 +4,8 @@ from bisect import bisect_right
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(_REPO_ROOT, "runtime", "argentvigil.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # sqlite3.connect does not create parent dirs
@@ -700,8 +702,8 @@ def get_leverage_history(metal: str) -> list[dict]:
     field); callers that want a same-week volume figure should look it up
     separately from volume_oi/gold_volume_oi (see get_latest_leverage)."""
     if metal == "XAG":
-        return _leverage_backfill_from_cot("cot_silver", "inventory_aggregate", 5000)
-    return _leverage_backfill_from_cot("cot_gold", "gold_inventory_aggregate", 100)
+        return _leverage_backfill_from_cot("cot_silver", "inventory_aggregate", SILVER_CONTRACT_OZ)
+    return _leverage_backfill_from_cot("cot_gold", "gold_inventory_aggregate", GOLD_CONTRACT_OZ)
 
 
 def get_latest_leverage(metal: str) -> dict | None:
