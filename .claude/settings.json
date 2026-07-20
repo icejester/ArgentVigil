@@ -5,22 +5,7 @@
       "Bash(bash utils/vigil.sh *)",
       "Bash(bash utils/vigil.sh)",
       "Bash(bash /Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh *)",
-      "Bash(bash /Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh)",
-      "Bash(curl -s http://localhost:8000*)",
-      "Bash(curl -s https://api.census.gov*)",
-      "Bash(sqlite3 /Users/jrmallas/.gitRepos/ArgentVigil/runtime/argentvigil.db *)",
-      "Bash(ps aux*)",
-      "Bash(npx vite *)",
-      "Bash(grep -n 'grep -n .type=\"mtd\"' /dev/null; grep -n 'type=\"mtd\"' /Users/jrmallas/.gitRepos/ArgentVigil/backend/main.py)",
-      "Read(//dev/**)",
-      "Bash(git commit -m ' *)",
-      "Bash(curl -s http://localhost:8000/api/health/db)",
-      "Bash(python3 -m json.tool)",
-      "Bash(python3 -c ' *)",
-      "Bash(curl -s -X POST http://localhost:8000/api/health/refresh/census_trade)",
-      "Bash(curl -s -X POST http://localhost:8000/api/health/refresh/cot_pipeline)",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" -X POST http://localhost:8000/api/health/refresh/nonexistent_key)",
-      "Bash(bash utils/vigil.sh restart)"
+      "Bash(bash /Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh)"
     ]
   }
 }
