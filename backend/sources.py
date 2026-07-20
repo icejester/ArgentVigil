@@ -8,6 +8,12 @@ that were never in any registry at all). backend/main.py's scheduler,
 the health routes, and the frontend Data tab (via GET /api/data-sources/db)
 all read from SOURCE_REGISTRY instead of parallel lists.
 
+Every source — including ones that used to be fired by hand-written
+asyncio.create_task(...) calls outside the scheduler entirely
+(money_supply, metals_prices, lbma_fix, census_trade, and CATCOR's own
+seed+backfill chain) — is now dispatched through the same generic
+scheduler via CadenceSpec.fire_at_startup, not a separate dispatch path.
+
 This module intentionally has no FastAPI/httpx-level knowledge of its
 own — it imports fetch functions from backend.main and backend.catcor and
 wraps them with scheduling/rate-limit metadata only. It is populated by
@@ -22,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable, Literal
 
-Trigger = Literal["startup", "interval", "manual_only", "always_on"]
+Trigger = Literal["interval", "manual_only", "always_on"]
 
 
 @dataclass(frozen=True)
@@ -41,13 +47,30 @@ class CadenceSpec:
         data — is structurally incapable of being paused by a future
         settings toggle or accidentally-added min_gap. Enforcement by
         construction, not by convention.
-      - "manual_only": never ticked by the scheduler; reachable only via
-        POST /api/health/refresh/{key}. min_gap/gate_on still apply there.
-      - "startup": fired once at boot from main.py's lifespan (not by the
-        generic scheduler — see main.py's _catcor_startup/_lbma_fix_startup/
-        _census_trade_startup, whose internal ordering is load-bearing and
-        deliberately not generalized in this pass). Also reachable via the
-        manual health-refresh route at any time.
+      - "manual_only": never ticked by the scheduler on a recurring basis;
+        reachable only via POST /api/health/refresh/{key}, plus once at
+        boot if fire_at_startup=True (below). min_gap/gate_on still apply
+        to both paths.
+
+    fire_at_startup: if True, the generic scheduler (main.py's
+    _schedule_loop) fires this source once, ~1s after boot, in addition to
+    whatever its trigger otherwise does. Orthogonal to trigger, not a
+    trigger value of its own — there used to be a fourth trigger value,
+    "startup", fired by hand-written asyncio.create_task(...) calls
+    outside the scheduler entirely (main.py's old _catcor_startup/
+    _lbma_fix_startup/_census_trade_startup). That was a real, separate
+    dispatch pattern coexisting alongside the generic one; fire_at_startup
+    collapses it into the same mechanism as everything else. A source that
+    wants "runs once at boot, never again automatically" is
+    trigger="manual_only", fire_at_startup=True (money_supply,
+    metals_prices, lbma_fix, census_trade); a source that wants "runs once
+    at boot, then repeats" is trigger="interval", fire_at_startup=True,
+    interval_seconds=<N> (catcor_startup, weekly). trigger="always_on" +
+    fire_at_startup=True is rejected by register() — always_on sources
+    already fire within ~1 tick of boot on their own interval; a second,
+    orthogonal "also fire at startup" flag on top of that guarantee would
+    only invite a future reader to wonder whether the two paths could ever
+    race or double-fire, for zero real benefit.
 
     min_gap + gate_on: a cooldown since either the last fetch ATTEMPT
     (source_health.last_attempt_at) or the last PERSISTED data's own age,
@@ -57,10 +80,14 @@ class CadenceSpec:
     CoT gates on persisted report age (CFTC publishes within ~3 days of
     its as-of date, so report age closely tracks fetch recency there).
     persisted_age_fn is required when gate_on == "persisted_data_age".
+    Note fire_at_startup and min_gap already coexisted before this
+    generalization (census_trade had trigger="startup" AND a min_gap) —
+    proof this composition isn't new, just made explicit.
     """
 
     trigger: Trigger
     interval_seconds: int | None = None
+    fire_at_startup: bool = False
     min_gap: timedelta | None = None
     gate_on: Literal["last_attempt_at", "persisted_data_age"] = "last_attempt_at"
     persisted_age_fn: Callable[[], "date | None"] | None = None
@@ -69,9 +96,9 @@ class CadenceSpec:
     @property
     def expected_interval_s(self) -> int | None:
         """Derived staleness-threshold input for the Data tab — never
-        stored, always computed from this spec. None for triggers with no
-        meaningful cadence number (manual_only/startup with no min_gap) —
-        the health payload omits the field rather than fabricating one."""
+        stored, always computed from this spec. None for manual_only
+        sources with no min_gap — the health payload omits the field
+        rather than fabricating one."""
         if self.interval_seconds is not None:
             return self.interval_seconds
         if self.min_gap is not None:
@@ -150,8 +177,6 @@ class SourceDefinition:
             if self.cadence.enabled_flag == "slow_enabled":
                 return "slow"
             return "interval"
-        if self.cadence.trigger == "startup":
-            return "startup"
         return "on-demand"
 
 
@@ -165,6 +190,12 @@ def register(source: SourceDefinition) -> SourceDefinition:
     build-then-assign step."""
     if source.key in SOURCE_REGISTRY:
         raise ValueError(f"duplicate source_key: {source.key}")
+    if source.cadence.trigger == "always_on" and source.cadence.fire_at_startup:
+        raise ValueError(
+            f"{source.key}: trigger='always_on' sources already fire within ~1 tick of "
+            "boot on their own interval — fire_at_startup=True is redundant and not allowed, "
+            "to avoid inviting a future reader to wonder whether the two paths could race."
+        )
     SOURCE_REGISTRY[source.key] = source
     return source
 
@@ -191,6 +222,7 @@ def serialize(source: SourceDefinition) -> dict:
         "cadence": {
             "trigger": cadence.trigger,
             "interval_seconds": cadence.interval_seconds,
+            "fire_at_startup": cadence.fire_at_startup,
             "min_gap_seconds": int(cadence.min_gap.total_seconds()) if cadence.min_gap else None,
             "gate_on": cadence.gate_on,
             "enabled_flag": cadence.enabled_flag,

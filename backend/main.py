@@ -96,6 +96,12 @@ _refresh_settings = {
     "slow_enabled": False,
 }
 _refresh_tasks: list[asyncio.Task] = []
+# Tracks which trigger="manual_only", fire_at_startup=True sources have
+# already had their one automatic boot-time fire — _schedule_loop consults
+# this so a one-shot source fires exactly once at startup and never again
+# automatically (still reachable afterward only via
+# POST /api/health/refresh/{key}, same as any other manual_only source).
+_startup_fired: set[str] = set()
 
 
 @asynccontextmanager
@@ -106,9 +112,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_backfill_if_needed())
     asyncio.create_task(_refresh_fast_tier())
     asyncio.create_task(_refresh_slow_tier())
-    asyncio.create_task(_lbma_fix_startup())
-    asyncio.create_task(_census_trade_startup())
-    asyncio.create_task(_catcor_startup())
     _refresh_tasks.append(asyncio.create_task(_schedule_loop()))
     yield
     for t in _refresh_tasks:
@@ -116,31 +119,39 @@ async def lifespan(app: FastAPI):
     await _client.aclose()
 
 
-async def _lbma_fix_startup():
-    """LBMA fix updates 1-2x/day (per metal) — too slow for either tiered
-    loop, so per the price-spec decision this is startup-only plus manual
-    force-refresh via the Data tab's per-source button (lbma_fix's
-    CadenceSpec.trigger is "startup", not "interval"), not a third
-    recurring loop. Silently skips if GAPI_API_KEY isn't set, same as CATCOR's ALFRED calls
-    silently degrade without FRED_API_KEY — this is a nice-to-have layer,
-    not a hard requirement to boot the app."""
+async def _fetch_and_persist_lbma_fix_startup():
+    """lbma_fix's fetch_fn. LBMA fix updates 1-2x/day (per metal) — too
+    slow for either tiered loop, so this is fire_at_startup=True plus
+    manual force-refresh via the Data tab's per-source button, not a
+    recurring interval (lbma_fix's CadenceSpec.trigger is "manual_only").
+    Silently skips if GAPI_API_KEY isn't set, same as CATCOR's ALFRED
+    calls silently degrade without FRED_API_KEY — this is a nice-to-have
+    layer, not a hard requirement to boot the app. Does NOT call
+    db.record_fetch_attempt itself — self_recording is False on this
+    source, so _schedule_loop's own wrapper is the single recorder (the
+    old standalone _lbma_fix_startup recorded internally AND would have
+    been double-recorded by the generic wrapper if folded in naively)."""
     if "GAPI_API_KEY" not in os.environ:
         print("[lbma] GAPI_API_KEY not set — skipping LBMA fix fetch")
         return
-    try:
-        await _fetch_and_persist_lbma_fix()
-        db.record_fetch_attempt("lbma_fix", success=True)
-    except Exception as e:
-        print(f"[lbma] warning: {e}")
-        db.record_fetch_attempt("lbma_fix", success=False, error=str(e))
+    await _fetch_and_persist_lbma_fix()
 
 
 async def _catcor_startup():
-    """One-shot on every startup: reseed the event calendar, pull Yahoo
-    intraday ticks, and backfill any missing reactions. Cheap on repeat
-    runs — backfill_reactions/capture_snapshot are idempotent (skip
-    windows that already have a reaction row), so this is safe whether
-    the app was offline 14 minutes or 14 days."""
+    """catcor_startup's fetch_fn. One-shot on every startup (plus a
+    weekly re-fire, per its CadenceSpec) to reseed the event calendar,
+    pull Yahoo intraday ticks, and backfill any missing reactions. Cheap
+    on repeat runs — backfill_reactions/capture_snapshot are idempotent
+    (skip windows that already have a reaction row), so this is safe
+    whether the app was offline 14 minutes or 14 days. Internal per-step
+    try/except-and-continue (steps 2-6) / abort-on-step-1-failure
+    structure is unchanged from before this function became a registered
+    fetch_fn — every exception here is caught and printed, never
+    re-raised, so _schedule_loop's outer wrapper will record a coarse
+    "success" in source_health whenever step 1 doesn't throw, even if
+    steps 2-6 individually failed. Accepted tradeoff (confirmed) — the
+    individual step failures are still visible in stdout/logs, just not
+    reflected in source_health's per-source status."""
     try:
         n = catcor.seed_events()
         print(f"[catcor] seeded {n} events")
@@ -207,42 +218,57 @@ async def _catcor_consensus_tick():
 
 async def _schedule_loop():
     """Single generic scheduler replacing the old _fast_tier_loop /
-    _slow_tier_loop / _event_tier_loop / _consensus_tier_loop. Ticks every
-    second and, per source in sources.SOURCE_REGISTRY, fires fetch_fn when
-    its CadenceSpec says it's due:
+    _slow_tier_loop / _event_tier_loop / _consensus_tier_loop, AND
+    replacing the separate hand-written asyncio.create_task(...) calls
+    lifespan used to make for money_supply/metals_prices/lbma_fix/
+    census_trade/catcor_startup — every source, including former
+    "startup-only" ones, is now dispatched from this one loop. Ticks
+    every second and, per source in sources.SOURCE_REGISTRY, fires
+    fetch_fn when its CadenceSpec says it's due:
       - trigger == "always_on": fires every interval_seconds, unconditionally.
       - trigger == "interval": fires every interval_seconds, but only if
         enabled_flag is None or _refresh_settings[enabled_flag] is true.
-      - trigger in ("manual_only", "startup"): never ticked here — reached
-        only via POST /api/health/refresh/{key} (manual_only) or once at
-        boot from lifespan (startup; see _catcor_startup/_lbma_fix_startup/
-        _census_trade_startup, whose call ordering is load-bearing and is
-        deliberately not folded into this generic dispatch in this pass).
-    Seeds last_fired with the loop's own start time for every source, so
-    each source's first real fire waits a full interval rather than firing
-    immediately on the first tick — matching the old per-tier loops, which
-    all slept before their first fire, and avoiding a startup burst
-    stacked directly on top of lifespan's explicit one-shot startup calls
-    (_backfill_if_needed, _refresh_fast_tier, _refresh_slow_tier, etc)."""
+      - trigger == "manual_only": never ticked here on a recurring basis —
+        reached only via POST /api/health/refresh/{key} — UNLESS
+        fire_at_startup=True, in which case it fires exactly once,
+        ~1s after boot, tracked via _startup_fired so it's never
+        auto-fired again afterward.
+    A source with fire_at_startup=True (regardless of trigger) is seeded
+    into last_fired far enough in the past that it's immediately due on
+    the very first tick — every other source keeps the original "wait a
+    full interval before first fire" behavior (matching the old per-tier
+    loops, which all slept before their first fire, avoiding a startup
+    burst stacked directly on top of lifespan's own one-shot startup
+    calls: _backfill_if_needed, _refresh_fast_tier, _refresh_slow_tier)."""
     start = datetime.now(timezone.utc)
-    last_fired: dict[str, datetime] = {key: start for key in sources.SOURCE_REGISTRY}
+    last_fired: dict[str, datetime] = {
+        key: (start - timedelta(seconds=(source.cadence.interval_seconds or 0) + 1))
+        if source.cadence.fire_at_startup else start
+        for key, source in sources.SOURCE_REGISTRY.items()
+    }
     while True:
         await asyncio.sleep(1)
         now = datetime.now(timezone.utc)
         for key, source in sources.SOURCE_REGISTRY.items():
             cadence = source.cadence
-            if cadence.trigger not in ("always_on", "interval"):
+            is_startup_only_fire = cadence.trigger == "manual_only" and cadence.fire_at_startup
+            if cadence.trigger not in ("always_on", "interval") and not is_startup_only_fire:
+                continue
+            if is_startup_only_fire and key in _startup_fired:
                 continue
             if cadence.trigger == "interval" and cadence.enabled_flag is not None:
                 if not _refresh_settings.get(cadence.enabled_flag, False):
                     continue
             interval = cadence.interval_seconds
-            if interval is None:
+            if interval is None and not is_startup_only_fire:
                 continue
-            due_at = last_fired.get(key)
-            if due_at is not None and (now - due_at).total_seconds() < interval:
-                continue
-            last_fired[key] = now
+            if is_startup_only_fire:
+                _startup_fired.add(key)
+            else:
+                due_at = last_fired.get(key)
+                if due_at is not None and (now - due_at).total_seconds() < interval:
+                    continue
+                last_fired[key] = now
             try:
                 await source.fetch_fn()
                 if not source.self_recording:
@@ -1383,11 +1409,15 @@ async def _refresh_census_trade():
     db.record_fetch_attempt("census_trade", success=True)
 
 
-async def _census_trade_startup():
-    """Monthly, not daily — too slow for either tiered loop, so this is
-    startup-only (gated) plus manual force-refresh via the Data tab's
-    per-source button, same as LBMA. Silently skips if CENSUS_API_KEY isn't
-    set — a nice-to-have layer, not a hard boot requirement."""
+async def _fetch_and_persist_census_trade_startup():
+    """census_trade's fetch_fn. Monthly, not daily — too slow for either
+    tiered loop, so this is fire_at_startup=True (gated by _refresh_census_trade's
+    own min_gap) plus manual force-refresh via the Data tab's per-source
+    button, same as LBMA. Silently skips if CENSUS_API_KEY isn't set — a
+    nice-to-have layer, not a hard boot requirement. self_recording=True
+    on this source (unchanged) — _refresh_census_trade already records its
+    own skip/success internally, and the except clause below records
+    failure, so _schedule_loop's outer wrapper must not double-record."""
     if "CENSUS_API_KEY" not in os.environ:
         print("[census_trade] CENSUS_API_KEY not set — skipping Census trade fetch")
         return
@@ -1671,18 +1701,27 @@ for _key, (_fn, _tables, _note) in _SLOW_TIER_FETCH_FNS.items():
     ))
 del _key, _fn, _tables, _note
 
+# money_supply/metals_prices: previously registered trigger="startup" but,
+# before this pass, nothing in lifespan actually called them at boot — a
+# real, confirmed-live bug (only lbma_fix/census_trade had real
+# _xxx_startup() wrapper functions wired in; these two were reachable only
+# via their own GET routes or manual health-refresh). fire_at_startup=True
+# here is the actual fix — they now genuinely fetch once at every backend
+# restart, matching their intended label, at the cost of new load on
+# FRED/Yahoo Finance per restart (confirmed acceptable — restarts are
+# infrequent for a single-process local app).
 sources.register(SourceDefinition(
     key="money_supply", label="FRED — Money Supply (M2, WALCL, Composition)",
     affinity_group="gov_regulatory", fetch_fn=fred_money_supply_refresh,
     tables=["fred_observations"], requires_env=["FRED_API_KEY"],
-    cadence=CadenceSpec(trigger="startup"),
+    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern."),
 ))
 sources.register(SourceDefinition(
     key="metals_prices", label="Yahoo Finance — Monthly Metal Closes",
     affinity_group="exchange_market", fetch_fn=metals_prices_refresh,
     tables=["fred_observations"],
-    cadence=CadenceSpec(trigger="startup"),
+    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="undocumented", note="No published quota; conservative-by-design per CLAUDE.md's Yahoo Finance dev note."),
 ))
 # cot_pipeline gates on PERSISTED DATA age (CFTC publishes within ~3 days
@@ -1706,9 +1745,9 @@ sources.register(SourceDefinition(
 ))
 sources.register(SourceDefinition(
     key="lbma_fix", label="GoldAPI.io — LBMA Fix",
-    affinity_group="exchange_market", fetch_fn=_fetch_and_persist_lbma_fix,
+    affinity_group="exchange_market", fetch_fn=_fetch_and_persist_lbma_fix_startup,
     tables=["lbma_fix"], requires_env=["GAPI_API_KEY"],
-    cadence=CadenceSpec(trigger="startup"),
+    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="numeric_quota", quota_per_period="500/month"),
 ))
 # census_trade gates on LAST ATTEMPT time (Census's ~2-month publication
@@ -1719,11 +1758,28 @@ sources.register(SourceDefinition(
 # overwrite with a blanket "success".
 sources.register(SourceDefinition(
     key="census_trade", label="U.S. Census Bureau — International Trade",
-    affinity_group="gov_regulatory", fetch_fn=_refresh_census_trade,
+    affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_census_trade_startup,
     tables=["census_trade"], requires_env=["CENSUS_API_KEY"],
-    cadence=CadenceSpec(trigger="startup", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
+    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True, min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
     rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), note="Census releases monthly, ~2-month publication lag."),
     self_recording=True,
+))
+# catcor_startup: previously fired by a hand-written asyncio.create_task(...)
+# call in lifespan, outside the scheduler entirely — a real, separate
+# dispatch pattern this registration collapses into the same mechanism as
+# every other source. fire_at_startup=True gives it today's original
+# "runs once at boot" behavior; trigger="interval" + interval_seconds=604800
+# (weekly, confirmed) adds real periodic re-runs on top, which it never had
+# before. _catcor_startup's internal 6-step chain (each step independently
+# try/excepted except step 1, which aborts the rest) is unchanged — see
+# that function's own docstring for what this trades away in source_health
+# fidelity (coarse success/fail, not per-step).
+sources.register(SourceDefinition(
+    key="catcor_startup", label="CATCOR — Seed + Backfill Chain",
+    affinity_group="calendar_events", fetch_fn=_catcor_startup,
+    tables=["event_calendar", "fred_observations", "forexfactory_calendar", "macro_price_reaction"],
+    cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Composite of Yahoo/ForexFactory/ALFRED calls — see catcor_consensus_actuals and each metal's own price-history source for their individual rate-limit notes."),
 ))
 # CATCOR's two recurring loops were never in any registry before this
 # pass — folding them in per datasources-spec.md Story #3's explicit
@@ -1950,6 +2006,18 @@ async def catcor_reactions_db():
 
 @app.post("/api/catcor/refresh")
 async def catcor_refresh():
+    """Deliberately NOT a call to sources.SOURCE_REGISTRY["catcor_startup"].fetch_fn()
+    (i.e. _catcor_startup) — the two have genuinely incompatible contracts,
+    not incidental duplication. _catcor_startup is best-effort (every step
+    after the first independently try/excepted, never raises past its own
+    boundary, returns nothing) since it's meant to run unattended on a
+    schedule; this route is the frontend's manual "force CATCOR refresh"
+    action and needs fail-fast semantics (abort + surface the real error
+    on first failure) plus a real {seeded, consensus, actuals} return
+    payload for its caller to display. The 6 underlying catcor.* calls
+    are intentionally the same sequence as catcor_startup's — that's not
+    accidental drift, it's the same real steps captured by both a
+    best-effort scheduled path and a fail-fast manual path."""
     if "FRED_API_KEY" not in os.environ:
         raise HTTPException(500, "FRED_API_KEY environment variable is not set")
     try:
