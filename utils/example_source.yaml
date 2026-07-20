@@ -1,0 +1,25 @@
+# Worked example for utils/gen_source_scaffold.py — a hypothetical daily
+# widget-count API, api-key-authed, no documented rate limit. This is the
+# SERIALIZED OUTPUT of a conversation reasoning through a real source's
+# shape (per datasources-spec.md Story #4), not a template to copy
+# blindly — every real onboarding should replace every value here.
+
+key: example_widgets
+label: "Example Widget API — Daily Counts"
+affinity_group: exchange_market
+base_url: "https://api.example.com/v1/widgets"
+auth:
+  type: api_key
+  header: "x-api-key"
+  env_var: EXAMPLE_WIDGETS_API_KEY
+cadence:
+  trigger: interval
+  interval_seconds: 86400
+  enabled_flag: slow_enabled
+rate_limit:
+  kind: undocumented
+  note: "No published quota — treat conservatively, same posture as metalcharts.org"
+fields:
+  - { name: date, type: TEXT, pk: true }
+  - { name: widget_count, type: REAL }
+  - { name: fetched_at, type: TEXT }

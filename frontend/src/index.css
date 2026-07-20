@@ -528,6 +528,12 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .data-refresh-btn:hover:not(:disabled) { border-color: #7b9fff; }
 .data-refresh-btn:disabled { opacity: 0.5; cursor: default; }
+.data-interval-edit { display: inline-flex; align-items: center; gap: 6px; margin-left: 10px; }
+.data-interval-input {
+  width: 72px; background: #0f1117; border: 1px solid #2e3547; border-radius: 4px;
+  padding: 3px 6px; font-size: 11px; color: #c8d0de;
+}
+.data-interval-input:disabled { opacity: 0.5; }
 
 /* Data Health — status dots (ok/stale/error), Fetch status rows, header
    badge, tiered-loop summary. Same dark palette as the rest of the app;
