@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { nearestRowDate } from "./date_utils";
 import {
   ComposedChart,
   Area,
@@ -375,26 +376,6 @@ function findNearestCompositionRow(rows, hoveredDate, groupKey) {
     if (requiredKeys.every((k) => row[k] != null)) return row;
   }
   return null;
-}
-
-// Cross-chart pin support: M2/WALCL, Composition, and the metals chart each
-// have their own date grid (monthly-anchored, weekly-anchored, monthly-
-// resampled) that rarely share exact date strings — Recharts' category-axis
-// ReferenceLine only renders when its x= value exists verbatim in that
-// chart's own dataset, so a pin set by clicking one chart would silently
-// fail to appear on the others without this. Finds the nearest real row
-// date on/before pinnedDate, falling back to the nearest row after it if
-// pinnedDate is earlier than every row (e.g. a chart whose data starts
-// later than the pinned chart's), so every chart shows the pin at the
-// closest date it actually has, rather than not at all.
-function nearestRowDate(rows, pinnedDate) {
-  if (!rows || rows.length === 0 || !pinnedDate) return null;
-  let best = null;
-  for (const row of rows) {
-    if (row.date <= pinnedDate) best = row.date;
-  }
-  if (best != null) return best;
-  return rows[0]?.date ?? null;
 }
 
 // XAG/XAU are month-end resampled (last trading day of the month), while

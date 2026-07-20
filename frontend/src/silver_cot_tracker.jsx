@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { nearestRowDate } from "./date_utils";
 import {
   LineChart,
   Line,
@@ -72,24 +73,6 @@ function windowStatsAsOf(series, pinnedDate) {
   const windows = { "2yr": stats(WINDOW_2YR), "5yr": stats(WINDOW_5YR) };
   windows.disagree = windows["2yr"].classification !== windows["5yr"].classification;
   return { latest: asOf, windows };
-}
-
-// Same helper as money_supply.jsx's own nearestRowDate — Recharts'
-// category-axis ReferenceLine only renders when its x= value exists
-// verbatim in that chart's own dataset, so a pin set by clicking one
-// chart would silently fail to appear on the others (different date
-// grids — CoT weekly vs. curve spread daily vs. volume's sparse ~11-day
-// set) without this. Finds the nearest real row date on/before
-// pinnedDate, falling back to the nearest row after it if pinnedDate
-// predates every row in that particular chart's own data.
-function nearestRowDate(rows, pinnedDate) {
-  if (!rows || rows.length === 0 || !pinnedDate) return null;
-  let best = null;
-  for (const row of rows) {
-    if (row.date <= pinnedDate) best = row.date;
-  }
-  if (best != null) return best;
-  return rows[0]?.date ?? null;
 }
 
 const WEEKDAY_NAMES = [

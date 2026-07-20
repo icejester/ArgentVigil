@@ -20,6 +20,7 @@ from . import delivery_behavior
 from . import sources
 from .mc_token import authed_headers
 from .sources import CadenceSpec, RateLimitSpec, SourceDefinition
+from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ, TROY_OZ_PER_KG
 from pipeline import run as pipeline_run
 from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
@@ -486,7 +487,7 @@ async def _fetch_and_persist_silver_leverage() -> dict:
     # equivalent — it's no longer persisted. Leverage math everywhere
     # else (the /db routes, the history chart) is CFTC-only now; see
     # db._leverage_backfill_from_cot's docstring for the full reasoning.
-    oi_oz = oi * 5000 if oi else None
+    oi_oz = oi * SILVER_CONTRACT_OZ if oi else None
     paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
     enriched = {**row, "paper_leverage": paper_leverage}
     if vol:
@@ -506,7 +507,7 @@ async def silver_db_leverage():
         return {"success": True, "data": []}
     enriched = {
         "date": row["date"],
-        "openInterest": row["open_interest"] / 5000 if row["open_interest"] else None,
+        "openInterest": row["open_interest"] / SILVER_CONTRACT_OZ if row["open_interest"] else None,
         "volume": row["volume"],
         "paper_leverage": row["paper_leverage"],
     }
@@ -521,7 +522,7 @@ async def silver_db_leverage_history():
         "data": [
             {
                 "date": r["date"],
-                "openInterest": r["open_interest"] / 5000 if r["open_interest"] else None,
+                "openInterest": r["open_interest"] / SILVER_CONTRACT_OZ if r["open_interest"] else None,
                 "volume": r["volume"],
                 "paper_leverage": r["paper_leverage"],
             }
@@ -600,7 +601,7 @@ async def _fetch_and_persist_gold_leverage() -> dict:
     # _fetch_and_persist_silver_leverage's comment for the full reasoning
     # (CFTC-only leverage math now, metalcharts.org's OI confirmed ~15%
     # off from CFTC's real open_interest_all on every date checked).
-    oi_oz = oi * 100 if oi else None
+    oi_oz = oi * GOLD_CONTRACT_OZ if oi else None
     paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
     enriched = {**row, "paper_leverage": paper_leverage}
     if vol:
@@ -620,7 +621,7 @@ async def gold_db_leverage():
         return {"success": True, "data": []}
     enriched = {
         "date": row["date"],
-        "openInterest": row["open_interest"] / 100 if row["open_interest"] else None,
+        "openInterest": row["open_interest"] / GOLD_CONTRACT_OZ if row["open_interest"] else None,
         "volume": row["volume"],
         "paper_leverage": row["paper_leverage"],
     }
@@ -635,7 +636,7 @@ async def gold_db_leverage_history():
         "data": [
             {
                 "date": r["date"],
-                "openInterest": r["open_interest"] / 100 if r["open_interest"] else None,
+                "openInterest": r["open_interest"] / GOLD_CONTRACT_OZ if r["open_interest"] else None,
                 "volume": r["volume"],
                 "paper_leverage": r["paper_leverage"],
             }
@@ -694,8 +695,8 @@ async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
         rows.append({
             "date": row["date"],
             "total_kg": kg,
-            # SHFE silver is in kg; convert to troy oz (1 kg = 32.1507 troy oz)
-            "total_oz": round(kg * 32.1507, 0) if kg else None,
+            # SHFE silver is in kg; convert to troy oz
+            "total_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
         })
     db.upsert_shfe_rows(rows)
     return rows
@@ -726,8 +727,8 @@ async def _fetch_and_persist_shfe_warehouses() -> list[dict]:
         chg_kg = r.get("warrantChange", 0)
         enriched.append({
             **r,
-            "warrant_oz": round(kg * 32.1507, 0) if kg else None,
-            "warrant_change_oz": round(chg_kg * 32.1507, 0) if chg_kg else None,
+            "warrant_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+            "warrant_change_oz": round(chg_kg * TROY_OZ_PER_KG, 0) if chg_kg else None,
         })
         persisted.append({
             "date": r.get("date", today),
@@ -745,8 +746,8 @@ async def shfe_db_warehouses():
     enriched = [
         {
             **r,
-            "warrant_oz": round(r["warrant_kg"] * 32.1507, 0) if r["warrant_kg"] else None,
-            "warrant_change_oz": round(r["warrant_change_kg"] * 32.1507, 0) if r["warrant_change_kg"] else None,
+            "warrant_oz": round(r["warrant_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_kg"] else None,
+            "warrant_change_oz": round(r["warrant_change_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_change_kg"] else None,
         }
         for r in rows
     ]
