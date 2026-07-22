@@ -19,16 +19,29 @@ from . import db
 from . import delivery_behavior
 from . import sources
 from .mc_token import authed_headers
+from .price_instruments import (
+    FUTURES_FRONT_BY_METAL,
+    LBMA_BY_METAL,
+    LBMA_SESSION_BY_METAL,
+    XAG_SPOT,
+    XAU_SPOT,
+    YAHOO_DAILY_CLOSE_BY_METAL,
+)
 from .sources import CadenceSpec, RateLimitSpec, SourceDefinition
 from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ, TROY_OZ_PER_KG
+from .yahoo_prices import bars_to_daily_dict, bars_to_daily_rows, fetch_yahoo_bars
 from pipeline import run as pipeline_run
 from pipeline.compute import compute_from_series, compute_signal_track_record
 from pipeline.config import (
     FRED_FETCH_YEARS,
     FRED_M2_YOY_LOOKBACK,
     FRED_SERIES_CPI,
+    FRED_SERIES_DFII10,
+    FRED_SERIES_DGS2,
+    FRED_SERIES_DGS10,
     FRED_SERIES_M2,
     FRED_SERIES_RRPONTSYD,
+    FRED_SERIES_T10Y2Y,
     FRED_SERIES_WALCL,
     FRED_SERIES_WLCFLPCL,
     FRED_SERIES_WRESBAL,
@@ -36,9 +49,7 @@ from pipeline.config import (
     FRED_SERIES_WSHOTSL,
     FRED_WALCL_YOY_LOOKBACK,
     METAL_PRICE_FETCH_YEARS,
-    XAG_SERIES_ID,
     XAG_TICKER,
-    XAU_SERIES_ID,
     XAU_TICKER,
 )
 
@@ -73,7 +84,7 @@ CENSUS_TRADE_FLOWS = {
     },
 }
 CENSUS_TRADE_MONTHS_PER_FETCH = 3  # cheap self-heal against late revisions between gate-interval runs
-METAL_PRICE_TICKERS = {XAG_SERIES_ID: XAG_TICKER, XAU_SERIES_ID: XAU_TICKER}
+METAL_PRICE_TICKERS = {"XAG": XAG_TICKER, "XAU": XAU_TICKER}
 
 # Recoverable stock = Investment (coins/bars) + ETF/Exchange Vaults + Central
 # Bank reserves only. Excludes industrial (unrecoverable) and jewelry/silverware
@@ -171,14 +182,31 @@ async def _catcor_startup():
         return
 
     try:
+        # Live CPI/NFP release dates from ALFRED, replacing what used to be
+        # a hand-maintained, easily-stale CPI_RELEASES/NFP_RELEASES list in
+        # catcor_events_seed.py. Its own try/except (not folded into step
+        # 1's abort-on-failure) since it needs FRED_API_KEY and the static
+        # FOMC seed above does not — a missing key here shouldn't stop FOMC
+        # from being seeded.
+        n_alfred = await catcor.seed_events_from_alfred(_client)
+        print(f"[catcor] seeded {n_alfred} events from ALFRED release dates")
+    except Exception as e:
+        print(f"[catcor] warning: seed_events_from_alfred failed: {e}")
+
+    try:
         await catcor.backfill_intraday_ticks(_client)
     except Exception as e:
         print(f"[catcor] warning: backfill_intraday_ticks failed: {e}")
 
     try:
-        await catcor.backfill_daily_closes(_client)
+        # CATCOR's own daily-close fallback used to be a dedicated
+        # backfill_daily_closes() pull; now shares
+        # _fetch_and_persist_yahoo_daily_close with Money Supply and the
+        # leverage panel's price chart (price-architecture-spec.md's Fetch
+        # consolidation) — one real daily-close series, not three.
+        await _fetch_and_persist_yahoo_daily_close()
     except Exception as e:
-        print(f"[catcor] warning: backfill_daily_closes failed: {e}")
+        print(f"[catcor] warning: _fetch_and_persist_yahoo_daily_close failed: {e}")
 
     try:
         # Fetch consensus first: fetch_and_persist_actuals computes
@@ -904,25 +932,20 @@ async def _fetch_and_persist_prices() -> dict:
     if isinstance(data, dict) and data.get("isStale") and date.today().weekday() >= 5:
         return data
     payload = data.get("data", data) if isinstance(data, dict) else {}
-    today = str(date.today())
+    now_iso = datetime.now(timezone.utc).isoformat()
     rows = []
-    for series_id in ("XAG", "XAU"):
+    for series_id, instrument in (("XAG", XAG_SPOT), ("XAU", XAU_SPOT)):
         entry = payload.get(series_id) if isinstance(payload, dict) else None
         price, pct = _spot_entry_fields(entry)
         if price is not None:
             rows.append({
-                "series_id": series_id,
-                "date": today,
+                "instrument": instrument,
+                "ts": now_iso,
                 "price": price,
                 "change_pct_24h": pct,
             })
     if rows:
-        db.upsert_spot_price_rows(rows)
-        now_iso = datetime.now(timezone.utc).isoformat()
-        db.append_price_tick([
-            {"series_id": r["series_id"], "ts": now_iso, "price": r["price"]}
-            for r in rows
-        ])
+        db.append_spot_price_ticks(rows)
     return data
 
 
@@ -1008,14 +1031,14 @@ async def prices_db():
 @app.get("/api/prices/db/ticks")
 async def prices_db_ticks(series_id: str = Query("XAG"), hours: int = Query(24)):
     """Price history for the leverage panel's price chart, spanning
-    windows from 6H to 12M. Stitches three resolutions (see
-    db.get_price_history): real 60s spot_price_tick ticks where they exist
-    (only from whenever the fast-tier refresh loop started running),
-    CATCOR's daily closes further back (~120 days), and Money Supply's
-    month-end closes beyond that (back to 2006) — so long windows show real,
-    if coarser, history instead of a gap before the tick table existed."""
+    windows from 6H to 12M. Stitches two resolutions (see
+    db.get_price_backfill): real 60s spot_price ticks where they exist
+    (only from whenever the fast-tier refresh loop started running), then
+    settlement_price's real Yahoo daily closes further back — so long
+    windows show real, if coarser, history instead of a gap before the
+    tick table existed."""
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    rows = db.get_price_history(series_id, since)
+    rows = db.get_price_backfill(series_id, since)
     return {"success": True, "data": rows}
 
 
@@ -1031,8 +1054,9 @@ GOLDAPI_BASE = "https://www.goldapi.io/api"
 # is for," not a trustworthy per-metal fix-moment timestamp. GoldAPI.io
 # also exposes only one price/day for gold — no distinct AM vs PM fix
 # field — so gold's PM fix is not available from this source; gold is
-# persisted as fix_type="AM" (best-effort) and silver as fix_type="daily".
-_LBMA_METAL_SYMBOLS = {"XAU": "AM", "XAG": "daily"}
+# persisted under session="AM" (best-effort) and silver under
+# session="daily" (see price_instruments.LBMA_SESSION_BY_METAL).
+_LBMA_METAL_SYMBOLS = ("XAU", "XAG")
 
 
 async def _fetch_goldapi_fix(symbol: str, api_key: str, for_date: date) -> dict:
@@ -1051,7 +1075,7 @@ async def _fetch_and_persist_lbma_fix() -> dict:
     api_key = os.environ["GAPI_API_KEY"]
     today = date.today()
     results = {}
-    for symbol, fix_type in _LBMA_METAL_SYMBOLS.items():
+    for symbol in _LBMA_METAL_SYMBOLS:
         # GoldAPI.io's historical endpoint confirmed live to have no data
         # for "today" until some lag later in the day (returns
         # {"error": "No data available..."} — no "price" key at all, not
@@ -1088,26 +1112,25 @@ async def _fetch_and_persist_lbma_fix() -> dict:
             payload = await _fetch_goldapi_fix(symbol, api_key, fetched_date)
         price = payload.get("price")
         if price is not None:
-            db.upsert_lbma_fix_row({
-                "metal": symbol,
-                "fix_type": fix_type,
+            db.upsert_settlement_price_rows(LBMA_BY_METAL[symbol], [{
                 "date": str(fetched_date),
-                "price_usd": price,
-            })
+                "session": LBMA_SESSION_BY_METAL[symbol],
+                "price": price,
+            }])
         results[symbol] = payload
     return results
 
 
 @app.get("/api/lbma/db")
 async def lbma_db(metal: str = Query("XAU")):
-    rows = db.get_latest_lbma_fix(metal)
+    rows = db.get_latest_settlement_price(LBMA_BY_METAL[metal])
     return {"success": True, "data": rows}
 
 
 @app.get("/api/lbma/db/history")
 async def lbma_db_history(metal: str = Query("XAU"), fix_type: str = Query(None)):
-    resolved_fix_type = fix_type or _LBMA_METAL_SYMBOLS.get(metal, "daily")
-    rows = db.get_lbma_fix_series(metal, resolved_fix_type)
+    resolved_session = fix_type or LBMA_SESSION_BY_METAL.get(metal, "daily")
+    rows = db.get_settlement_price_series(LBMA_BY_METAL[metal], session=resolved_session)
     return {"success": True, "data": rows}
 
 
@@ -1174,49 +1197,12 @@ def _delivery_sort_key(symbol: str) -> tuple[int, int]:
 
 async def _fetch_yahoo_contract_daily(ticker: str, days: int) -> dict[str, tuple[float, float]]:
     """Daily (close, volume) pairs keyed by YYYY-MM-DD for a single futures
-    contract symbol, sourced from the response's own per-bar arrays (NOT
-    meta.regularMarketVolume, which is only today's snapshot) — real daily
-    volume is what makes per-historical-date liquidity ranking possible, see
-    module note above. Single retry with short backoff on 429/5xx, then
-    raises — see squeeze-context-spec.md's rate-limit investigation: this
-    endpoint has no published quota or rate-limit response headers
-    (confirmed live), but has been hit repeatedly elsewhere in this
-    codebase (catcor.py's startup backfill, Money Supply's on-demand
-    refresh) with no documented 429, unlike ForexFactory's confirmed one —
-    a single retry is a defensive margin, not evidence of a known problem.
-    A 404 (contract symbol not yet listed / already delisted) is treated as
-    "no data" rather than retried, since a retry can't fix a symbol that
-    doesn't exist."""
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            resp = await _client.get(
-                f"{YAHOO_CHART_BASE}/{ticker}",
-                params={"interval": "1d", "range": f"{days}d"},
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-                timeout=30,
-            )
-            if resp.status_code == 404:
-                return {}
-            resp.raise_for_status()
-            data = resp.json()
-            result = data["chart"]["result"][0]
-            timestamps = result["timestamp"]
-            quote = result["indicators"]["quote"][0]
-            closes = quote["close"]
-            volumes = quote.get("volume") or [None] * len(timestamps)
-            bars = {}
-            for ts, close, vol in zip(timestamps, closes, volumes):
-                if close is None:
-                    continue
-                d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-                bars[d.isoformat()] = (round(close, 4), vol or 0)
-            return bars
-        except httpx.HTTPError as e:
-            last_error = e
-            if attempt == 0:
-                await asyncio.sleep(2)
-    raise last_error
+    contract symbol — real daily volume is what makes per-historical-date
+    liquidity ranking possible, see module note above. Thin wrapper over
+    yahoo_prices.fetch_yahoo_bars (the shared caller/retry/404 logic,
+    price-architecture-spec.md's Fetch consolidation) + bars_to_daily_dict."""
+    bars = await fetch_yahoo_bars(_client, ticker, interval="1d", range_=f"{days}d")
+    return bars_to_daily_dict(bars)
 
 
 async def _fetch_and_persist_curve_spread() -> dict:
@@ -1569,6 +1555,10 @@ async def fred_money_supply_refresh():
         wshotsl_rows = await _fetch_fred_series(FRED_SERIES_WSHOTSL, observation_start)
         wshomcb_rows = await _fetch_fred_series(FRED_SERIES_WSHOMCB, observation_start)
         wlcflpcl_rows = await _fetch_fred_series(FRED_SERIES_WLCFLPCL, observation_start)
+        dgs2_rows = await _fetch_fred_series(FRED_SERIES_DGS2, observation_start)
+        dgs10_rows = await _fetch_fred_series(FRED_SERIES_DGS10, observation_start)
+        dfii10_rows = await _fetch_fred_series(FRED_SERIES_DFII10, observation_start)
+        t10y2y_rows = await _fetch_fred_series(FRED_SERIES_T10Y2Y, observation_start)
         db.upsert_fred_observations(FRED_SERIES_M2, m2_rows)
         db.upsert_fred_observations(FRED_SERIES_WALCL, walcl_rows)
         db.upsert_fred_observations(FRED_SERIES_CPI, cpi_rows)
@@ -1577,6 +1567,10 @@ async def fred_money_supply_refresh():
         db.upsert_fred_observations(FRED_SERIES_WSHOTSL, wshotsl_rows)
         db.upsert_fred_observations(FRED_SERIES_WSHOMCB, wshomcb_rows)
         db.upsert_fred_observations(FRED_SERIES_WLCFLPCL, wlcflpcl_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS2, dgs2_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS10, dgs10_rows)
+        db.upsert_fred_observations(FRED_SERIES_DFII10, dfii10_rows)
+        db.upsert_fred_observations(FRED_SERIES_T10Y2Y, t10y2y_rows)
         db.record_fetch_attempt("money_supply", success=True)
         return {
             "success": True,
@@ -1589,6 +1583,10 @@ async def fred_money_supply_refresh():
                 FRED_SERIES_WSHOTSL: wshotsl_rows,
                 FRED_SERIES_WSHOMCB: wshomcb_rows,
                 FRED_SERIES_WLCFLPCL: wlcflpcl_rows,
+                FRED_SERIES_DGS2: dgs2_rows,
+                FRED_SERIES_DGS10: dgs10_rows,
+                FRED_SERIES_DFII10: dfii10_rows,
+                FRED_SERIES_T10Y2Y: t10y2y_rows,
             },
         }
     except httpx.HTTPError as e:
@@ -1599,33 +1597,16 @@ async def fred_money_supply_refresh():
 FRED_WINDOW_YEARS = {"2y": 2, "5y": 5, "10y": 10, "20y": 20}
 
 
-async def _fetch_yahoo_daily_closes(ticker: str, years: int) -> list[dict]:
-    resp = await _client.get(
-        f"{YAHOO_CHART_BASE}/{ticker}",
-        params={"interval": "1d", "range": f"{years}y"},
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    result = data["chart"]["result"][0]
-    timestamps = result["timestamp"]
-    closes = result["indicators"]["quote"][0]["close"]
-
-    rows = []
-    for ts, close in zip(timestamps, closes):
-        if close is None:
-            continue
-        d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-        rows.append({"date": d.isoformat(), "value": round(close, 4)})
-    return rows
-
-
 def _resample_month_end(daily_rows: list[dict]) -> list[dict]:
-    """Reduce daily closes to one row per calendar month — the last trading
-    day on or before that month's end. Yahoo's own `1mo` interval bucket
-    includes the current in-progress month, which isn't a true month-end
-    close, so we resample from daily data instead."""
+    """Reduce {'date','price'} daily rows to one row per calendar month —
+    the last trading day on or before that month's end. Yahoo's own `1mo`
+    interval bucket includes the current in-progress month, which isn't a
+    true month-end close, so this resamples from real daily data instead.
+    Now a pure read-time helper (price-architecture-spec.md) — the write
+    path persists real daily closes only; Money Supply's purchasing-power
+    chart, which wants monthly granularity, resamples at request time via
+    db.get_settlement_price_by_month instead of a separately-fetched/
+    separately-stored monthly series."""
     by_month: dict[str, dict] = {}
     for row in daily_rows:
         month_key = row["date"][:7]  # YYYY-MM
@@ -1633,20 +1614,49 @@ def _resample_month_end(daily_rows: list[dict]) -> list[dict]:
     return [by_month[k] for k in sorted(by_month)]
 
 
+async def _fetch_and_persist_yahoo_daily_close() -> dict:
+    """Real daily (not month-end) Yahoo closes for both metals — one
+    settlement_price instrument (XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE)
+    now serves every consumer that used to read from three differently-
+    shaped places: Money Supply's purchasing-power chart (previously
+    XAG_CLOSE/XAU_CLOSE, month-end resampled at write time), CATCOR's
+    event-reaction daily-close fallback (previously XAG_DAILY_CLOSE/
+    XAU_DAILY_CLOSE, a dedicated 120-day-deep series that duplicated this
+    same fetch at a shallower depth), and the leverage panel's long-window
+    price chart (previously stitched in via db.get_price_history's third
+    tier). Fetches the full METAL_PRICE_FETCH_YEARS range on every call —
+    goal 3 is "if data's available, get it" — but
+    upsert_settlement_price_rows only ever writes rows that are new or
+    actually changed, so a routine cadence tick doesn't rewrite years of
+    unchanged history (price-architecture-spec.md Q3)."""
+    result = {}
+    for metal, ticker in METAL_PRICE_TICKERS.items():
+        bars = await fetch_yahoo_bars(_client, ticker, interval="1d", range_=f"{METAL_PRICE_FETCH_YEARS}y")
+        daily_rows = bars_to_daily_rows(bars)
+        instrument = YAHOO_DAILY_CLOSE_BY_METAL[metal]
+        db.upsert_settlement_price_rows(instrument, daily_rows)
+        result[instrument] = daily_rows
+    return result
+
+
 @app.get("/api/metals/prices/refresh")
 async def metals_prices_refresh():
     try:
-        result = {}
-        for series_id, ticker in METAL_PRICE_TICKERS.items():
-            daily = await _fetch_yahoo_daily_closes(ticker, METAL_PRICE_FETCH_YEARS)
-            monthly = _resample_month_end(daily)
-            db.upsert_fred_observations(series_id, monthly)
-            result[series_id] = monthly
+        result = await _fetch_and_persist_yahoo_daily_close()
         db.record_fetch_attempt("metals_prices", success=True)
         return {"success": True, "data": result}
     except httpx.HTTPError as e:
         db.record_fetch_attempt("metals_prices", success=False, error=str(e))
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/metals/prices/db/daily-range")
+async def metals_prices_db_daily_range(metal: str = Query("XAG"), since: str = Query("2020-01-01")):
+    """Real daily high/low/close for the Paper Games leverage chart's
+    day-range price series (see db.get_daily_price_range) — reads
+    settlement_price's real Yahoo daily bars, no new fetch."""
+    rows = db.get_daily_price_range(metal, since)
+    return {"success": True, "data": rows}
 
 
 COT_MIN_REFRESH_DAYS = 7  # CFTC only publishes a new report ~weekly — no point re-pulling more often; also feeds cot_pipeline's CadenceSpec.min_gap below, single source of truth for the number
@@ -1691,7 +1701,7 @@ async def _refresh_cot_pipeline():
 sources.register(SourceDefinition(
     key="spot_prices", label="Spot Prices (metalcharts.org)",
     affinity_group="exchange_market", fetch_fn=_fetch_and_persist_prices,
-    tables=["spot_price_snapshot", "spot_price_tick"],
+    tables=["spot_price"],
     cadence=CadenceSpec(trigger="interval", interval_seconds=_refresh_settings["fast_interval_s"], enabled_flag="fast_enabled"),
     rate_limit=RateLimitSpec(kind="undocumented", note="Reverse-engineered metalcharts.org endpoint, no published quota."),
 ))
@@ -1734,9 +1744,9 @@ sources.register(SourceDefinition(
     rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern."),
 ))
 sources.register(SourceDefinition(
-    key="metals_prices", label="Yahoo Finance — Monthly Metal Closes",
+    key="metals_prices", label="Yahoo Finance — Daily Metal Closes",
     affinity_group="exchange_market", fetch_fn=metals_prices_refresh,
-    tables=["fred_observations"],
+    tables=["settlement_price"],
     cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="undocumented", note="No published quota; conservative-by-design per CLAUDE.md's Yahoo Finance dev note."),
 ))
@@ -1749,7 +1759,7 @@ sources.register(SourceDefinition(
 sources.register(SourceDefinition(
     key="cot_pipeline", label="CFTC Commitment of Traders (Legacy + Disaggregated)",
     affinity_group="gov_regulatory", fetch_fn=_refresh_cot_pipeline,
-    tables=["cot_silver", "cot_gold", "cot_disaggregated", "cot_prices", "pipeline_runs"],
+    tables=["cot_silver", "cot_gold", "cot_disaggregated", "settlement_price", "pipeline_runs"],
     cadence=CadenceSpec(
         trigger="manual_only",
         min_gap=timedelta(days=COT_MIN_REFRESH_DAYS),
@@ -1762,7 +1772,7 @@ sources.register(SourceDefinition(
 sources.register(SourceDefinition(
     key="lbma_fix", label="GoldAPI.io — LBMA Fix",
     affinity_group="exchange_market", fetch_fn=_fetch_and_persist_lbma_fix_startup,
-    tables=["lbma_fix"], requires_env=["GAPI_API_KEY"],
+    tables=["settlement_price"], requires_env=["GAPI_API_KEY"],
     cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="numeric_quota", quota_per_period="500/month"),
 ))
@@ -1793,7 +1803,7 @@ sources.register(SourceDefinition(
 sources.register(SourceDefinition(
     key="catcor_startup", label="CATCOR — Seed + Backfill Chain",
     affinity_group="calendar_events", fetch_fn=_catcor_startup,
-    tables=["event_calendar", "fred_observations", "forexfactory_calendar", "macro_price_reaction"],
+    tables=["event_calendar", "spot_price", "settlement_price", "forexfactory_calendar", "macro_price_reaction"],
     cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="undocumented", note="Composite of Yahoo/ForexFactory/ALFRED calls — see catcor_consensus_actuals and each metal's own price-history source for their individual rate-limit notes."),
 ))
@@ -1807,7 +1817,7 @@ sources.register(SourceDefinition(
     affinity_group="calendar_events", fetch_fn=_catcor_snapshot_tick,
     tables=["macro_price_reaction"],
     cadence=CadenceSpec(trigger="always_on", interval_seconds=60),
-    rate_limit=RateLimitSpec(kind="undocumented", note="Internal — reads already-fetched spot_price_tick rows, no new upstream call."),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Internal — reads already-fetched spot_price rows, no new upstream call."),
 ))
 sources.register(SourceDefinition(
     key="catcor_consensus_actuals", label="CATCOR — ForexFactory Consensus + ALFRED Actuals",
@@ -1939,8 +1949,22 @@ async def metals_prices_db(
         years = FRED_WINDOW_YEARS.get(window, 20)
         since = str(date.today() - timedelta(days=365 * years))
 
-    xag_rows = db.get_fred_observations(XAG_SERIES_ID, since)
-    xau_rows = db.get_fred_observations(XAU_SERIES_ID, since)
+    # Real daily closes, resampled to month-end at read time (per
+    # price-architecture-spec.md — the write path no longer bakes monthly
+    # resampling into a separately-fetched series). {"date","price"} ->
+    # {"date","value"} to match _resample_month_end/_index_to_100's shape.
+    xag_daily = [
+        {"date": r["date"], "value": r["price"]}
+        for r in db.get_settlement_price_series(YAHOO_DAILY_CLOSE_BY_METAL["XAG"])
+        if r["price"] is not None and r["date"] >= since
+    ]
+    xau_daily = [
+        {"date": r["date"], "value": r["price"]}
+        for r in db.get_settlement_price_series(YAHOO_DAILY_CLOSE_BY_METAL["XAU"])
+        if r["price"] is not None and r["date"] >= since
+    ]
+    xag_rows = _resample_month_end(xag_daily)
+    xau_rows = _resample_month_end(xau_daily)
     if end is not None:
         xag_rows = [r for r in xag_rows if r["date"] <= end]
         xau_rows = [r for r in xau_rows if r["date"] <= end]
@@ -2001,6 +2025,10 @@ async def fred_money_supply_db(
     wshotsl_all = _trim(db.get_fred_observations(FRED_SERIES_WSHOTSL, since))
     wshomcb_all = _trim(db.get_fred_observations(FRED_SERIES_WSHOMCB, since))
     wlcflpcl_all = _trim(db.get_fred_observations(FRED_SERIES_WLCFLPCL, since))
+    dgs2_all = _trim(db.get_fred_observations(FRED_SERIES_DGS2, since))
+    dgs10_all = _trim(db.get_fred_observations(FRED_SERIES_DGS10, since))
+    dfii10_all = _trim(db.get_fred_observations(FRED_SERIES_DFII10, since))
+    t10y2y_all = _trim(db.get_fred_observations(FRED_SERIES_T10Y2Y, since))
 
     m2_yoy = [r for r in _compute_yoy(m2_all, FRED_M2_YOY_LOOKBACK) if r["date"] >= since]
     walcl_yoy = [r for r in _compute_yoy(walcl_all, FRED_WALCL_YOY_LOOKBACK) if r["date"] >= since]
@@ -2051,6 +2079,12 @@ async def fred_money_supply_db(
             "wshotsl": _millions_to_trillions(wshotsl_all),
             "wshomcb": _millions_to_trillions(wshomcb_all),
             "wlcflpcl": _millions_to_trillions(wlcflpcl_all),
+            # Treasury Yields sub-panel — already % units, no divisor needed
+            # (unlike the Composition series' millions/billions split above).
+            "dgs2": dgs2_all,
+            "dgs10": dgs10_all,
+            "dfii10": dfii10_all,
+            "t10y2y": t10y2y_all,
         },
     }
 
@@ -2084,7 +2118,7 @@ async def catcor_refresh():
     try:
         n_seeded = catcor.seed_events()
         await catcor.backfill_intraday_ticks(_client)
-        await catcor.backfill_daily_closes(_client)
+        await _fetch_and_persist_yahoo_daily_close()
         consensus_result = await catcor.fetch_and_persist_consensus(_client)
         actuals_result = await catcor.fetch_and_persist_actuals(_client)
         catcor.backfill_reactions()

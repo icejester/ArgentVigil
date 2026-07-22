@@ -139,8 +139,8 @@ async def test_lbma_weekend_fetch_walks_back_to_friday(tmp_db, upstream_client, 
 
     # Every outbound request asked for Friday 2026-07-17 — never the weekend.
     assert requested_dates and all(d == "20260717" for d in requested_dates)
-    for metal in ("XAU", "XAG"):
-        rows = tmp_db.get_latest_lbma_fix(metal)
+    for instrument in (main_module.LBMA_BY_METAL["XAU"], main_module.LBMA_BY_METAL["XAG"]):
+        rows = tmp_db.get_latest_settlement_price(instrument)
         assert rows and rows[0]["date"] == "2026-07-17"
 
 
@@ -176,6 +176,36 @@ async def test_yahoo_daily_404_means_no_data_not_retry(upstream_client):
         bars = await main_module._fetch_yahoo_contract_daily("SIQ99.CMX", days=370)
     assert bars == {}
     assert route.call_count == 1
+
+
+# --- Yahoo daily close: consolidated fetcher writes settlement_price -----
+
+
+async def test_yahoo_daily_close_fetcher_writes_settlement_price_both_metals(
+    tmp_db, upstream_client
+):
+    """price-architecture-spec.md's Fetch consolidation: one fetch now
+    serves what used to be three separate call sites (Money Supply's
+    monthly close, CATCOR's 120-day daily fallback, the leverage panel's
+    price chart) — confirms it persists real daily closes for both metals
+    under the shared XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE instruments."""
+    fixtures = {
+        "SI=F": yahoo_chart_payload({"2026-07-17": (39.5, 1000), "2026-07-18": (39.8, 1200)}),
+        "GC=F": yahoo_chart_payload({"2026-07-17": (3350.0, 500), "2026-07-18": (3360.0, 600)}),
+    }
+
+    def _yahoo_callback(request: httpx.Request) -> httpx.Response:
+        ticker = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=fixtures[ticker])
+
+    with respx.mock:
+        respx.get(url__startswith=main_module.YAHOO_CHART_BASE).mock(side_effect=_yahoo_callback)
+        await main_module._fetch_and_persist_yahoo_daily_close()
+
+    xag_rows = tmp_db.get_settlement_price_series("XAG_YAHOO_DAILY_CLOSE")
+    xau_rows = tmp_db.get_settlement_price_series("XAU_YAHOO_DAILY_CLOSE")
+    assert [(r["date"], r["price"]) for r in xag_rows] == [("2026-07-17", 39.5), ("2026-07-18", 39.8)]
+    assert [(r["date"], r["price"]) for r in xau_rows] == [("2026-07-17", 3350.0), ("2026-07-18", 3360.0)]
 
 
 # --- Curve spread: per-date ranking + delivery-order enforcement ----------

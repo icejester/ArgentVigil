@@ -1,16 +1,21 @@
 """
-Manually-maintained calendar of recurring macro catalysts CATCOR tracks —
-FOMC decisions, CPI, and NFP (Employment Situation). Not scraped from ALFRED
-release-calendar metadata: FOMC dates come from the Fed's published meeting
-calendar, CPI/NFP dates were cross-checked against ALFRED's own
-release/dates endpoint (release_id=10 for CPI, release_id=50 for Employment
-Situation) as of 2026-07-04. The 2025/2026 government shutdown (lapse in
-appropriations, Oct 2025-Feb 2026) shifted several BLS releases off their
-usual cadence (e.g. the January 2026 jobs report slipped from Feb 6 to Feb
-11) — dates below are the actual as-published schedule, not a "first
-Friday of the month" assumption.
+Manually-maintained calendar of FOMC decisions — the one CATCOR event type
+with no ALFRED release_id (the Fed's own meeting calendar isn't a BLS/
+Census "release"), so it has no live-fetchable source and stays hand-
+maintained. FOMC dates come from the Fed's published meeting calendar.
 
-Update this file directly when new meetings/releases are scheduled;
+CPI and NFP dates are NOT maintained here anymore — as of
+catcor.seed_events_from_alfred(), they're fetched live from ALFRED's
+fred/release/dates endpoint (release_id=10 CPI, release_id=50 NFP) on
+every CATCOR startup/weekly re-seed, which is why CPI_RELEASES/
+NFP_RELEASES (this file used to hand-maintain both, and it fell behind —
+see catcor.ALFRED_RELEASE_ID) were removed. RELEASE_TIME_ET/EVENT_NAMES/
+SOURCE_URLS/SOURCE_TIERS below are still shared with the live-fetched
+CPI/NFP path (seed_events_from_alfred_sync keys off EVENT_NAMES etc. by
+event_type the same way seed_events() does), so don't remove those even
+though CPI/NFP no longer have their own date lists here.
+
+Update this file directly when new FOMC meetings are scheduled;
 catcor.seed_events() re-derives event_id deterministically from
 event_type + date, so re-running it after an edit here just updates the
 existing row rather than duplicating it.
@@ -30,41 +35,18 @@ FOMC_MEETINGS = [
     ("2026-09-16", "14:00"),
 ]
 
-# Consumer Price Index (CPIAUCSL) — 8:30am ET, per ALFRED release_id=10.
-CPI_RELEASES = [
-    "2026-01-13",
-    "2026-02-13",
-    "2026-03-11",
-    "2026-04-10",
-    "2026-05-12",
-    "2026-06-10",
-    "2026-07-14",
-    "2026-08-12",
-    "2026-09-11",
-]
-
-# Employment Situation / nonfarm payrolls (PAYEMS) — 8:30am ET, per ALFRED
-# release_id=50. Jan 2026 release slipped from its originally-scheduled
-# Feb 6 to Feb 11 due to the government shutdown lapse in appropriations.
-NFP_RELEASES = [
-    "2026-01-09",
-    "2026-02-11",
-    "2026-03-06",
-    "2026-04-03",
-    "2026-05-08",
-    "2026-06-05",
-    "2026-07-02",
-    "2026-08-07",
-    "2026-09-04",
-]
-
+# CPI (CPIAUCSL) and NFP (PAYEMS) release dates are no longer listed here —
+# both are fetched live from ALFRED's fred/release/dates endpoint by
+# catcor.seed_events_from_alfred() (release_id=10 CPI, release_id=50 NFP),
+# 8:30am ET per that same ALFRED release metadata. RELEASE_TIME_ET stays
+# here since seed_events_from_alfred_sync() still needs it.
 RELEASE_TIME_ET = "08:30"
 
-EVENTS = (
-    [{"event_type": "FOMC", "date": d, "time_et": t, "alfred_series_id": None} for d, t in FOMC_MEETINGS]
-    + [{"event_type": "CPI", "date": d, "time_et": RELEASE_TIME_ET, "alfred_series_id": "CPIAUCSL"} for d in CPI_RELEASES]
-    + [{"event_type": "NFP", "date": d, "time_et": RELEASE_TIME_ET, "alfred_series_id": "PAYEMS"} for d in NFP_RELEASES]
-)
+# seed_events() only ever seeds FOMC now — CPI/NFP go through
+# seed_events_from_alfred() instead, which builds its own row shape
+# directly from EVENT_NAMES/SOURCE_URLS/SOURCE_TIERS below rather than
+# reading from this EVENTS list.
+EVENTS = [{"event_type": "FOMC", "date": d, "time_et": t, "alfred_series_id": None} for d, t in FOMC_MEETINGS]
 
 EVENT_NAMES = {
     "FOMC": "FOMC Rate Decision",

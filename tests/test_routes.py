@@ -32,7 +32,7 @@ async def test_silver_leverage_route_round_trips_contracts(tmp_db, client):
 
 
 async def test_census_trade_route_includes_implied_qty_oz(tmp_db, client):
-    tmp_db.upsert_fred_observations("XAG_CLOSE", [{"date": "2026-04-30", "value": 40.0}])
+    tmp_db.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [{"date": "2026-04-30", "price": 40.0}])
     tmp_db.upsert_census_trade_rows([{
         "metal": "XAG", "flow": "import", "hs_code": "7106",
         "cty_code": "-", "cty_name": "TOTAL FOR ALL COUNTRIES",

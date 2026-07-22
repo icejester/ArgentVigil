@@ -4,6 +4,7 @@ from bisect import bisect_right
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from .price_instruments import GC_F_WEEKLY, GLD_CLOSE, SESSION_DAILY, SI_F_WEEKLY, SLV_CLOSE
 from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -107,27 +108,40 @@ CREATE TABLE IF NOT EXISTS pslv_snapshot (
     units REAL
 );
 
-CREATE TABLE IF NOT EXISTS spot_price_snapshot (
-    series_id TEXT NOT NULL,
-    date TEXT NOT NULL,
+-- Tick-resolution spot price, per price-architecture-spec.md. instrument
+-- is a closed set (see backend/price_instruments.py) — real metalcharts.org
+-- spot quotes (*_SPOT, ~60s cadence) and Yahoo front-month-continuous
+-- futures bars (*_FUTURES_FRONT, 5-min cadence) are DIFFERENT instruments
+-- that must never share a key: an earlier design shared "XAG"/"XAU" between
+-- the two and produced a real sawtooth artifact (futures prints running
+-- ~0.3-0.6 higher than spot, interleaved on the same series). Append-only —
+-- a real tick is never revised.
+CREATE TABLE IF NOT EXISTS spot_price (
+    instrument TEXT NOT NULL,
+    ts TEXT NOT NULL,
     price REAL,
     change_pct_24h REAL,
-    PRIMARY KEY (series_id, date)
+    PRIMARY KEY (instrument, ts)
 );
 
--- LBMA AM/PM (gold) / daily (silver) fix, sourced from GoldAPI.io's
--- date-suffixed historical endpoint (exchange="LBMA" in its response —
--- confirmed distinct from GoldAPI's bare current-price endpoint, which is
--- a FOREX.com spot feed, not LBMA at all). fix_type is 'AM' for gold
--- (GoldAPI.io exposes no PM-fix-distinct field — gold's PM fix is not
--- available from this source) and 'daily' for silver.
-CREATE TABLE IF NOT EXISTS lbma_fix (
-    metal TEXT NOT NULL,
-    fix_type TEXT NOT NULL,
+-- Daily-or-coarser settlement/reference prices, per price-architecture-
+-- spec.md: Yahoo real daily closes, GoldAPI.io LBMA AM/PM/daily fixes, and
+-- ETF/COT-week closes all live here as different `instrument` values
+-- instead of three separately-shaped tables (the old lbma_fix table plus
+-- assorted fred_observations series_id keys plus cot_prices). Upsert, not
+-- append-only — LBMA/Yahoo closes can both be legitimately re-fetched.
+-- `session` is a real string column ('AM'|'PM'|'daily'), not NULL, since
+-- NULL in a composite PRIMARY KEY behaves unintuitively for SQLite's
+-- ON CONFLICT upserts — matches lbma_fix's prior fix_type convention.
+CREATE TABLE IF NOT EXISTS settlement_price (
+    instrument TEXT NOT NULL,
     date TEXT NOT NULL,
-    price_usd REAL,
+    session TEXT NOT NULL,
+    price REAL,
+    high REAL,
+    low REAL,
     fetched_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (metal, fix_type, date)
+    PRIMARY KEY (instrument, date, session)
 );
 
 -- U.S. Census Bureau International Trade API, HS 7106 (silver) / HS 7108
@@ -215,13 +229,6 @@ CREATE TABLE IF NOT EXISTS macro_price_reaction (
     PRIMARY KEY (event_id, metal, window)
 );
 
-CREATE TABLE IF NOT EXISTS spot_price_tick (
-    series_id TEXT NOT NULL,
-    ts TEXT NOT NULL,
-    price REAL,
-    PRIMARY KEY (series_id, ts)
-);
-
 CREATE TABLE IF NOT EXISTS cot_silver (
     report_date TEXT PRIMARY KEY,
     noncomm_long REAL,
@@ -240,13 +247,6 @@ CREATE TABLE IF NOT EXISTS cot_gold (
     net_long REAL,
     net_long_pct_oi REAL,
     fetched_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS cot_prices (
-    ticker TEXT NOT NULL,
-    date TEXT NOT NULL,
-    price REAL,
-    PRIMARY KEY (ticker, date)
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
@@ -409,6 +409,20 @@ def init_db():
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+        # settlement_price: high/low, added for the Paper Games leverage
+        # chart's day-range price series — Yahoo's daily chart-API response
+        # already carries these fields (see yahoo_prices.fetch_yahoo_bars),
+        # previously discarded. NULL for any instrument with no real
+        # intraday-range concept (LBMA fix, ETF/weekly closes — a single
+        # fixed print per period, never a range).
+        for stmt in (
+            "ALTER TABLE settlement_price ADD COLUMN high REAL",
+            "ALTER TABLE settlement_price ADD COLUMN low REAL",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 def upsert_aggregate_rows(rows: list[dict]):
@@ -731,42 +745,123 @@ def get_latest_leverage(metal: str) -> dict | None:
     }
 
 
-def upsert_lbma_fix_row(row: dict):
+def upsert_settlement_price_rows(instrument: str, rows: list[dict]):
+    """Upsert into settlement_price, keyed (instrument, date, session).
+    Each row needs 'date'/'price'/'session' (session defaults to
+    price_instruments.SESSION_DAILY if omitted — most instruments only
+    ever have one print/day; LBMA gold's 'AM' is the one caller that
+    passes it explicitly). 'high'/'low' are optional (only the Yahoo
+    daily-close instruments carry them — a single-print instrument like
+    LBMA/ETF closes has no range concept, so those rows simply omit the
+    keys and persist NULL).
+
+    Diffs against what's already persisted before writing (per
+    price-architecture-spec.md's resolution to Q3): a row whose
+    price/high/low are all unchanged from the currently-stored values at
+    that (date, session) is skipped entirely, so re-fetching a full
+    multi-year range on every cadence tick doesn't rewrite years of
+    already-correct history — only genuinely new or revised rows hit the
+    upsert."""
+    if not rows:
+        return
     with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO lbma_fix (metal, fix_type, date, price_usd)
-               VALUES (:metal, :fix_type, :date, :price_usd)
-               ON CONFLICT (metal, fix_type, date) DO UPDATE SET
-                   price_usd = excluded.price_usd,
-                   fetched_at = datetime('now')""",
-            row,
-        )
+        existing = {
+            (r["date"], r["session"]): (r["price"], r["high"], r["low"])
+            for r in conn.execute(
+                "SELECT date, session, price, high, low FROM settlement_price WHERE instrument = ?",
+                (instrument,),
+            ).fetchall()
+        }
+        to_write = []
+        for row in rows:
+            session = row.get("session", SESSION_DAILY)
+            high = row.get("high")
+            low = row.get("low")
+            key = (row["date"], session)
+            if existing.get(key) == (row["price"], high, low):
+                continue
+            to_write.append({
+                "instrument": instrument,
+                "date": row["date"],
+                "session": session,
+                "price": row["price"],
+                "high": high,
+                "low": low,
+            })
+        if to_write:
+            conn.executemany(
+                """INSERT INTO settlement_price (instrument, date, session, price, high, low)
+                   VALUES (:instrument, :date, :session, :price, :high, :low)
+                   ON CONFLICT (instrument, date, session) DO UPDATE SET
+                       price = excluded.price,
+                       high = excluded.high,
+                       low = excluded.low,
+                       fetched_at = datetime('now')""",
+                to_write,
+            )
 
 
-def get_latest_lbma_fix(metal: str) -> list[dict]:
-    """Latest fix row per fix_type for a metal (gold has 'AM' only via
-    GoldAPI.io; silver has 'daily' only) — a list since gold could in
-    principle carry more than one fix_type in the future."""
+def get_latest_settlement_price(instrument: str) -> list[dict]:
+    """Latest row per session for an instrument (gold LBMA has 'AM' only
+    via GoldAPI.io; silver LBMA has 'daily' only) — a list since an
+    instrument could in principle carry more than one session."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT metal, fix_type, date, price_usd FROM lbma_fix AS outer_fix
-               WHERE metal = ? AND date = (
-                   SELECT MAX(date) FROM lbma_fix
-                   WHERE metal = outer_fix.metal AND fix_type = outer_fix.fix_type
+            """SELECT instrument, date, session, price FROM settlement_price AS outer_row
+               WHERE instrument = ? AND date = (
+                   SELECT MAX(date) FROM settlement_price
+                   WHERE instrument = outer_row.instrument AND session = outer_row.session
                )""",
-            (metal,),
+            (instrument,),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_lbma_fix_series(metal: str, fix_type: str) -> list[dict]:
+def get_settlement_price_series(instrument: str, session: str | None = None) -> list[dict]:
+    query = "SELECT date, session, price, high, low FROM settlement_price WHERE instrument = ?"
+    params: list = [instrument]
+    if session is not None:
+        query += " AND session = ?"
+        params.append(session)
+    query += " ORDER BY date"
     with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT date, price_usd FROM lbma_fix
-               WHERE metal = ? AND fix_type = ? ORDER BY date""",
-            (metal, fix_type),
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_daily_price_range(metal: str, since: str) -> list[dict]:
+    """Real daily high/low/close for a metal since `since` (YYYY-MM-DD),
+    for the Paper Games leverage chart's day-range price series — NOT
+    tick-resolution (that's spot_price/get_price_backfill's job). Reads
+    settlement_price's XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE
+    instrument, which already carries real Yahoo daily high/low (captured
+    by yahoo_prices.fetch_yahoo_bars, persisted by
+    _fetch_and_persist_yahoo_daily_close — no separate fetch needed).
+    Rows with no real high/low (pre-migration rows fetched before this
+    column existed, or a genuinely missing bar) are skipped rather than
+    rendered as a zero-width range."""
+    instrument = f"{metal}_YAHOO_DAILY_CLOSE"
+    rows = get_settlement_price_series(instrument)
+    return [
+        {"date": r["date"], "close": r["price"], "high": r["high"], "low": r["low"]}
+        for r in rows
+        if r["date"] >= since and r["high"] is not None and r["low"] is not None
+    ]
+
+
+def get_settlement_price_by_month(instrument: str, session: str = SESSION_DAILY) -> dict[str, float]:
+    """{'YYYY-MM': last real price that month} — month-end-style lookup for
+    a daily-or-coarser settlement series, computed at read time from
+    whatever daily rows exist (replaces the old month-end-resampled
+    XAG_CLOSE/XAU_CLOSE fred_observations series, which baked the
+    resampling into the write path instead)."""
+    rows = get_settlement_price_series(instrument, session=session)
+    by_month: dict[str, float] = {}
+    for row in rows:
+        if row["price"] is None:
+            continue
+        by_month[row["date"][:7]] = row["price"]  # rows arrive date-ascending, last write wins
+    return by_month
 
 
 def upsert_census_trade_rows(rows: list[dict]):
@@ -806,8 +901,8 @@ def get_census_trade(metal: str, flow: str | None = None, hs_code: str | None = 
         rows = conn.execute(query, params).fetchall()
         result = [dict(r) for r in rows]
 
-    spot_series_id = "XAG_CLOSE" if metal == "XAG" else "XAU_CLOSE"
-    spot_by_month = get_fred_observations_by_month(spot_series_id)
+    spot_instrument = f"{metal}_YAHOO_DAILY_CLOSE"
+    spot_by_month = get_settlement_price_by_month(spot_instrument)
     for row in result:
         month_key = f"{row['year']:04d}-{row['month']:02d}"
         spot = spot_by_month.get(month_key)
@@ -939,22 +1034,39 @@ def get_latest_pslv() -> dict | None:
         return dict(row) if row else None
 
 
-def upsert_spot_price_rows(rows: list[dict]):
+def append_spot_price_ticks(rows: list[dict]):
+    """Append-only real spot ticks — a published tick is never revised.
+    Each row: {'instrument', 'ts', 'price', 'change_pct_24h'} — the latter
+    nullable, only ever populated for *_SPOT instruments (metalcharts.org
+    supplies it for free on every poll; Yahoo futures bars don't carry an
+    equivalent field). Replaces the old spot_price_snapshot (one row/day,
+    overwritten) + append_price_tick (no change_pct_24h column) split —
+    spot_price now serves both "latest snapshot" and "tick history" off
+    one append-only table."""
     with get_conn() as conn:
         conn.executemany(
-            """INSERT OR REPLACE INTO spot_price_snapshot (series_id, date, price, change_pct_24h)
-               VALUES (:series_id, :date, :price, :change_pct_24h)""",
-            rows,
+            """INSERT OR IGNORE INTO spot_price (instrument, ts, price, change_pct_24h)
+               VALUES (:instrument, :ts, :price, :change_pct_24h)""",
+            [{**row, "change_pct_24h": row.get("change_pct_24h")} for row in rows],
         )
 
 
 def get_latest_spot_prices() -> dict[str, dict]:
+    """Latest tick per *_SPOT instrument — 'date' key kept in the return
+    shape (derived from 'ts') since /api/prices/db's existing response
+    shape is unchanged by this migration."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT series_id, date, price, change_pct_24h FROM spot_price_snapshot s1
-               WHERE date = (SELECT MAX(date) FROM spot_price_snapshot s2 WHERE s2.series_id = s1.series_id)"""
+            """SELECT instrument, ts, price, change_pct_24h FROM spot_price s1
+               WHERE instrument IN ('XAG_SPOT', 'XAU_SPOT')
+                 AND ts = (SELECT MAX(ts) FROM spot_price s2 WHERE s2.instrument = s1.instrument)"""
         ).fetchall()
-        return {r["series_id"]: dict(r) for r in rows}
+        return {
+            r["instrument"].removesuffix("_SPOT"): {
+                "date": r["ts"][:10], "price": r["price"], "change_pct_24h": r["change_pct_24h"],
+            }
+            for r in rows
+        }
 
 
 def get_fred_observations(series_id: str, since: str) -> list[dict]:
@@ -1072,97 +1184,75 @@ def get_event_reaction_series() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def append_price_tick(rows: list[dict]):
-    with get_conn() as conn:
-        conn.executemany(
-            """INSERT OR IGNORE INTO spot_price_tick (series_id, ts, price)
-               VALUES (:series_id, :ts, :price)""",
-            rows,
-        )
-
-
-def get_ticks_since(series_id: str, since_ts: str) -> list[dict]:
-    """Full intraday tick history for series_id at/after since_ts, ordered
+def get_spot_price_ticks_since(instrument: str, since_ts: str) -> list[dict]:
+    """Full tick history for instrument at/after since_ts, ordered
     oldest-first — for a 24h price chart, not a nearest-tick lookup like
-    get_ticks_near (CATCOR's use case). Ticks only exist from whenever the
-    fast-tier refresh loop started actually running at its 60s cadence; a
-    freshly-enabled instance will have a short/empty history until it
-    accumulates.
-
-    Note: spot_price_tick holds more than one series_id family — "XAG"/
-    "XAU" are main.py's real metalcharts.org spot quotes (60s cadence);
-    "XAG_FUTURES"/"XAU_FUTURES" are catcor.py's Yahoo SI=F/GC=F futures
-    bars (5m cadence, used for event-reaction snapshots, NOT the live spot
-    price). These two used to collide under the same "XAG"/"XAU" keys —
-    a real bug that sawtoothed PriceHistoryChart with futures prints
-    running ~0.3-0.6 higher than spot, interleaved on the same line. Pass
-    the series_id family that matches what you actually want."""
+    get_spot_price_near (CATCOR's use case). Ticks only exist from whenever
+    the fast-tier refresh loop started actually running at its 60s cadence
+    (for *_SPOT) or CATCOR's intraday backfill last ran (for
+    *_FUTURES_FRONT); a freshly-enabled instance will have a short/empty
+    history until it accumulates. Pass a real price_instruments constant —
+    *_SPOT and *_FUTURES_FRONT are deliberately different instruments (see
+    price_instruments.py's module docstring for the sawtooth bug this
+    schema exists to make impossible)."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT ts, price FROM spot_price_tick
-               WHERE series_id = ? AND ts >= ?
+            """SELECT ts, price FROM spot_price
+               WHERE instrument = ? AND ts >= ?
                ORDER BY ts ASC""",
-            (series_id, since_ts),
+            (instrument, since_ts),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_price_history(series_id: str, since_ts: str) -> list[dict]:
-    """Tiered price history for a lookback window, stitching three
-    resolutions since none alone covers every window the frontend offers
-    (6H..12M): real spot_price_tick ticks (60s resolution, but only exist
-    from whenever the fast-tier refresh loop actually started running —
-    see get_ticks_since), then CATCOR's XAG_DAILY_CLOSE/XAU_DAILY_CLOSE
-    (daily, ~120 days back — catcor.DAILY_CLOSE_FETCH_DAYS), then the
-    month-end-resampled XAG_CLOSE/XAU_CLOSE used by Money Supply (monthly,
-    back to 2006). Each tier only contributes points strictly older than
-    the tier above it already covers, so the stitched series never has two
-    sources double-covering the same date. Returned oldest-first, each row
-    {"ts": <ISO string>, "price": <float>}.
+def get_price_backfill(metal: str, since_ts: str) -> list[dict]:
+    """Tiered price history for a lookback window, per
+    price-architecture-spec.md's get_price_backfill: real spot_price ticks
+    (60s resolution, but only exist from whenever the fast-tier refresh
+    loop actually started running) stitched with settlement_price's real
+    Yahoo daily closes (back to whatever range Yahoo retains, confirmed
+    ~1yr+) for anything older. The old 3-tier stitch (ticks / CATCOR's
+    XAG_DAILY_CLOSE / Money Supply's month-end XAG_CLOSE) collapses to 2
+    tiers now that both former daily-close series are the same
+    XAG_YAHOO_DAILY_CLOSE settlement_price instrument. Each tier only
+    contributes points strictly older than the tier above it already
+    covers, so the stitched series never double-covers a date. Returned
+    oldest-first, each row {"ts": <ISO string or date string>, "price": <float>}.
 
-    Callers should pass "XAG"/"XAU" here (the real spot series) — never
-    "XAG_FUTURES"/"XAU_FUTURES" (catcor.py's Yahoo futures backfill, a
-    different instrument used only for CATCOR's own event-reaction
-    snapshots, see get_ticks_since's note)."""
-    daily_series_id = f"{series_id}_DAILY_CLOSE"
-    monthly_series_id = f"{series_id}_CLOSE"
+    metal is "XAG"/"XAU" — resolves to price_instruments' *_SPOT and
+    *_YAHOO_DAILY_CLOSE instruments internally."""
+    spot_instrument = f"{metal}_SPOT"
+    daily_instrument = f"{metal}_YAHOO_DAILY_CLOSE"
 
-    ticks = get_ticks_since(series_id, since_ts)
+    ticks = get_spot_price_ticks_since(spot_instrument, since_ts)
     earliest_tick_date = ticks[0]["ts"][:10] if ticks else None
-
     daily_cutoff = earliest_tick_date or datetime.now(timezone.utc).date().isoformat()
-    daily_rows = [
-        r for r in get_fred_observations(daily_series_id, since=since_ts[:10])
-        if r["value"] is not None and r["date"] < daily_cutoff
-    ]
-    earliest_daily_date = daily_rows[0]["date"] if daily_rows else daily_cutoff
 
-    monthly_rows = [
-        r for r in get_fred_observations(monthly_series_id, since=since_ts[:10])
-        if r["value"] is not None and r["date"] < earliest_daily_date
+    daily_rows = [
+        r for r in get_settlement_price_series(daily_instrument)
+        if r["price"] is not None and since_ts[:10] <= r["date"] < daily_cutoff
     ]
 
     combined = (
-        [{"ts": r["date"], "price": r["value"]} for r in monthly_rows]
-        + [{"ts": r["date"], "price": r["value"]} for r in daily_rows]
+        [{"ts": r["date"], "price": r["price"]} for r in daily_rows]
         + [{"ts": t["ts"], "price": t["price"]} for t in ticks]
     )
     return combined
 
 
-def get_ticks_near(series_id: str, ts: str, tolerance_s: int) -> dict | None:
-    """Nearest spot_price_tick row to ts within tolerance_s, or None.
-    CATCOR's capture_snapshot passes "XAG_FUTURES"/"XAU_FUTURES" here (see
-    get_ticks_since's note) — this function itself is series-id-agnostic,
-    it just finds whichever row is closest under whatever key you pass."""
+def get_spot_price_near(instrument: str, ts: str, tolerance_s: int) -> dict | None:
+    """Nearest spot_price row to ts within tolerance_s, or None. CATCOR's
+    capture_snapshot passes *_FUTURES_FRONT instruments here — this
+    function itself is instrument-agnostic, it just finds whichever row is
+    closest under whatever key you pass."""
     with get_conn() as conn:
         row = conn.execute(
-            """SELECT series_id, ts, price FROM spot_price_tick
-               WHERE series_id = ?
+            """SELECT instrument, ts, price FROM spot_price
+               WHERE instrument = ?
                  AND ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?
                ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC
                LIMIT 1""",
-            (series_id, ts, tolerance_s, ts),
+            (instrument, ts, tolerance_s, ts),
         ).fetchone()
         return dict(row) if row else None
 
@@ -1245,12 +1335,21 @@ def get_forexfactory_week(week_key: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+_COT_PRICE_TICKER_TO_INSTRUMENT = {
+    "SLV": SLV_CLOSE, "GLD": GLD_CLOSE, "SI=F": SI_F_WEEKLY, "GC=F": GC_F_WEEKLY,
+}
+
+
 def upsert_prices(ticker: str, prices: dict[str, float]):
-    with get_conn() as conn:
-        conn.executemany(
-            "INSERT OR REPLACE INTO cot_prices (ticker, date, price) VALUES (?, ?, ?)",
-            [(ticker, date, price) for date, price in prices.items()],
-        )
+    """pipeline/run.py's weekly CoT-aligned price writer — 'ticker' is one
+    of SLV/GLD/SI=F/GC=F, mapped to its settlement_price instrument.
+    Replaces the old dedicated cot_prices table; pipeline/ stays
+    stdlib-only, this import is the same backend.db import it already
+    relies on (price_instruments.py is stdlib-free like units.py)."""
+    upsert_settlement_price_rows(
+        _COT_PRICE_TICKER_TO_INSTRUMENT[ticker],
+        [{"date": d, "price": p} for d, p in prices.items()],
+    )
 
 
 def get_silver_series() -> list[dict]:
@@ -1272,11 +1371,9 @@ def get_gold_series() -> list[dict]:
 
 
 def get_price_series(ticker: str) -> dict[str, float]:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT date, price FROM cot_prices WHERE ticker = ? ORDER BY date", (ticker,)
-        ).fetchall()
-        return {r["date"]: r["price"] for r in rows}
+    instrument = _COT_PRICE_TICKER_TO_INSTRUMENT[ticker]
+    rows = get_settlement_price_series(instrument)
+    return {r["date"]: r["price"] for r in rows if r["price"] is not None}
 
 
 def record_pipeline_run(ran_at: str):

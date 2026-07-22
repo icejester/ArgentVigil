@@ -45,9 +45,20 @@ FRED_SERIES_WSHOTSL = "WSHOTSL"        # Treasuries held outright
 FRED_SERIES_WSHOMCB = "WSHOMCB"        # MBS held outright
 FRED_SERIES_WLCFLPCL = "WLCFLPCL"      # discount window (primary credit) lending
 
-# Metal price history (Yahoo Finance), for the purchasing-power comparison chart
+# Metal price history (Yahoo Finance), for the purchasing-power comparison
+# chart. Settlement instrument keys (XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE)
+# now live in backend/price_instruments.py, not here — main.py resolves the
+# ticker-to-instrument mapping via price_instruments.YAHOO_DAILY_CLOSE_BY_METAL.
 METAL_PRICE_FETCH_YEARS = 20
-XAG_SERIES_ID = "XAG_CLOSE"
-XAU_SERIES_ID = "XAU_CLOSE"
 XAG_TICKER = "SI=F"  # COMEX silver futures, continuous front-month
 XAU_TICKER = "GC=F"  # COMEX gold futures, continuous front-month
+
+# Treasury Yields (Money Supply tab's Treasury Yields sub-panel) — all real
+# FRED series, daily, % units already (no conversion needed, unlike the
+# millions/billions divisor split the Composition series need). T10Y2Y is
+# FRED's own maintained 10Y-2Y spread, fetched directly rather than computed
+# from DGS10/DGS2 client-side, to avoid any rounding drift between the two.
+FRED_SERIES_DGS2 = "DGS2"        # 2-Year Treasury Constant Maturity yield
+FRED_SERIES_DGS10 = "DGS10"      # 10-Year Treasury Constant Maturity yield
+FRED_SERIES_DFII10 = "DFII10"    # 10-Year TIPS (real, inflation-indexed) yield
+FRED_SERIES_T10Y2Y = "T10Y2Y"    # 10Y minus 2Y spread — yield-curve-inversion signal

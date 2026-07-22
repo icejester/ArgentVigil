@@ -1,4 +1,4 @@
-# ArgentVigil v1.27.0
+# ArgentVigil v1.30.0
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 

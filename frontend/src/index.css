@@ -80,6 +80,56 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .app-title { font-size: 26px; font-weight: 700; letter-spacing: 0.03em; color: #e8ecf4; }
 .app-subtitle { font-size: 13px; color: #6b778d; }
 
+/* Header ticker — purely visual "stuff's running" pulse, not a trading
+   readout. Sits parallel with the "ArgentVigil" title, as the second
+   child of .app-header--split's row. Ag/Au panes sit side by side on one
+   line. Collapsed = label/price/change only, compact (no border/
+   background until opened, so it doesn't read as its own boxed panel).
+   When either pane opens, the whole ticker block wraps onto its own
+   full-width line (via .app-header--split's flex-wrap) and the open
+   pane(s) share that row evenly, each revealing its real chart. */
+.header-ticker {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 16px;
+  flex: 0 1 auto;
+}
+/* When either metal's pane is open, force this whole block to claim the
+   full row width so .app-header--split's flex-wrap drops it onto its own
+   line below the title, instead of squeezing a full-width chart into
+   whatever narrow space is left beside "ArgentVigil". */
+.header-ticker:has(.header-ticker-pane[open]) {
+  flex-basis: 100%;
+}
+.header-ticker-pane {
+  font-size: 12px;
+  border: none;
+  background: none;
+  flex: 0 0 auto;
+}
+.header-ticker-pane[open] {
+  border: 1px solid #2e3547;
+  background: #141820;
+  flex: 1 1 0;
+  min-width: 0;
+}
+.header-ticker-summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.header-ticker-label {
+  font-weight: 700;
+  width: 20px;
+  flex-shrink: 0;
+  text-align: left;
+}
+.header-ticker-price { color: #c8d0de; flex-shrink: 0; }
+.header-ticker-pct { font-size: 11px; flex-shrink: 0; }
+
 .staleness-label {
   font-size: 11px;
   font-weight: 400;

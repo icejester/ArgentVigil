@@ -163,22 +163,26 @@
     "curl": "curl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1wk&range=8y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F",
     "tables": [
       {
-        "name": "cot_prices",
+        "name": "settlement_price (SLV_CLOSE / GLD_CLOSE / SI=F_WEEKLY / GC_F_WEEKLY instruments)",
         "fields": [
           [
-            "ticker",
-            "PK \u2014 e.g. SI=F, GC=F"
+            "instrument",
+            "PK (with date, session) \u2014 SLV_CLOSE / GLD_CLOSE / SI=F_WEEKLY / GC_F_WEEKLY (price_instruments.py); ticker\u2192instrument mapping is db._COT_PRICE_TICKER_TO_INSTRUMENT"
           ],
           [
             "date",
             "PK \u2014 weekly close date"
           ],
           [
+            "session",
+            "PK \u2014 'daily' (this instrument only ever has one print/week)"
+          ],
+          [
             "price",
             "Close price"
           ]
         ],
-        "note": "Upsert (ticker+date), not append-only \u2014 safe to re-fetch/correct."
+        "note": "Upsert, not append-only \u2014 safe to re-fetch/correct. Same settlement_price table the lbma_fix and metals_prices sources also write to, under different instrument values \u2014 replaces the old dedicated cot_prices table. pipeline/run.py calls db.upsert_prices(ticker, prices), which resolves the ticker to its settlement_price instrument internally; pipeline/ itself stays stdlib-only (price_instruments.py has no third-party dependencies, same constraint units.py carries)."
       }
     ]
   },
@@ -437,33 +441,11 @@
     "curl": "curl \"https://metalcharts.org/api/prices\" \\\n  -H \"x-mc-token: <token>\" \\\n  -H \"Referer: https://metalcharts.org/comex/silver\" \\\n  -H \"x-requested-with: XMLHttpRequest\"\n# same metalcharts.org auth flow as the Silver COMEX source above",
     "tables": [
       {
-        "name": "spot_price_snapshot",
+        "name": "spot_price",
         "fields": [
           [
-            "series_id",
-            "PK (with date) \u2014 e.g. XAG, XAU"
-          ],
-          [
-            "date",
-            "PK \u2014 one row per calendar day, overwritten on every fast-tier tick"
-          ],
-          [
-            "price",
-            "Latest price"
-          ],
-          [
-            "change_pct_24h",
-            "24h % change, from upstream"
-          ]
-        ],
-        "note": "Not a true intraday series (one row/day, overwritten) \u2014 see spot_price_tick for that."
-      },
-      {
-        "name": "spot_price_tick",
-        "fields": [
-          [
-            "series_id",
-            "PK (with ts) \u2014 \"XAG\"/\"XAU\" (real metalcharts.org spot ticks, this card's source) or \"XAG_FUTURES\"/\"XAU_FUTURES\" (Yahoo SI=F/GC=F futures bars, a different instrument backfilled by CATCOR \u2014 see the catcor_reactions card)"
+            "instrument",
+            "PK (with ts) \u2014 XAG_SPOT/XAU_SPOT (real metalcharts.org spot ticks, this card's source) or XAG_FUTURES_FRONT/XAU_FUTURES_FRONT (Yahoo SI=F/GC=F front-month-continuous futures bars, a different instrument backfilled by CATCOR \u2014 see the catcor_reactions card). A closed instrument set (backend/price_instruments.py) so these can never collide under one key."
           ],
           [
             "ts",
@@ -472,12 +454,16 @@
           [
             "price",
             "Price at that tick"
+          ],
+          [
+            "change_pct_24h",
+            "24h % change, from upstream \u2014 only ever populated for *_SPOT rows (metalcharts.org supplies it for free on every poll; Yahoo futures bars carry no equivalent field, so *_FUTURES_FRONT rows leave this NULL)"
           ]
         ],
-        "note": "Append-only (INSERT OR IGNORE) \u2014 two distinct series_id families share this table. \"XAG\"/\"XAU\" (this source's fast-tier poll, ~60s cadence) power GET /api/prices/db/ticks and the Paper Leverage panel's price chart. \"XAG_FUTURES\"/\"XAU_FUTURES\" (Yahoo futures, ~5m cadence, see catcor_reactions) power CATCOR's event-reaction snapshot capture only \u2014 never the spot chart. These two used to collide under the same \"XAG\"/\"XAU\" keys, a real bug (futures prints running ~0.3-0.6 higher than spot, interleaved on the same chart line, producing a sawtooth) fixed by giving Yahoo's bars their own series_id."
+        "note": "Append-only (INSERT OR IGNORE) \u2014 a real tick is never revised. Two distinct instrument families share this table. XAG_SPOT/XAU_SPOT (this source's fast-tier poll, ~60s cadence) power GET /api/prices/db and GET /api/prices/db/ticks (the Paper Leverage panel's price chart, via db.get_price_backfill \u2014 latest-snapshot reads (/api/prices/db) also derive from this table's MAX(ts) row per instrument, replacing an earlier separate one-row-per-day spot_price_snapshot table). XAG_FUTURES_FRONT/XAU_FUTURES_FRONT (Yahoo futures, ~5m cadence, see catcor_reactions) power CATCOR's event-reaction snapshot capture only \u2014 never the spot chart. These two used to collide under shared \"XAG\"/\"XAU\" string keys before price_instruments.py's closed set existed, a real bug (futures prints running ~0.3-0.6 higher than spot, interleaved on the same chart line, producing a sawtooth) fixed by giving Yahoo's bars their own instrument name."
       }
     ],
-    "note": "GET /api/prices/db/ticks?series_id=&hours= (Paper Leverage panel's 6H/12H/24H/48H/1M/3M/6M/12M price chart) stitches three resolutions since no single table covers every window: spot_price_tick's \"XAG\"/\"XAU\" rows (60s real spot ticks, only from whenever the fast tier first ran \u2014 currently back to ~2026-04-22), then fred_observations' XAG_DAILY_CLOSE/XAU_DAILY_CLOSE (daily, ~120 days), then XAG_CLOSE/XAU_CLOSE (month-end, back to 2006) for anything older. See db.get_price_history. Never reads spot_price_tick's \"XAG_FUTURES\"/\"XAU_FUTURES\" rows (CATCOR-only, see catcor_reactions)."
+    "note": "GET /api/prices/db/ticks?series_id=&hours= (Paper Leverage panel's 6H/12H/24H/48H/1M/3M/6M/12M price chart) stitches two resolutions since no single table covers every window: spot_price's XAG_SPOT/XAU_SPOT rows (60s real spot ticks, only from whenever the fast tier first ran \u2014 currently back to ~2026-04-22), then settlement_price's XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE real daily closes for anything older. See db.get_price_backfill. Never reads spot_price's XAG_FUTURES_FRONT/XAU_FUTURES_FRONT rows (CATCOR-only, see catcor_reactions)."
   },
   {
     "key": "lbma_fix",
@@ -489,14 +475,14 @@
     "curl": "curl \"https://www.goldapi.io/api/XAU/USD/$(date +%Y%m%d)\" \\\n  -H \"x-access-token: ${GAPI_API_KEY}\"\n# silver: /api/XAG/USD/{YYYYMMDD}",
     "tables": [
       {
-        "name": "lbma_fix",
+        "name": "settlement_price (XAG_LBMA / XAU_LBMA instruments)",
         "fields": [
           [
-            "metal",
-            "PK \u2014 'XAU' or 'XAG'"
+            "instrument",
+            "PK (with date, session) \u2014 'XAG_LBMA' or 'XAU_LBMA'"
           ],
           [
-            "fix_type",
+            "session",
             "PK \u2014 'AM' for gold (GoldAPI.io exposes no PM-fix-distinct field \u2014 gold's real 15:00 London PM fix is NOT available from this source), 'daily' for silver"
           ],
           [
@@ -504,7 +490,7 @@
             "PK \u2014 calendar date requested, not a verified per-metal fix-moment timestamp (see note)"
           ],
           [
-            "price_usd",
+            "price",
             "Fix price, USD/oz"
           ],
           [
@@ -512,7 +498,7 @@
             "Row upsert timestamp"
           ]
         ],
-        "note": "Upsert (INSERT ... ON CONFLICT), not append-only. Confirmed live against a real API key: GoldAPI.io stamps BOTH gold and silver historical rows with an identical 10:30:00Z timestamp regardless of metal \u2014 real LBMA fix times are gold AM 10:30 UTC, gold PM 15:00 UTC, silver 12:00 UTC (winter), so silver's 10:30 stamp does not match its real fix time. The date field is treated as \"which calendar day this fix is for,\" not a trustworthy fix-moment timestamp. price_usd is presumed close to the real LBMA print (exchange=\"LBMA\" in the raw response, and gold's value differs meaningfully from the bare current-price endpoint's FOREXCOM spot value) but this has not been independently cross-checked against LBMA's own published fix, since LBMA's official data requires a paid IBA license (see price-spec.md)."
+        "note": "Upsert (INSERT ... ON CONFLICT), not append-only \u2014 same settlement_price table also holds Yahoo daily closes and ETF/COT-week closes under other instrument values (see the metals_prices card and the FRED / ALFRED card's cot_pipeline price rows); LBMA fixes are just one instrument family within it. Confirmed live against a real API key: GoldAPI.io stamps BOTH gold and silver historical rows with an identical 10:30:00Z timestamp regardless of metal \u2014 real LBMA fix times are gold AM 10:30 UTC, gold PM 15:00 UTC, silver 12:00 UTC (winter), so silver's 10:30 stamp does not match its real fix time. The date field is treated as \"which calendar day this fix is for,\" not a trustworthy fix-moment timestamp. price is presumed close to the real LBMA print (exchange=\"LBMA\" in the raw response, and gold's value differs meaningfully from the bare current-price endpoint's FOREXCOM spot value) but this has not been independently cross-checked against LBMA's own published fix, since LBMA's official data requires a paid IBA license (see price-architecture-spec.md)."
       }
     ]
   },
@@ -584,19 +570,20 @@
   {
     "key": "fred",
     "label": "FRED / ALFRED",
-    "origin": "FRED API (money supply) and ALFRED point-in-time vintage API (CATCOR actuals) \u2014 requires FRED_API_KEY",
+    "origin": "FRED API (money supply) and ALFRED point-in-time vintage API (CATCOR actuals) \u2014 requires FRED_API_KEY. Also documents the Yahoo Finance daily-close fetch (source_key metals_prices) that writes this card's settlement_price table, since it's the same table family other sources' price rows also live in \u2014 see the settlement_price (XAG_YAHOO_DAILY_CLOSE / XAU_YAHOO_DAILY_CLOSE instruments) entry below.",
     "sourceKeys": [
       "money_supply",
-      "catcor_consensus_actuals"
+      "catcor_consensus_actuals",
+      "metals_prices"
     ],
-    "curl": "# FRED (Money Supply)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n\n# ALFRED (CATCOR point-in-time vintage, e.g. CPI actual as-of the day after a release)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=${FRED_API_KEY}&file_type=json&realtime_start=2026-01-15&realtime_end=2026-01-15&sort_order=desc&limit=2\"",
+    "curl": "# FRED (Money Supply)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n\n# FRED (Treasury Yields — same call shape, different series_id)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n# also: DGS2, DFII10, T10Y2Y\n\n# ALFRED (CATCOR point-in-time vintage, e.g. CPI actual as-of the day after a release)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=${FRED_API_KEY}&file_type=json&realtime_start=2026-01-15&realtime_end=2026-01-15&sort_order=desc&limit=2\"\n\n# Yahoo Finance (metals_prices — real daily closes, resampled to month-end at read time, not fetch time)\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=20y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F",
     "tables": [
       {
         "name": "fred_observations",
         "fields": [
           [
             "series_id",
-            "PK (with date) \u2014 one of 8 values, see the split-out rows below",
+            "PK (with date) \u2014 one of 12 values, see the split-out rows below",
             "\u2014"
           ],
           [
@@ -655,6 +642,27 @@
         "note": "Fed Balance Sheet Composition (fed-balance-spec.md) \u2014 a look inside WALCL's top-line number. All 5 candidate H.4.1 series now shipped (v1 shipped WRESBAL/RRPONTSYD only; WSHOTSL/WSHOMCB/WLCFLPCL added in a follow-up pass). Fetched by /api/fred/money-supply/refresh alongside M2SL/WALCL/CPIAUCSL, same source_key (money_supply). Raw value only, no YoY yet \u2014 frontend defaults WRESBAL/RRPONTSYD visible, the other three hidden behind a checkbox to avoid an overcrowded initial chart."
       },
       {
+        "name": "fred_observations \u2014 DGS2, DGS10, DFII10, T10Y2Y",
+        "fields": [
+          [
+            "series_id",
+            "'DGS2' / 'DGS10' / 'DFII10' / 'T10Y2Y' \u2014 2-Year, 10-Year, 10-Year TIPS (real), and 10Y-2Y spread Treasury yields",
+            "Money Supply tab \u2014 Treasury Yields chart"
+          ],
+          [
+            "date",
+            "Observation date (all four daily, FRED's native cadence)",
+            "Chart x-axis"
+          ],
+          [
+            "value",
+            "Percent \u2014 already FRED's native unit for all four, no divisor/conversion needed (unlike the Composition series above)",
+            "\u2014"
+          ]
+        ],
+        "note": "Added alongside M2SL/WALCL/CPIAUCSL in the same /api/fred/money-supply/refresh call, same source_key (money_supply) \u2014 no new source or table. T10Y2Y is FRED's own maintained 10Y-2Y spread, fetched directly rather than computed client-side from DGS10/DGS2, to avoid any rounding drift. DFII10 (10-Year real/TIPS yield) is the series most commonly cited as gold's opportunity-cost driver, since gold pays no yield of its own \u2014 see the Treasury Yields legend's eli5 text for the full framing. Raw value only, no derived series."
+      },
+      {
         "name": "fred_observations \u2014 CPIAUCSL",
         "fields": [
           [
@@ -697,67 +705,30 @@
         "note": "ALFRED only \u2014 not fetched via the Money Supply refresh path (backend/catcor.py's _series_id_for_event_type). Both vintage prints _fetch_alfred_change diffs (this month's + prior month's, as ALFRED reported them the day after release) are persisted here before the diff is returned and written to event_calendar.actual_value \u2014 only accumulates once CATCOR's actuals loop has run against a real NFP event, so a fresh clone/reset DB shows 0 rows here until then."
       },
       {
-        "name": "fred_observations \u2014 XAG_CLOSE, XAU_CLOSE",
+        "name": "settlement_price (XAG_YAHOO_DAILY_CLOSE / XAU_YAHOO_DAILY_CLOSE instruments)",
         "fields": [
           [
-            "series_id",
-            "'XAG_CLOSE' or 'XAU_CLOSE'",
-            "Money Supply tab \u2014 Dollars vs Silver vs Gold as Purchasing Power chart"
+            "instrument",
+            "'XAG_YAHOO_DAILY_CLOSE' or 'XAU_YAHOO_DAILY_CLOSE'",
+            "Money Supply tab (resampled to month-end at read time) \u2014 Dollars vs Silver vs Gold as Purchasing Power chart; CATCOR panel \u2014 price-reaction capture fallback; Paper Leverage panel's long-window price chart"
           ],
           [
             "date",
-            "Month-end date (last trading day on/before month-end)",
+            "Real daily date \u2014 every trading day Yahoo returns, not resampled",
             "Chart x-axis"
           ],
           [
-            "value",
-            "USD/oz close price, resampled from Yahoo daily closes to one row per month",
-            "\u2014"
-          ]
-        ],
-        "note": "Fetched by /api/metals/prices/refresh, on-demand only (source_key metals_prices). NOT read by CATCOR \u2014 see XAG_DAILY_CLOSE/XAU_DAILY_CLOSE below for that."
-      },
-      {
-        "name": "fred_observations \u2014 XAG_DAILY_CLOSE, XAU_DAILY_CLOSE",
-        "fields": [
-          [
-            "series_id",
-            "'XAG_DAILY_CLOSE' or 'XAU_DAILY_CLOSE'",
-            "CATCOR panel \u2014 price-reaction capture fallback"
-          ],
-          [
-            "date",
-            "Daily date, ~120 days back",
+            "session",
+            "'daily' (this instrument only ever has one print/day)",
             "\u2014"
           ],
           [
-            "value",
+            "price",
             "USD/oz close price, unresampled Yahoo daily close",
             "\u2014"
           ]
         ],
-        "note": "Fetched by catcor.py's backfill_daily_closes (catcor_snapshot's loop). Deliberately separate keys from XAG_CLOSE/XAU_CLOSE above \u2014 those are month-end-only and have no daily granularity, a real bug caught during CATCOR's build when the fallback silently returned NULL against the monthly-only keys. Used only when no spot_price_tick exists near an event window."
-      }
-    ]
-  },
-  {
-    "key": "metals_prices_monthly",
-    "label": "Yahoo Finance (monthly, Money Supply)",
-    "origin": "Yahoo Finance chart API \u2014 SI=F/GC=F, httpx directly in main.py (separate from pipeline/price_fetch.py)",
-    "sourceKeys": [
-      "metals_prices"
-    ],
-    "curl": "curl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=5y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F \u2014 resampled to one row per month-end server-side",
-    "tables": [
-      {
-        "name": "fred_observations (XAG_CLOSE / XAU_CLOSE keys)",
-        "fields": [
-          [
-            "value",
-            "Last trading day on/before each month-end \u2014 feeds Money Supply's purchasing-power comparison"
-          ]
-        ],
-        "note": "Full field breakdown lives under the FRED / ALFRED card's fred_observations \u2014 XAG_CLOSE, XAU_CLOSE table \u2014 this card documents the fetch route (/api/metals/prices/refresh) that writes those rows, not a separate table."
+        "note": "One real daily-close series per metal now serves every consumer that used to read from three differently-shaped places (price-architecture-spec.md's Fetch consolidation): Money Supply's purchasing-power chart resamples this to month-end at READ time (db.get_settlement_price_by_month / main.py's _resample_month_end) rather than a separately-fetched/separately-stored monthly series; CATCOR's price-reaction fallback (catcor.py's _daily_close_fallback) and the Paper Leverage panel's long-window price chart (db.get_price_backfill) both read the same real daily rows directly. Fetched by /api/metals/prices/refresh (source_key metals_prices, fires at startup + on-demand + shared with CATCOR's own startup chain \u2014 see catcor_startup) via the shared backend/yahoo_prices.py fetcher. Upsert, diffed against the currently-stored price before writing \u2014 a routine cadence tick re-fetching the full multi-year range does not rewrite unchanged history, only genuinely new/revised rows (price-architecture-spec.md Q3)."
       }
     ]
   },
@@ -858,12 +829,12 @@
   {
     "key": "catcor_reactions",
     "label": "CATCOR \u2014 price reaction capture",
-    "origin": "Computed from spot_price_tick's XAG_FUTURES/XAU_FUTURES rows (Yahoo SI=F/GC=F futures bars \u2014 NOT the spot chart's XAG/XAU rows, a deliberately separate series_id family) / fred_observations (XAG_DAILY_CLOSE etc.) around each event's scheduled_time",
+    "origin": "Computed from spot_price's XAG_FUTURES_FRONT/XAU_FUTURES_FRONT rows (Yahoo SI=F/GC=F futures bars \u2014 NOT the spot chart's XAG_SPOT/XAU_SPOT rows, a deliberately separate instrument in price_instruments.py's closed set) / settlement_price's XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE rows (fallback \u2014 same daily-close instrument the metals_prices card documents, no longer a CATCOR-only series) around each event's scheduled_time",
     "sourceKeys": [
       "catcor_snapshot",
       "catcor_startup"
     ],
-    "curl": "# no upstream call \u2014 reads spot_price_tick / fred_observations already in SQLite.\n# The ticks themselves come from Yahoo's intraday backfill:\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=5m&range=60d\" \\\n  -H \"User-Agent: Mozilla/5.0\"\n# daily-close fallback (older events, past Yahoo's 5m-interval window):\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=120d\" \\\n  -H \"User-Agent: Mozilla/5.0\"",
+    "curl": "# no upstream call \u2014 reads spot_price / settlement_price already in SQLite.\n# The ticks themselves come from Yahoo's intraday backfill:\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=5m&range=60d\" \\\n  -H \"User-Agent: Mozilla/5.0\"\n# daily-close fallback (older events, past Yahoo's 5m-interval window) is the SAME\n# fetch as the metals_prices source (see the FRED / ALFRED card) \u2014 no separate call.",
     "tables": [
       {
         "name": "macro_price_reaction",
