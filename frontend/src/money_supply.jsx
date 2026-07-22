@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { nearestRowDate } from "./date_utils";
 import {
   ComposedChart,
+  LineChart,
   Area,
   Bar,
   Line,
@@ -38,6 +39,14 @@ const XAG_COLOR = "#9aa5b1";
 const WIN_COLOR = "#4caf76";
 const LOSS_COLOR = "#e05252";
 
+// Treasury Yields sub-panel — each series its own distinct shade, no
+// group-color convention needed (unlike Composition's assets/liabilities
+// split) since these are 4 flat, ungrouped % series on one shared axis.
+const DGS2_COLOR = "#7b9fff";
+const DGS10_COLOR = "#e0a84c";
+const DFII10_COLOR = "#4caf76";
+const T10Y2Y_COLOR = "#c9536b";
+
 // M2SL is monthly with a ~4-6wk publication lag; WALCL is weekly with only a
 // few days' lag. Different thresholds reflect each series' own normal cadence.
 const M2_STALE_DAYS = 45;
@@ -63,6 +72,25 @@ function xTicks(data, maxTicks = 8) {
   const n = Math.min(data.length, maxTicks);
   const step = Math.floor(data.length / n) || 1;
   return data.filter((_, i) => i % step === 0).map((r) => r.date);
+}
+
+// All 4 Treasury yield series are real daily FRED series in the same %
+// units already — a plain date-key merge, no forward-fill/ratio math
+// needed (unlike mergeSeries/mergeComposition below, which bridge series
+// on genuinely different cadences).
+function mergeYields(dgs2, dgs10, dfii10, t10y2y) {
+  const byDate = {};
+  for (const [key, rows] of [
+    ["dgs2", dgs2],
+    ["dgs10", dgs10],
+    ["dfii10", dfii10],
+    ["t10y2y", t10y2y],
+  ]) {
+    for (const r of rows || []) {
+      byDate[r.date] = { ...(byDate[r.date] || {}), date: r.date, [key]: r.value };
+    }
+  }
+  return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
 }
 
 // M2 (monthly) and WALCL (weekly) have different date grids — merge on date
@@ -259,6 +287,37 @@ const QE_QT_LEGEND_SERIES = [
     color: RATIO_COLOR,
     dashed: true,
     eli5: "The Fed's total assets level itself (Treasuries + MBS + Discount Window Lending), right axis, trillions USD — plotted alongside its own week-over-week change so the level and the momentum are visible on one chart. Same totalAssets figure shown in the Fed Balance Sheet Composition chart above.",
+  },
+];
+
+// Treasury Yields sub-panel's legend — same shape/behavior as every other
+// legend in this panel (click to highlight + reveal eli5). Flat, ungrouped
+// series (no assets/liabilities split like Composition), all sharing one
+// % axis, so no dashed/gradient swatches needed here.
+const YIELDS_LEGEND_SERIES = [
+  {
+    key: "dgs2",
+    legendLabel: "2-Year Yield",
+    color: DGS2_COLOR,
+    eli5: "Market yield on the 2-Year Treasury, daily — read as the market's near-term expectation for where the Fed funds rate is headed over the next couple years. Rises when the market expects tighter policy (higher rates for longer), falls when it expects cuts.",
+  },
+  {
+    key: "dgs10",
+    legendLabel: "10-Year Yield",
+    color: DGS10_COLOR,
+    eli5: "Market yield on the 10-Year Treasury, daily — the most commonly cited long-term rate benchmark (mortgage rates, corporate borrowing costs, and \"risk-free rate\" comparisons all reference this). Reflects longer-run growth/inflation expectations, not just near-term Fed policy.",
+  },
+  {
+    key: "dfii10",
+    legendLabel: "10-Year Real Yield (TIPS)",
+    color: DFII10_COLOR,
+    eli5: "The 10-Year yield adjusted for expected inflation (TIPS-derived) — the rate most often cited as gold's actual competing return, since gold pays no yield of its own. When real yields rise, holding gold instead of a real-yielding bond costs more in forgone interest; when real yields fall (or go negative), that cost shrinks or reverses, which is the textbook mechanism behind gold's inverse real-rate relationship. Not a guarantee gold moves opposite this on any given day — plenty of other forces (dollar strength, physical demand, positioning) move gold too — but this is the one rate series most directly tied to gold's opportunity cost.",
+  },
+  {
+    key: "t10y2y",
+    legendLabel: "10Y–2Y Spread",
+    color: T10Y2Y_COLOR,
+    eli5: "10-Year yield minus 2-Year yield — the classic yield-curve slope. Negative (inverted) has historically preceded most U.S. recessions by 12-18 months; it means the market expects the Fed to cut rates more than it's currently signaling. Shown here as context alongside the two rates it's built from, not as a standalone prediction.",
   },
 ];
 
@@ -641,6 +700,21 @@ function QeQtTooltipContent({ active, label, qeQtRows }) {
   );
 }
 
+function YieldsTooltipContent({ active, label, yieldsMerged }) {
+  if (!active || !label) return null;
+  const row = yieldsMerged.find((r) => r.date === label);
+  if (!row) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      {row.dgs2 != null && <div style={{ color: DGS2_COLOR }}>2-Year: {row.dgs2.toFixed(2)}%</div>}
+      {row.dgs10 != null && <div style={{ color: DGS10_COLOR }}>10-Year: {row.dgs10.toFixed(2)}%</div>}
+      {row.dfii10 != null && <div style={{ color: DFII10_COLOR }}>10-Year Real (TIPS): {row.dfii10.toFixed(2)}%</div>}
+      {row.t10y2y != null && <div style={{ color: T10Y2Y_COLOR }}>10Y–2Y Spread: {row.t10y2y >= 0 ? "+" : ""}{row.t10y2y.toFixed(2)}%</div>}
+    </div>
+  );
+}
+
 function fmtUsd(v) {
   if (v == null) return "—";
   return `$${v.toFixed(2)}`;
@@ -737,6 +811,8 @@ export default function MoneySupply() {
   // Same click-to-toggle-ELI5 + chart-highlight legend pattern applied to
   // the QE/QT chart, per UI_STANDARDS.md.
   const [clickedQeQtKey, setClickedQeQtKey] = useState(null);
+  // Same pattern applied to the Treasury Yields chart's 4-entry legend.
+  const [clickedYieldsKey, setClickedYieldsKey] = useState(null);
 
   // Safety net: if the mouse button is released outside the chart's own SVG
   // (e.g. dragged off it before releasing), the chart's own onMouseUp never
@@ -813,6 +889,12 @@ export default function MoneySupply() {
   const merged = useMemo(() => (data ? mergeSeries(data.m2, data.walcl) : []), [data]);
   const ticks = useMemo(() => xTicks(merged), [merged]);
 
+  const yieldsMerged = useMemo(
+    () => (data ? mergeYields(data.dgs2, data.dgs10, data.dfii10, data.t10y2y) : []),
+    [data]
+  );
+  const yieldsTicks = useMemo(() => xTicks(yieldsMerged), [yieldsMerged]);
+
   const composition = useMemo(() => (data ? mergeComposition(data) : []), [data]);
   // Fewer ticks than the default 8 — this chart shares its row with the pie
   // (see the flex layout below), so it has less width than the other
@@ -863,6 +945,7 @@ export default function MoneySupply() {
   // (different charts have different date grids that rarely share exact
   // date strings).
   const pinnedDateMerged = nearestRowDate(merged, pinnedDate);
+  const pinnedDateYields = nearestRowDate(yieldsMerged, pinnedDate);
   const pinnedDateComposition = nearestRowDate(composition, pinnedDate);
   // QE/QT renders a filtered subset of `composition` (only rows with a real
   // assetsChangeBillions), a different date grid than the unfiltered
@@ -1540,6 +1623,125 @@ export default function MoneySupply() {
           {clickedQeQtKey && (
             <div className="comex-panel-note comex-panel-note--eli5">
               {QE_QT_LEGEND_SERIES.find((d) => d.key === clickedQeQtKey)?.eli5}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Hit Refresh to fetch from FRED, or run the refresh endpoint once to seed the database.</div>
+        </div>
+      )}
+      </div>
+      </details>
+
+      <details className="collapsible-pane" open>
+      <summary className="collapsible-pane-title">
+        Treasury Yields
+        {yieldsMerged.length > 0 && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {(() => {
+              const row = pinnedDate
+                ? yieldsMerged.find((r) => r.date === pinnedDateYields)
+                : yieldsMerged[yieldsMerged.length - 1];
+              if (!row) return null;
+              return (
+                <>
+                  {row.date} · 2Y {row.dgs2 != null ? `${row.dgs2.toFixed(2)}%` : "—"} · 10Y{" "}
+                  {row.dgs10 != null ? `${row.dgs10.toFixed(2)}%` : "—"} · 10Y–2Y{" "}
+                  {row.t10y2y != null ? `${row.t10y2y >= 0 ? "+" : ""}${row.t10y2y.toFixed(2)}%` : "—"}
+                </>
+              );
+            })()}
+          </span>
+        )}
+      </summary>
+      <div className="collapsible-pane-body">
+      <div className="comex-panel-note">
+        Real FRED Treasury series, daily. Gold's most-cited "opportunity cost" driver is the
+        10-Year real (TIPS) yield — see that series' legend entry below for why. Descriptive
+        historical series — no thresholds, no predictions.
+      </div>
+      {yieldsMerged.length > 0 ? (
+        <div>
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart
+              data={yieldsMerged}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onClick={(state) => {
+                if (state?.activeLabel) setPinnedDate(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={yieldsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              {/* Two axes, not one — dgs2/dgs10/dfii10 are yield LEVELS
+                  (~2-5%), t10y2y is a SPREAD between two of them (~0.3-0.5%,
+                  can go negative on an inversion). Forcing all four onto one
+                  axis (Recharts' default domain includes 0) squashed
+                  everything into a ~0-5% range where the levels' real day-
+                  to-day movement (tenths of a point) looked flat and the
+                  spread was pinned near the bottom — confirmed against real
+                  fetched data (2yr ~4.18%, 10yr ~4.55%, spread ~0.39%) that
+                  the underlying series DO move, only the shared axis was
+                  hiding it. dataMin/dataMax (not [0,"auto"]) so each axis
+                  fills its own real range instead of both including zero. */}
+              <YAxis
+                yAxisId="level"
+                domain={["dataMin - 0.1", "dataMax + 0.1"]}
+                tickFormatter={(v) => `${v.toFixed(1)}%`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Yield %", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <YAxis
+                yAxisId="spread"
+                orientation="right"
+                domain={["dataMin - 0.05", "dataMax + 0.05"]}
+                tickFormatter={(v) => `${v.toFixed(2)}%`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "10Y–2Y Spread", angle: 90, position: "insideRight", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip content={<YieldsTooltipContent yieldsMerged={yieldsMerged} />} />
+              {pinnedDateYields && (
+                <ReferenceLine yAxisId="level" x={pinnedDateYields} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+              )}
+              <ReferenceLine yAxisId="spread" y={0} stroke="#5a6278" strokeDasharray="2 4" />
+              {YIELDS_LEGEND_SERIES.map((entry) => (
+                <Line
+                  key={entry.key}
+                  yAxisId={entry.key === "t10y2y" ? "spread" : "level"}
+                  type="monotone"
+                  dataKey={entry.key}
+                  stroke={entry.color}
+                  dot={false}
+                  strokeWidth={clickedYieldsKey === entry.key ? 3 : 1.5}
+                  strokeOpacity={clickedYieldsKey && clickedYieldsKey !== entry.key ? 0.25 : 1}
+                  connectNulls
+                />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+          {pinnedDateYields && (
+            <div style={{ marginTop: 4 }}>
+              <YieldsTooltipContent active label={pinnedDateYields} yieldsMerged={yieldsMerged} />
+            </div>
+          )}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {YIELDS_LEGEND_SERIES.map((entry) => (
+              <button
+                key={entry.key}
+                className={`comex-legend-item legend-btn-row${clickedYieldsKey === entry.key ? " legend-btn-row--baseline" : ""}`}
+                onClick={() => setClickedYieldsKey((k) => (k === entry.key ? null : entry.key))}
+              >
+                <span className="comex-legend-swatch" style={{ background: entry.color }} />
+                <span>
+                  <strong>{entry.legendLabel}</strong>
+                </span>
+              </button>
+            ))}
+          </div>
+          {clickedYieldsKey && (
+            <div className="comex-panel-note comex-panel-note--eli5">
+              {YIELDS_LEGEND_SERIES.find((d) => d.key === clickedYieldsKey)?.eli5}
             </div>
           )}
         </div>

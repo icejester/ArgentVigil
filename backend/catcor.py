@@ -17,9 +17,23 @@ import httpx
 
 from seed_data import catcor_events_seed as seed
 from . import db
+from .price_instruments import FUTURES_FRONT_BY_METAL, YAHOO_DAILY_CLOSE_BY_METAL
+from .yahoo_prices import bars_to_ticks, fetch_yahoo_bars
 
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+FRED_RELEASE_DATES_BASE = "https://api.stlouisfed.org/fred/release/dates"
 YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+
+# ALFRED release_id per event_type this module can auto-seed from
+# fred/release/dates, replacing what used to be a hand-maintained,
+# periodically-stale date list in catcor_events_seed.py's
+# CPI_RELEASES/NFP_RELEASES. FOMC has no ALFRED release_id (the Fed's own
+# meeting calendar isn't a BLS/Census "release") and stays seeded from the
+# static FOMC_MEETINGS list.
+ALFRED_RELEASE_ID = {
+    "CPI": 10,
+    "NFP": 50,
+}
 
 # ForexFactory's own free, no-key JSON calendar export — real consensus/
 # forecast figures. Only a "thisweek" (current Sun-Sat calendar week)
@@ -59,14 +73,15 @@ XAG_TICKER = "SI=F"
 XAU_TICKER = "GC=F"
 METALS = {"XAG": XAG_TICKER, "XAU": XAU_TICKER}
 
-# spot_price_tick's "XAG"/"XAU" series_ids belong exclusively to main.py's
+# spot_price's XAG_SPOT/XAU_SPOT instruments belong exclusively to main.py's
 # fast-tier metalcharts.org spot poll — a genuinely different instrument
 # from Yahoo's SI=F/GC=F futures bars backfilled here, and the two used to
-# collide under the same series_id (real bug: futures prints running
-# ~0.3-0.6 higher than spot, interleaved in the same series, producing a
-# sawtooth in PriceHistoryChart). Yahoo's bars get their own series_id
-# family, same non-colliding-key precedent as DAILY_CLOSE_SERIES_ID below.
-FUTURES_SERIES_ID = {"XAG": "XAG_FUTURES", "XAU": "XAU_FUTURES"}
+# collide under the same series_id before price_instruments.py's closed
+# instrument set existed (real bug: futures prints running ~0.3-0.6 higher
+# than spot, interleaved in the same series, producing a sawtooth in
+# PriceHistoryChart). Yahoo's bars get their own instrument family
+# (*_FUTURES_FRONT, price_instruments.FUTURES_FRONT_BY_METAL).
+FUTURES_SERIES_ID = FUTURES_FRONT_BY_METAL
 
 # Window offsets in minutes relative to scheduled_time.
 WINDOWS = {
@@ -125,6 +140,93 @@ def seed_events(days_back: int = 90, days_forward: int = 60):
     if rows:
         db.upsert_event_rows(rows)
     return len(rows)
+
+
+async def _fetch_release_dates(client: httpx.AsyncClient, release_id: int, realtime_start: str, realtime_end: str) -> list[str]:
+    """Real (not scheduled-and-later-revised) release dates for release_id
+    within [realtime_start, realtime_end], as published by ALFRED's
+    fred/release/dates endpoint — the same endpoint the seed file's own
+    docstring says was used to hand cross-check CPI_RELEASES/NFP_RELEASES
+    once, on 2026-07-04. Returns YYYY-MM-DD strings, ascending."""
+    api_key = os.environ["FRED_API_KEY"]
+    resp = await client.get(
+        FRED_RELEASE_DATES_BASE,
+        params={
+            "release_id": release_id,
+            "api_key": api_key,
+            "file_type": "json",
+            "realtime_start": realtime_start,
+            "realtime_end": realtime_end,
+            "sort_order": "asc",
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [d["date"] for d in data.get("release_dates", [])]
+
+
+def seed_events_from_alfred_sync(release_dates_by_type: dict[str, list[str]], days_back: int = 90, days_forward: int = 60) -> int:
+    """Build and upsert event_calendar rows for CPI/NFP from already-fetched
+    ALFRED release dates. Split out from seed_events_from_alfred so the
+    row-building/window-filtering logic (identical in shape to
+    seed_events()'s own loop over the static seed list) is testable without
+    a live client. release_dates_by_type is {"CPI": [...], "NFP": [...]}."""
+    today = datetime.now(timezone.utc).date()
+    window_start = (today - timedelta(days=days_back)).isoformat()
+    window_end = (today + timedelta(days=days_forward)).isoformat()
+
+    rows = []
+    for event_type, dates in release_dates_by_type.items():
+        for date_str in dates:
+            if not (window_start <= date_str <= window_end):
+                continue
+            rows.append({
+                "event_id": _event_id(event_type, date_str),
+                "event_name": seed.EVENT_NAMES[event_type],
+                "event_type": event_type,
+                "scheduled_time": _et_to_utc_iso(date_str, seed.RELEASE_TIME_ET),
+                "consensus_value": None,
+                "actual_value": None,
+                "surprise_delta": None,
+                "source_url": seed.SOURCE_URLS[event_type],
+                "source_tier": seed.SOURCE_TIERS[event_type],
+            })
+    if rows:
+        db.upsert_event_rows(rows)
+    return len(rows)
+
+
+async def seed_events_from_alfred(client: httpx.AsyncClient, days_back: int = 90, days_forward: int = 60) -> int:
+    """Live replacement for catcor_events_seed.py's hand-maintained
+    CPI_RELEASES/NFP_RELEASES lists — fetches real release dates from
+    ALFRED's fred/release/dates for each event_type in ALFRED_RELEASE_ID
+    and upserts them the same way seed_events() does for the static FOMC
+    list. INSERT OR REPLACE means a row already carrying a
+    research_session_id/direction/consensus_value/actual_value would be
+    clobbered back to NULL by a re-seed here (same pre-existing risk
+    seed_events() itself carries for FOMC/CPI/NFP rows, not new to this
+    function) - acceptable because CPI/NFP event_ids are government-tier
+    and never carry a research_session_id in practice, and
+    consensus_value/actual_value get re-derived by
+    fetch_and_persist_consensus/fetch_and_persist_actuals on the same
+    startup pass right after this runs.
+    Raises RuntimeError if FRED_API_KEY is unset, matching
+    fetch_and_persist_actuals's convention (clean error, not a bare
+    KeyError from inside the fetch)."""
+    if "FRED_API_KEY" not in os.environ:
+        raise RuntimeError("FRED_API_KEY environment variable is not set")
+
+    today = datetime.now(timezone.utc).date()
+    realtime_start = (today - timedelta(days=days_back)).isoformat()
+    realtime_end = (today + timedelta(days=days_forward)).isoformat()
+
+    release_dates_by_type = {}
+    for event_type, release_id in ALFRED_RELEASE_ID.items():
+        dates = await _fetch_release_dates(client, release_id, realtime_start, realtime_end)
+        release_dates_by_type[event_type] = dates
+
+    return seed_events_from_alfred_sync(release_dates_by_type, days_back=days_back, days_forward=days_forward)
 
 
 async def _fetch_alfred_observations(client: httpx.AsyncClient, series_id: str, vintage_date: str, limit: int = 1) -> list[dict]:
@@ -381,97 +483,30 @@ def _parse_forexfactory_number(s: str, event_type: str) -> float | None:
     return value / _ALFRED_NATIVE_UNIT_MAGNITUDE.get(event_type, 1.0)
 
 
-async def _fetch_yahoo_intraday(client: httpx.AsyncClient, ticker: str, days: int) -> list[dict]:
-    """5-minute-bar intraday history for ticker, up to Yahoo's ~60-72 day
-    cap for the 5m interval (1m is capped at 8 days — too short to be
-    useful for a 90-day backfill window)."""
-    resp = await client.get(
-        f"{YAHOO_CHART_BASE}/{ticker}",
-        params={"interval": "5m", "range": f"{days}d"},
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    result = data["chart"]["result"][0]
-    timestamps = result["timestamp"]
-    closes = result["indicators"]["quote"][0]["close"]
-
-    rows = []
-    for ts, close in zip(timestamps, closes):
-        if close is None:
-            continue
-        iso_ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        rows.append({"ts": iso_ts, "price": round(close, 4)})
-    return rows
-
-
 async def backfill_intraday_ticks(client: httpx.AsyncClient):
     """One-time-per-run pull of Yahoo 5-minute bars for both metals, so
     capture_snapshot has real intraday ticks to sample from even for
     events that predate this feature's own fast-tier tick collection.
-    append_price_tick is INSERT OR IGNORE, so re-running this is always
-    safe and cheap on repeat startups.
+    append_spot_price_ticks is INSERT OR IGNORE, so re-running this is
+    always safe and cheap on repeat startups.
 
-    Written under FUTURES_SERIES_ID ("XAG_FUTURES"/"XAU_FUTURES"), NOT the
-    bare "XAG"/"XAU" spot_price_tick keys main.py's fast tier uses — SI=F/
-    GC=F are futures, a genuinely different instrument from metalcharts.org's
-    spot quote, and sharing a series_id with it produced a real sawtooth
-    artifact in PriceHistoryChart (futures prints running ~0.3-0.6 higher,
-    interleaved with real spot ticks on the same line)."""
+    Written under FUTURES_SERIES_ID (*_FUTURES_FRONT), NOT the *_SPOT
+    instruments main.py's fast tier uses — SI=F/GC=F are futures, a
+    genuinely different instrument from metalcharts.org's spot quote, and
+    sharing a series_id with it produced a real sawtooth artifact in
+    PriceHistoryChart (futures prints running ~0.3-0.6 higher, interleaved
+    with real spot ticks on the same line) before price_instruments.py's
+    closed instrument set existed."""
     for series_id, ticker in METALS.items():
         try:
-            bars = await _fetch_yahoo_intraday(client, ticker, YAHOO_INTRADAY_DAYS)
+            bars = await fetch_yahoo_bars(client, ticker, interval="5m", range_=f"{YAHOO_INTRADAY_DAYS}d")
         except httpx.HTTPError as e:
             print(f"[catcor] warning: Yahoo intraday fetch failed for {ticker}: {e}")
             continue
         futures_series_id = FUTURES_SERIES_ID[series_id]
-        rows = [{"series_id": futures_series_id, "ts": b["ts"], "price": b["price"]} for b in bars]
+        rows = [{"instrument": futures_series_id, **t} for t in bars_to_ticks(bars)]
         if rows:
-            db.append_price_tick(rows)
-
-
-# Dedicated daily-close series for CATCOR's own fallback, distinct from
-# main.py's XAG_CLOSE/XAU_CLOSE (which are month-end resampled for the
-# Money Supply purchasing-power chart and have no daily granularity at
-# all — reusing those would silently return nothing for ~29 days out of
-# every 30). Stored in the same generic fred_observations table, just
-# under different series_id keys.
-DAILY_CLOSE_SERIES_ID = {"XAG": "XAG_DAILY_CLOSE", "XAU": "XAU_DAILY_CLOSE"}
-DAILY_CLOSE_FETCH_DAYS = 120  # comfortably covers the 90-day backfill window
-
-
-async def backfill_daily_closes(client: httpx.AsyncClient):
-    """One-time-per-run pull of real daily (not month-end) closes for both
-    metals, so capture_snapshot has a genuine same-day fallback for events
-    older than Yahoo's ~72-day 5-minute-bar cutoff but still within the
-    90-day event window. upsert_fred_observations is INSERT OR REPLACE
-    keyed by (series_id, date), so re-running this is safe and cheap."""
-    for series_id, ticker in METALS.items():
-        try:
-            resp = await client.get(
-                f"{YAHOO_CHART_BASE}/{ticker}",
-                params={"interval": "1d", "range": f"{DAILY_CLOSE_FETCH_DAYS}d"},
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data["chart"]["result"][0]
-            timestamps = result["timestamp"]
-            closes = result["indicators"]["quote"][0]["close"]
-        except httpx.HTTPError as e:
-            print(f"[catcor] warning: Yahoo daily-close fetch failed for {ticker}: {e}")
-            continue
-
-        rows = []
-        for ts, close in zip(timestamps, closes):
-            if close is None:
-                continue
-            d = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-            rows.append({"date": d, "value": round(close, 4)})
-        if rows:
-            db.upsert_fred_observations(DAILY_CLOSE_SERIES_ID[series_id], rows)
+            db.append_spot_price_ticks(rows)
 
 
 def _target_ts(scheduled_time: str, window: str) -> str:
@@ -481,14 +516,17 @@ def _target_ts(scheduled_time: str, window: str) -> str:
 
 def _daily_close_fallback(series_id: str, target_ts: str) -> float | None:
     """Coarser fallback for events older than Yahoo's intraday cutoff:
-    same-day close from CATCOR's own daily close series (see
-    backfill_daily_closes) — not main.py's month-end-resampled
-    XAG_CLOSE/XAU_CLOSE, which has no daily granularity."""
-    fred_series_id = DAILY_CLOSE_SERIES_ID[series_id]
+    same-day close from settlement_price's real Yahoo daily close
+    (XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE — main.py's
+    _fetch_and_persist_yahoo_daily_close is what keeps this populated, on
+    the same shared instrument Money Supply's purchasing-power chart reads,
+    see price-architecture-spec.md's Fetch consolidation). Not a
+    month-end-resampled series — this has real daily granularity."""
+    instrument = YAHOO_DAILY_CLOSE_BY_METAL[series_id]
     target_date = target_ts[:10]
-    rows = db.get_fred_observations(fred_series_id, since="1900-01-01")
-    same_day = [r for r in rows if r["date"] == target_date]
-    return same_day[-1]["value"] if same_day else None
+    rows = db.get_settlement_price_series(instrument)
+    same_day = [r for r in rows if r["date"] == target_date and r["price"] is not None]
+    return same_day[-1]["price"] if same_day else None
 
 
 def capture_snapshot(event_id: str, window: str):
@@ -524,10 +562,10 @@ def capture_snapshot(event_id: str, window: str):
         # preserves existing snapshot coverage after spot_price_tick's
         # "XAG"/"XAU" keys were reserved exclusively for real spot ticks.
         futures_series_id = FUTURES_SERIES_ID[series_id]
-        tick = db.get_ticks_near(futures_series_id, target_ts, TICK_TOLERANCE_S)
+        tick = db.get_spot_price_near(futures_series_id, target_ts, TICK_TOLERANCE_S)
         price = tick["price"] if tick else _daily_close_fallback(series_id, target_ts)
 
-        baseline_tick = db.get_ticks_near(futures_series_id, baseline_ts, TICK_TOLERANCE_S)
+        baseline_tick = db.get_spot_price_near(futures_series_id, baseline_ts, TICK_TOLERANCE_S)
         baseline_price = baseline_tick["price"] if baseline_tick else _daily_close_fallback(series_id, baseline_ts)
 
         price_delta_pct = None

@@ -363,6 +363,7 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
           <XAxis
             dataKey="date"
             ticks={xTicks}
+            tickFormatter={(d) => new Date(d).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
             tick={{ fill: "#8a94a6", fontSize: 11 }}
           />
           <YAxis
@@ -848,6 +849,12 @@ function metalChartLegend(metalLabel) {
       color: "#5a6278",
       eli5: "Real daily contracts-traded figure from metalcharts.org — the one thing on this chart CFTC's own report doesn't provide at all (CoT reports positions, never trading volume). Only accumulates forward from whenever this feature started polling, no historical backfill exists or is possible (metalcharts.org's own volume-oi endpoint has no date-range support, confirmed live) — expect this to show as a handful of recent bars, not a full-window series, until more real days pile up.",
     },
+    {
+      key: "price_range",
+      legendLabel: "Price (Day High/Low)",
+      color: "#5aa9e6",
+      eli5: "Daily high/low/close from Yahoo Finance's real futures-contract bars (SI=F/GC=F) — not a 60-second live tick like the header ticker, this is end-of-day range so it can back-fill years of real history at once. The shaded band is that day's real trading range; deliberately NOT the tick-resolution spot feed, which only accumulates a few hours of real history at a time and would leave most of this chart's window blank.",
+    },
   ];
 }
 
@@ -881,6 +888,12 @@ function MetalLeverageCurveVolumeTooltipContent({ active, label, merged }) {
       {row.paper_leverage != null && <div style={{ color: "#e0a84c" }}>Paper Leverage: {row.paper_leverage.toFixed(2)}x</div>}
       {row.curve_spread_pct != null && <div style={{ color: "#7b9fff" }}>Curve Spread: {(row.curve_spread_pct * 100).toFixed(2)}%</div>}
       {row.volume != null && <div style={{ color: "#5a6278" }}>Volume: {Number(row.volume).toLocaleString()} contracts</div>}
+      {row.price_high != null && row.price_low != null && (
+        <div style={{ color: "#5aa9e6" }}>
+          Price: ${row.price_low.toFixed(2)}–${row.price_high.toFixed(2)}
+          {row.price_close != null && ` (close $${row.price_close.toFixed(2)})`}
+        </div>
+      )}
     </div>
   );
 }
@@ -889,6 +902,7 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
   const [leverageRows, setLeverageRows] = useState(null);
   const [curveRows, setCurveRows] = useState(null);
   const [volumeRows, setVolumeRows] = useState(null);
+  const [priceRangeRows, setPriceRangeRows] = useState(null);
   const [clickedKey, setClickedKey] = useState(null);
   const { label, leverageHistoryUrl, spotKey } = METAL_CONFIG[metal];
   const legend = metalChartLegend(label);
@@ -906,6 +920,16 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((j) => setVolumeRows(j.data ?? []))
       .catch(() => setVolumeRows([]));
+    // Real daily high/low/close, NOT the 60s spot tick feed — that only
+    // accumulates a few hours of real history at a time (fast tier just
+    // started), which would leave most of this chart's window blank. This
+    // reads settlement_price's real Yahoo daily bars instead (years of
+    // real history already on file), per the header ticker/leverage-chart
+    // scoping discussion.
+    fetch(`/api/metals/prices/db/daily-range?metal=${spotKey}&since=2015-01-01`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((j) => setPriceRangeRows(j.data ?? []))
+      .catch(() => setPriceRangeRows([]));
   }, [leverageHistoryUrl, spotKey]);
 
   useEffect(() => {
@@ -914,7 +938,7 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
     return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchAll);
   }, [fetchAll]);
 
-  if (leverageRows == null || curveRows == null || volumeRows == null) return null;
+  if (leverageRows == null || curveRows == null || volumeRows == null || priceRangeRows == null) return null;
 
   function nearestBy(sortedRows, dateKey, valueKey, targetDate, toleranceDays) {
     if (!sortedRows.length) return null;
@@ -933,6 +957,8 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
     .filter((r) => r.paper_leverage != null)
     .sort((a, b) => a.date.localeCompare(b.date));
   const volumeSorted = [...volumeRows].sort((a, b) => a.date.localeCompare(b.date));
+  const priceRangeSorted = [...priceRangeRows].sort((a, b) => a.date.localeCompare(b.date));
+  const priceRangeByDate = new Map(priceRangeSorted.map((r) => [r.date, r]));
 
   const merged = curveRows
     .filter((r) => {
@@ -940,12 +966,28 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
       const d = new Date(r.date);
       return (since == null || d >= since) && (until == null || d <= until);
     })
-    .map((r) => ({
-      date: r.date,
-      curve_spread_pct: r.curve_spread_pct,
-      paper_leverage: nearestBy(leverageSorted, "date", "paper_leverage", r.date, 3),
-      volume: nearestBy(volumeSorted, "date", "volume", r.date, 1),
-    }));
+    .map((r) => {
+      // Price range is looked up by EXACT date, not nearest-within-tolerance
+      // like leverage/volume — it's daily data on the same real calendar as
+      // curve spread (both ultimately Yahoo-sourced), so an exact match is
+      // the honest lookup here rather than blurring across days.
+      const priceRow = priceRangeByDate.get(r.date);
+      return {
+        date: r.date,
+        curve_spread_pct: r.curve_spread_pct,
+        paper_leverage: nearestBy(leverageSorted, "date", "paper_leverage", r.date, 3),
+        volume: nearestBy(volumeSorted, "date", "volume", r.date, 1),
+        price_high: priceRow?.high ?? null,
+        price_low: priceRow?.low ?? null,
+        price_close: priceRow?.close ?? null,
+        // Stacked-area range-band trick: a transparent base (price_low) plus
+        // a visible area of height price_band (= high - low), so the visible
+        // band sits exactly between low and high on the price axis, instead
+        // of a shaded area starting from 0 (Recharts has no native
+        // "band between two values" mark).
+        price_band: priceRow ? priceRow.high - priceRow.low : null,
+      };
+    });
 
   if (merged.length < 2) {
     return (
@@ -968,10 +1010,11 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
         {label} Paper Leverage, Curve Spread &amp; Volume — {merged[0].date} to {merged[merged.length - 1].date}
       </div>
       <div className="chart-note">
-        Three independently-fetched series, merged by nearest date (leverage is weekly
-        CFTC data, curve spread and volume are daily). Volume only has real history from
+        Four independently-fetched series, merged by date (leverage is weekly CFTC data,
+        curve spread/volume/price range are daily). Volume only has real history from
         whenever this feature started polling — it will show as sparse recent bars, not a
-        full-window series, until more real days accumulate.
+        full-window series, until more real days accumulate. Price range is real daily
+        high/low from Yahoo, not the 60-second live spot tick — see the legend for why.
       </div>
       <ResponsiveContainer width="100%" height={260}>
         <ComposedChart
@@ -1007,6 +1050,7 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
             width={48}
           />
           <YAxis yAxisId="volume" domain={[0, "auto"]} hide includeHidden />
+          <YAxis yAxisId="price" domain={["auto", "auto"]} hide includeHidden />
           <Tooltip content={<MetalLeverageCurveVolumeTooltipContent merged={merged} />} />
           {pinnedDateSnapped && (
             <ReferenceLine yAxisId="spread" x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
@@ -1020,6 +1064,34 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
             name="volume"
             barSize={4}
             isAnimationActive={false}
+          />
+          {/* Range-band trick (see price_band's computation above): a
+              transparent base stacked under a visible fill, so the visible
+              band renders exactly between price_low and price_high. */}
+          <Area
+            yAxisId="price"
+            type="monotone"
+            dataKey="price_low"
+            stackId="price_range"
+            stroke="none"
+            fill="transparent"
+            isAnimationActive={false}
+            name="price_low_base"
+            legendType="none"
+            tooltipType="none"
+          />
+          <Area
+            yAxisId="price"
+            type="monotone"
+            dataKey="price_band"
+            stackId="price_range"
+            stroke="#5aa9e6"
+            strokeWidth={clickedKey === "price_range" ? 1.5 : 0.8}
+            fill="#5aa9e6"
+            fillOpacity={clickedKey && clickedKey !== "price_range" ? 0.08 : clickedKey === "price_range" ? 0.35 : 0.18}
+            isAnimationActive={false}
+            name="price_range"
+            legendType="none"
           />
           <Line
             yAxisId="leverage"
