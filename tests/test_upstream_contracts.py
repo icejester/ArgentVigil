@@ -266,3 +266,210 @@ def test_forexfactory_cpi_percent_strips_without_scaling():
 def test_forexfactory_unparseable_returns_none():
     assert _parse_forexfactory_number("", event_type="NFP") is None
     assert _parse_forexfactory_number("abc", event_type="NFP") is None
+
+
+# --- Treasury MTS: fiscal-year-block month reconstruction (fed-spend-spec.md Story #0) --
+
+
+def _mts1_row(classification_desc, sequence_number_cd, record_fiscal_year, rcpt, outly, dfct):
+    return {
+        "classification_desc": classification_desc,
+        "sequence_number_cd": sequence_number_cd,
+        "record_fiscal_year": str(record_fiscal_year),
+        "current_month_gross_rcpt_amt": str(rcpt) if rcpt is not None else "null",
+        "current_month_gross_outly_amt": str(outly) if outly is not None else "null",
+        "current_month_dfct_sur_amt": str(dfct) if dfct is not None else "null",
+    }
+
+
+def test_mts_fiscal_month_prior_year_block():
+    # "1.x" on a report whose own record_fiscal_year is 2015 = prior FY,
+    # i.e. FY2014 (Oct 2013 - Sep 2014) — confirmed live against the real
+    # 2026-06-30 publication (report FY 2026, "1.1"="October" = FY2025 =
+    # calendar 2024-10, since FY2025 is the block's own FY = report_fy - 1).
+    # Scaled down to FY2015/FY2014 here for round test numbers.
+    assert main_module._mts_fiscal_month_to_calendar("October", "1.1", "2015") == (2013, 10)
+    assert main_module._mts_fiscal_month_to_calendar("December", "1.3", "2015") == (2013, 12)
+    # January-September of FY2014 (still "1.x") are calendar 2014.
+    assert main_module._mts_fiscal_month_to_calendar("January", "1.4", "2015") == (2014, 1)
+    assert main_module._mts_fiscal_month_to_calendar("September", "1.12", "2015") == (2014, 9)
+
+
+def test_mts_fiscal_month_current_year_block():
+    # "2.x" = the report's own current FY (record_fiscal_year itself, no -1).
+    assert main_module._mts_fiscal_month_to_calendar("October", "2.1", "2015") == (2014, 10)
+    assert main_module._mts_fiscal_month_to_calendar("March", "2.6", "2015") == (2015, 3)
+
+
+def test_mts_fiscal_month_unrecognized_classification_returns_none():
+    # Table 1 also carries subtotal/label rows (e.g. "FY 2014", "Year-to-Date")
+    # even under record_type_cd=MTH filtering in edge cases — anything that
+    # isn't a real month name must be skipped, not silently mis-parsed.
+    assert main_module._mts_fiscal_month_to_calendar("Year-to-Date", "1.13", "2015") is None
+    assert main_module._mts_fiscal_month_to_calendar("FY 2014", "1.0", "2015") is None
+
+
+def test_mts_amount_parses_null_sentinel_string_as_none():
+    # MTS uses the literal string "null" (not JSON null) for an absent value.
+    assert main_module._mts_amount("null") is None
+    assert main_module._mts_amount(None) is None
+    assert main_module._mts_amount("123.45") == 123.45
+
+
+TREASURY_MTS_TABLE1_URL = f"{main_module.TREASURY_MTS_BASE}/mts_table_1"
+TREASURY_MTS_TABLE5_URL = f"{main_module.TREASURY_MTS_BASE}/mts_table_5"
+
+
+def _mts_table1_payload() -> dict:
+    return {
+        # "1.1"/report FY2015 -> prior FY2014 -> calendar 2013-10.
+        # "2.1"/report FY2016 -> current FY2016 -> calendar 2015-10.
+        "data": [
+            _mts1_row("October", "1.1", "2015", 300e9, 580e9, 280e9),
+            _mts1_row("Year-to-Date", "1.13", "2015", None, None, None),  # non-month row, must be skipped
+            _mts1_row("October", "2.1", "2016", 320e9, 600e9, 280e9),
+        ]
+    }
+
+
+def _mts_table5_payload() -> dict:
+    return {
+        "data": [
+            {"record_date": "2013-10-31", "classification_desc": main_module.TREASURY_INTEREST_CLASSIFICATION, "current_month_net_outly_amt": "30000000000.0"},
+            {"record_date": "2015-10-31", "classification_desc": main_module.TREASURY_INTEREST_CLASSIFICATION, "current_month_net_outly_amt": "32000000000.0"},
+        ]
+    }
+
+
+async def test_treasury_outlays_merges_table1_and_table5_by_month(tmp_db, upstream_client):
+    with respx.mock:
+        respx.get(TREASURY_MTS_TABLE1_URL).mock(return_value=httpx.Response(200, json=_mts_table1_payload()))
+        respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json=_mts_table5_payload()))
+        n = await main_module._fetch_and_persist_treasury_outlays()
+
+    # Table 1 contributed 2 real months (the Year-to-Date row was skipped);
+    # both happen to already have a Table 5 interest match at the same
+    # (year, month) via record_date, so no extra bare-interest-only rows.
+    assert n == 2
+    rows = tmp_db.get_treasury_outlays()
+    by_month = {(r["year"], r["month"]): r for r in rows}
+    assert (2013, 10) in by_month and (2015, 10) in by_month
+
+    oct2013 = by_month[(2013, 10)]
+    assert oct2013["receipts_usd"] == pytest.approx(300e9)
+    assert oct2013["outlays_usd"] == pytest.approx(580e9)
+    assert oct2013["deficit_usd"] == pytest.approx(280e9)
+    assert oct2013["interest_usd"] == pytest.approx(30e9)
+    assert oct2013["date"] == "2013-10-01"
+
+    oct2015 = by_month[(2015, 10)]
+    assert oct2015["receipts_usd"] == pytest.approx(320e9)
+    assert oct2015["interest_usd"] == pytest.approx(32e9)
+
+
+async def test_treasury_outlays_upsert_overwrites_prior_publication(tmp_db, upstream_client):
+    """MTS restates a month on every later release — a second fetch's value
+    for an already-persisted (year, month) must win, matching census_trade's
+    upsert convention (later publication is more current, not append-only)."""
+    with respx.mock:
+        respx.get(TREASURY_MTS_TABLE1_URL).mock(return_value=httpx.Response(200, json=_mts_table1_payload()))
+        respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json=_mts_table5_payload()))
+        await main_module._fetch_and_persist_treasury_outlays()
+
+    revised_payload = {"data": [_mts1_row("October", "1.1", "2015", 999e9, 580e9, 280e9)]}
+    with respx.mock:
+        respx.get(TREASURY_MTS_TABLE1_URL).mock(return_value=httpx.Response(200, json=revised_payload))
+        respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json={"data": []}))
+        await main_module._fetch_and_persist_treasury_outlays()
+
+    rows = {(r["year"], r["month"]): r for r in tmp_db.get_treasury_outlays()}
+    assert rows[(2013, 10)]["receipts_usd"] == pytest.approx(999e9)
+    # interest_usd came from the FIRST fetch only (the second fetch's Table 5
+    # response was empty) — the merge-forward-against-existing logic must
+    # preserve that previously-persisted real value rather than nulling it
+    # out just because this particular fetch's Table 5 response omitted it.
+    assert rows[(2013, 10)]["interest_usd"] == pytest.approx(30e9)
+
+
+# --- Treasury MTS: per-agency breakdown (fed-spend-spec.md Story #0 Tier 2) --
+
+
+def _mts5_agency_payload(record_date: str, agencies: dict[str, float]) -> dict:
+    """Real-shaped Table 5 response for one record_date: each agency gets a
+    level-1 'C' header row (null value) plus a direct child 'Total--<agency>'
+    'C' row carrying the real figure — same parent_id/classification_id
+    linkage confirmed live."""
+    data = []
+    next_id = 1
+    for agency, amount in agencies.items():
+        header_id = str(next_id)
+        total_id = str(next_id + 1)
+        next_id += 2
+        data.append({
+            "record_date": record_date, "parent_id": "0", "classification_id": header_id,
+            "classification_desc": f"{agency}:", "record_type_cd": "C", "sequence_level_nbr": "1",
+            "current_month_net_outly_amt": "null",
+        })
+        data.append({
+            "record_date": record_date, "parent_id": header_id, "classification_id": total_id,
+            "classification_desc": f"Total--{agency}", "record_type_cd": "C", "sequence_level_nbr": "2",
+            "current_month_net_outly_amt": str(amount),
+        })
+    # A non-"C" / non-department-total child row, to confirm it's correctly
+    # ignored rather than mistaken for the real total.
+    data.append({
+        "record_date": record_date, "parent_id": "1", "classification_id": "999",
+        "classification_desc": "Some Bureau:", "record_type_cd": "B", "sequence_level_nbr": "2",
+        "current_month_net_outly_amt": "999999.0",
+    })
+    return {"data": data}
+
+
+async def test_treasury_outlays_by_agency_extracts_department_totals(tmp_db, upstream_client):
+    # treasury_outlays_by_agency depends on treasury_outlays already having
+    # persisted the real (year, month) set — seed it directly rather than
+    # re-fetching Table 1.
+    tmp_db.upsert_treasury_outlays_rows([
+        {"year": 2026, "month": 6, "receipts_usd": 1.0, "outlays_usd": 2.0, "deficit_usd": 1.0, "interest_usd": None},
+    ])
+    payload = _mts5_agency_payload("2026-06-30", {
+        "Department of Defense--Military Programs": 78329784246.77,
+        "Social Security Administration": 152111028019.48,
+    })
+    with respx.mock:
+        respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json=payload))
+        n = await main_module._fetch_and_persist_treasury_outlays_by_agency()
+
+    assert n == 2
+    rows = {r["agency"]: r for r in tmp_db.get_treasury_outlays_by_agency()}
+    assert rows["Department of Defense--Military Programs"]["outlay_usd"] == pytest.approx(78329784246.77)
+    assert rows["Social Security Administration"]["outlay_usd"] == pytest.approx(152111028019.48)
+    # The stray Bureau-level ("B") row must not leak in as a fake "agency".
+    assert "Some Bureau" not in rows
+
+
+async def test_treasury_outlays_by_agency_skips_already_persisted_months(tmp_db, upstream_client):
+    """Bounded-window fetch must not re-request a month it already has —
+    real cost control against ~1 request/month with no documented upstream
+    rate limit."""
+    tmp_db.upsert_treasury_outlays_rows([
+        {"year": 2026, "month": 6, "receipts_usd": 1.0, "outlays_usd": 2.0, "deficit_usd": 1.0, "interest_usd": None},
+    ])
+    tmp_db.upsert_treasury_outlays_by_agency_rows([
+        {"year": 2026, "month": 6, "agency": "Department of Justice", "outlay_usd": 111.0},
+    ])
+    call_count = 0
+
+    def _callback(request):
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json=_mts5_agency_payload("2026-06-30", {"Department of Justice": 999.0}))
+
+    with respx.mock:
+        respx.get(url__startswith=TREASURY_MTS_TABLE5_URL).mock(side_effect=_callback)
+        n = await main_module._fetch_and_persist_treasury_outlays_by_agency()
+
+    assert call_count == 0
+    assert n == 0
+    rows = tmp_db.get_treasury_outlays_by_agency()
+    assert rows[0]["outlay_usd"] == pytest.approx(111.0)  # untouched, not overwritten with 999

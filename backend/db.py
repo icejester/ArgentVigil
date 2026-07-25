@@ -191,6 +191,46 @@ CREATE TABLE IF NOT EXISTS census_trade (
     PRIMARY KEY (metal, flow, hs_code, cty_code, year, month)
 );
 
+-- Monthly Treasury Statement topline (fed-spend-spec.md Story #1) —
+-- outlays, receipts, deficit/surplus (Table 1: Summary of Receipts,
+-- Outlays, and the Deficit/Surplus of the U.S. Government), plus interest
+-- on the public debt (Table 5: Outlays of the U.S. Government, the
+-- "Total--Interest on the Public Debt" row) from fiscaldata.treasury.gov's
+-- public API, no key required. MTS republishes every month's whole fiscal
+-- year on each release, so this is upsert keyed by (year, month), not
+-- append-only — same reasoning as census_trade (a later publication's
+-- restated figure for an already-persisted month is the more current one).
+-- Nulls over zeros for a month whose interest figure hasn't been
+-- correlated (Table 1 and Table 5 are fetched/matched independently).
+CREATE TABLE IF NOT EXISTS treasury_outlays (
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    receipts_usd REAL,
+    outlays_usd REAL,
+    deficit_usd REAL,
+    interest_usd REAL,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (year, month)
+);
+
+-- Monthly Treasury Statement, per-department/agency breakdown of outlays
+-- (fed-spend-spec.md Story #0's Tier 2, MTS Table 5). One row per real
+-- (year, month, agency) — agency is the level-1 department/agency header's
+-- own classification_desc (e.g. "Department of Defense--Military Programs",
+-- "Social Security Administration"), a stable 29-entry list confirmed live
+-- across 2015 and 2026 publications. outlay_usd is that department's own
+-- "Total--<agency>" child row for the month, NOT the sum of its own
+-- sub-programs computed client-side — Treasury's own reported total.
+-- Same upsert-on-restatement reasoning as treasury_outlays.
+CREATE TABLE IF NOT EXISTS treasury_outlays_by_agency (
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    agency TEXT NOT NULL,
+    outlay_usd REAL,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (year, month, agency)
+);
+
 -- Front-month vs. next-month COMEX futures settlement spread (Squeeze
 -- Context Story #1, see squeeze-context-spec.md). Sourced from Yahoo
 -- Finance's chart API against real deferred-month contract symbols (e.g.
@@ -988,6 +1028,83 @@ def get_census_trade(metal: str, flow: str | None = None, hs_code: str | None = 
             row["implied_qty_oz"] = round(row["value_general_usd"] / spot, 4)
         else:
             row["implied_qty_oz"] = None
+    return result
+
+
+def upsert_treasury_outlays_rows(rows: list[dict]):
+    """Partial-column upsert, same shape as upsert_census_trade_rows —
+    MTS restates figures for a given month on every later publication, so
+    a later fetch's value for an already-persisted (year, month) should
+    win, with fetched_at refreshed to 'now'."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO treasury_outlays
+                   (year, month, receipts_usd, outlays_usd, deficit_usd, interest_usd)
+               VALUES (:year, :month, :receipts_usd, :outlays_usd, :deficit_usd, :interest_usd)
+               ON CONFLICT (year, month) DO UPDATE SET
+                   receipts_usd = excluded.receipts_usd,
+                   outlays_usd = excluded.outlays_usd,
+                   deficit_usd = excluded.deficit_usd,
+                   interest_usd = excluded.interest_usd,
+                   fetched_at = datetime('now')""",
+            rows,
+        )
+
+
+def get_treasury_outlays(since: str | None = None) -> list[dict]:
+    """Rows ordered oldest-to-newest, each carrying a synthetic 'date'
+    field (YYYY-MM-01, first of that calendar month) alongside year/month —
+    same 'derived once at read time, not persisted' convention as every
+    other computed field in this codebase, added purely so callers can
+    treat this like every other date-keyed series (nearestRowDate, window
+    filtering) without re-deriving a date string themselves."""
+    query = "SELECT * FROM treasury_outlays"
+    params: list = []
+    if since is not None:
+        # since is a full 'YYYY-MM-DD' — compare against the synthetic
+        # month-start date string, computed in SQL so the WHERE clause can
+        # still use year/month directly rather than a stored date column.
+        query += " WHERE (year * 100 + month) >= ?"
+        params.append(int(since[:4]) * 100 + int(since[5:7]))
+    query += " ORDER BY year, month"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        result = [dict(r) for r in rows]
+    for row in result:
+        row["date"] = f"{row['year']:04d}-{row['month']:02d}-01"
+    return result
+
+
+def upsert_treasury_outlays_by_agency_rows(rows: list[dict]):
+    """Full-column upsert (outlay_usd is the only non-key column, so unlike
+    treasury_outlays there's no partial-column merge-forward concern — a
+    fetch either has this (year, month, agency)'s real total or it doesn't
+    contribute that row at all)."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO treasury_outlays_by_agency (year, month, agency, outlay_usd)
+               VALUES (:year, :month, :agency, :outlay_usd)
+               ON CONFLICT (year, month, agency) DO UPDATE SET
+                   outlay_usd = excluded.outlay_usd,
+                   fetched_at = datetime('now')""",
+            rows,
+        )
+
+
+def get_treasury_outlays_by_agency(since: str | None = None) -> list[dict]:
+    """Rows ordered oldest-to-newest, each carrying a synthetic 'date'
+    field (YYYY-MM-01), same convention as get_treasury_outlays."""
+    query = "SELECT * FROM treasury_outlays_by_agency"
+    params: list = []
+    if since is not None:
+        query += " WHERE (year * 100 + month) >= ?"
+        params.append(int(since[:4]) * 100 + int(since[5:7]))
+    query += " ORDER BY year, month, agency"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        result = [dict(r) for r in rows]
+    for row in result:
+        row["date"] = f"{row['year']:04d}-{row['month']:02d}-01"
     return result
 
 
