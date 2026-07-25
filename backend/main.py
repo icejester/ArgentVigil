@@ -490,6 +490,12 @@ async def silver_db_depositories(date: str | None = Query(None)):
     return {"success": True, "data": rows}
 
 
+@app.get("/api/silver/db/depositories/history")
+async def silver_db_depositories_history():
+    rows = db.get_depository_history()
+    return {"success": True, "data": rows}
+
+
 async def _fetch_and_persist_silver_leverage() -> dict:
     hdrs = await authed_headers(_client)
     resp = await _client.get(
@@ -601,8 +607,14 @@ async def _fetch_and_persist_gold_depositories() -> list[dict]:
 
 
 @app.get("/api/gold/db/depositories")
-async def gold_db_depositories():
-    rows = db.get_latest_gold_depositories()
+async def gold_db_depositories(date: str | None = Query(None)):
+    rows = db.get_gold_depositories_on_date(date) if date else db.get_latest_gold_depositories()
+    return {"success": True, "data": rows}
+
+
+@app.get("/api/gold/db/depositories/history")
+async def gold_db_depositories_history():
+    rows = db.get_gold_depository_history()
     return {"success": True, "data": rows}
 
 
@@ -707,6 +719,57 @@ async def silver_db_delivery(type: str = Query("mtd")):
     return {"success": True, "data": rows}
 
 
+# Mirrors _fetch_and_persist_delivery — confirmed live 2026-07-22 that
+# metalcharts.org's delivery-notices endpoint fully supports symbol=XAU (96
+# real rows, matching CME's own official MetalsIssuesAndStopsReport.pdf
+# exactly for a spot-checked date). Gold's registered/eligible/total side
+# (gold_inventory_aggregate) has always been populated; only the delivery-
+# notices half was ever silver-only, an incomplete build rather than a real
+# upstream or structural gold-vault difference — see
+# RECLASSIFICATION_SUPPORTED_METALS in delivery_behavior.py, extended to XAU
+# in the same change that added this function.
+async def _fetch_and_persist_gold_delivery(type: str = "mtd") -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/delivery-notices",
+        params={"symbol": "XAU", "type": type},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    data = raw.get("data") or []
+    if isinstance(data, dict):
+        data = [data]
+    rows = [
+        {
+            "date": r.get("date", str(date.today())),
+            "type": type,
+            "daily_issued": r.get("dailyIssued"),
+            "daily_stopped": r.get("dailyStopped"),
+        }
+        for r in data
+        if isinstance(r, dict) and (r.get("dailyIssued") is not None or r.get("dailyStopped") is not None)
+    ]
+    if rows:
+        db.upsert_gold_delivery_rows(rows)
+    return raw
+
+
+# Same ytd-over-mtd reasoning as _fetch_and_persist_delivery_ytd above —
+# ytd accumulates real coverage instead of resetting to a handful of days
+# every month, which is what the Delivery Behavior reclassification signal
+# needs. Module-level so _SOURCE_REGISTRY can reference it directly.
+async def _fetch_and_persist_gold_delivery_ytd():
+    return await _fetch_and_persist_gold_delivery(type="ytd")
+
+
+@app.get("/api/gold/db/delivery")
+async def gold_db_delivery(type: str = Query("mtd")):
+    rows = db.get_gold_delivery_history(type)
+    return {"success": True, "data": rows}
+
+
 async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
     hdrs = await authed_headers(_client)
     resp = await _client.get(
@@ -733,6 +796,40 @@ async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
 @app.get("/api/shfe/db/history")
 async def shfe_db_history():
     rows = db.get_shfe_history()
+    return {"success": True, "data": rows}
+
+
+# Mirrors _fetch_and_persist_shfe_history — confirmed live 2026-07-24 that
+# metalcharts.org's SHFE endpoint fully supports symbol=AU (19 real days
+# checked, same {date, total} shape as silver). Unlike the COMEX delivery-
+# notices/registered-eligible gap, SHFE gold has no confirmed data-
+# availability blocker — this was purely unbuilt, not unavailable.
+async def _fetch_and_persist_shfe_gold_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AU", "range": range},
+        headers=hdrs,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = []
+    for row in raw.get("data", []):
+        kg = row.get("total")
+        rows.append({
+            "date": row["date"],
+            "total_kg": kg,
+            # SHFE gold is in kg; convert to troy oz
+            "total_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+        })
+    db.upsert_shfe_gold_rows(rows)
+    return rows
+
+
+@app.get("/api/shfe/gold/db/history")
+async def shfe_gold_db_history():
+    rows = db.get_shfe_gold_history()
     return {"success": True, "data": rows}
 
 
@@ -776,6 +873,78 @@ async def shfe_db_warehouses():
             **r,
             "warrant_oz": round(r["warrant_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_kg"] else None,
             "warrant_change_oz": round(r["warrant_change_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_change_kg"] else None,
+        }
+        for r in rows
+    ]
+    return {"success": True, "data": enriched}
+
+
+@app.get("/api/shfe/db/warehouses/history")
+async def shfe_db_warehouses_history():
+    rows = db.get_shfe_warehouse_history()
+    enriched = [
+        {
+            **r,
+            "warrant_oz": round(r["warrant_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_kg"] else None,
+        }
+        for r in rows
+    ]
+    return {"success": True, "data": enriched}
+
+
+async def _fetch_and_persist_shfe_gold_warehouses() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AU", "type": "warehouses"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = raw.get("data", [])
+    today = str(date.today())
+    persisted = []
+    enriched = []
+    for r in rows:
+        kg = r.get("warrant", 0)
+        chg_kg = r.get("warrantChange", 0)
+        enriched.append({
+            **r,
+            "warrant_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+            "warrant_change_oz": round(chg_kg * TROY_OZ_PER_KG, 0) if chg_kg else None,
+        })
+        persisted.append({
+            "date": r.get("date", today),
+            "warehouse": r["warehouse"],
+            "warrant_kg": kg,
+            "warrant_change_kg": chg_kg,
+        })
+    db.upsert_shfe_gold_warehouse_rows(persisted)
+    return enriched
+
+
+@app.get("/api/shfe/gold/db/warehouses")
+async def shfe_gold_db_warehouses():
+    rows = db.get_latest_shfe_gold_warehouses()
+    enriched = [
+        {
+            **r,
+            "warrant_oz": round(r["warrant_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_kg"] else None,
+            "warrant_change_oz": round(r["warrant_change_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_change_kg"] else None,
+        }
+        for r in rows
+    ]
+    return {"success": True, "data": enriched}
+
+
+@app.get("/api/shfe/gold/db/warehouses/history")
+async def shfe_gold_db_warehouses_history():
+    rows = db.get_shfe_gold_warehouse_history()
+    enriched = [
+        {
+            **r,
+            "warrant_oz": round(r["warrant_kg"] * TROY_OZ_PER_KG, 0) if r["warrant_kg"] else None,
         }
         for r in rows
     ]
@@ -1713,8 +1882,11 @@ _SLOW_TIER_FETCH_FNS: dict[str, tuple[Callable[[], Awaitable[None]], list[str], 
     "silver_leverage": (_fetch_and_persist_silver_leverage, ["volume_oi"], "Silver COMEX volume (leverage/OI computed from cot_silver + inventory_aggregate, see db.get_leverage_history)."),
     "gold_leverage": (_fetch_and_persist_gold_leverage, ["gold_volume_oi"], "Gold COMEX volume (leverage/OI computed from cot_gold + gold_inventory_aggregate)."),
     "delivery_notices": (_fetch_and_persist_delivery_ytd, ["delivery_notices"], "COMEX silver daily issued/stopped delivery notices, YTD window."),
+    "gold_delivery_notices": (_fetch_and_persist_gold_delivery_ytd, ["gold_delivery_notices"], "COMEX gold daily issued/stopped delivery notices, YTD window."),
     "shfe_silver_history": (_fetch_and_persist_shfe_history, ["shfe_inventory"], "SHFE silver inventory, daily."),
     "shfe_warehouses": (_fetch_and_persist_shfe_warehouses, ["shfe_warehouse"], "SHFE per-warehouse warrant snapshot, daily."),
+    "shfe_gold_history": (_fetch_and_persist_shfe_gold_history, ["shfe_gold_inventory"], "SHFE gold inventory, daily."),
+    "shfe_gold_warehouses": (_fetch_and_persist_shfe_gold_warehouses, ["shfe_gold_warehouse"], "SHFE gold per-warehouse warrant snapshot, daily."),
     "pslv": (_fetch_and_persist_pslv, ["pslv_snapshot"], "Sprott PSLV custodial ounces, direct from Sprott's API."),
     "futures_curve_spread": (_fetch_and_persist_curve_spread, ["futures_curve_spread"], "COMEX front/next-month futures spread (Yahoo Finance), daily."),
 }

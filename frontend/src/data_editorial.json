@@ -311,7 +311,8 @@
     "sourceKeys": [
       "comex_gold_history",
       "comex_gold_depositories",
-      "gold_leverage"
+      "gold_leverage",
+      "gold_delivery_notices"
     ],
     "curl": "curl \"https://metalcharts.org/api/comex/inventory?symbol=XAU&range=ALL\" \\\n  -H \"x-mc-token: <token>\" \\\n  -H \"Referer: https://metalcharts.org/comex/gold\" \\\n  -H \"x-requested-with: XMLHttpRequest\"\n# same token flow as Silver \u2014 see that source's curl for step 1",
     "tables": [
@@ -341,9 +342,18 @@
             "Gold OI/volume/leverage \u2014 GET /api/gold/db/leverage/history stitches in a CoT-derived backfill same as silver's, but gold_inventory_aggregate.registered is only reported upstream from 2026-02-17 onward (a real, much later upstream gap than silver's 2020-01-02 \u2014 confirmed live, not a fetch bug), so the backfill contributes almost nothing for gold today"
           ]
         ]
+      },
+      {
+        "name": "gold_delivery_notices",
+        "fields": [
+          [
+            "(mirrors delivery_notices)",
+            "Gold COMEX daily issued/stopped delivery notices \u2014 added 2026-07-22 after confirming metalcharts.org's delivery-notices endpoint already fully supports symbol=XAU (verified against CME's own official MetalsIssuesAndStopsReport.pdf for a spot-checked date). Powers Delivery Behavior's reclassification/deregistration signal for gold, same as silver's copy powers it for silver."
+          ]
+        ]
       }
     ],
-    "note": "Fetched+persisted every slow-tier cycle; history/depositories not currently rendered anywhere in the frontend (leverage is)."
+    "note": "Fetched+persisted every slow-tier cycle; history/depositories not currently rendered anywhere in the frontend (leverage and delivery notices are, via Delivery Behavior)."
   },
   {
     "key": "shfe",
@@ -351,9 +361,11 @@
     "origin": "Same reverse-engineered metalcharts.org API",
     "sourceKeys": [
       "shfe_silver_history",
-      "shfe_warehouses"
+      "shfe_warehouses",
+      "shfe_gold_history",
+      "shfe_gold_warehouses"
     ],
-    "curl": "curl \"https://metalcharts.org/api/comex/inventory?symbol=AG&range=ALL\" \\\n  -H \"x-mc-token: <token>\" \\\n  -H \"Referer: https://metalcharts.org/comex/silver\" \\\n  -H \"x-requested-with: XMLHttpRequest\"\n# warehouses: &type=warehouses instead of &range=ALL",
+    "curl": "curl \"https://metalcharts.org/api/comex/inventory?symbol=AG&range=ALL\" \\\n  -H \"x-mc-token: <token>\" \\\n  -H \"Referer: https://metalcharts.org/comex/silver\" \\\n  -H \"x-requested-with: XMLHttpRequest\"\n# warehouses: &type=warehouses instead of &range=ALL\n# gold: &symbol=AU instead of &symbol=AG \u2014 confirmed live 2026-07-24, same response shape",
     "tables": [
       {
         "name": "shfe_inventory",
@@ -390,6 +402,24 @@
           [
             "warrant_change_kg",
             "Day-over-day change, kg"
+          ]
+        ]
+      },
+      {
+        "name": "shfe_gold_inventory",
+        "fields": [
+          [
+            "(mirrors shfe_inventory)",
+            "SHFE gold warehouse total, kg/oz \u2014 same shape as silver, symbol=AU"
+          ]
+        ]
+      },
+      {
+        "name": "shfe_gold_warehouse",
+        "fields": [
+          [
+            "(mirrors shfe_warehouse)",
+            "SHFE gold per-warehouse warrant stock, kg/oz"
           ]
         ]
       }

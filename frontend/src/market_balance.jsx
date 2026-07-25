@@ -249,6 +249,11 @@ export default function MarketBalancePanel() {
               {balanceLabel(latestCumulative).toLowerCase()}
             </div>
           )}
+          <div className="flow-panel-note" style={{ marginTop: 8 }}>
+            A short-term delivery anomaly (see Delivery Behavior's Reclassification vs. Real
+            Inflow chart) is a distinct signal from this multi-year structural trend, not
+            evidence of it — treat the two separately rather than reading one into the other.
+          </div>
 
           <RunwayStatCard meta={meta} />
         </>

@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS shfe_inventory (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS shfe_gold_inventory (
+    date TEXT PRIMARY KEY,
+    total_kg REAL,
+    total_oz REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS volume_oi (
     date TEXT PRIMARY KEY,
     open_interest REAL,
@@ -92,7 +99,23 @@ CREATE TABLE IF NOT EXISTS delivery_notices (
     PRIMARY KEY (date, type)
 );
 
+CREATE TABLE IF NOT EXISTS gold_delivery_notices (
+    date TEXT,
+    type TEXT,
+    daily_issued REAL,
+    daily_stopped REAL,
+    PRIMARY KEY (date, type)
+);
+
 CREATE TABLE IF NOT EXISTS shfe_warehouse (
+    date TEXT,
+    warehouse TEXT,
+    warrant_kg REAL,
+    warrant_change_kg REAL,
+    PRIMARY KEY (date, warehouse)
+);
+
+CREATE TABLE IF NOT EXISTS shfe_gold_warehouse (
     date TEXT,
     warehouse TEXT,
     warrant_kg REAL,
@@ -513,6 +536,23 @@ def get_shfe_history() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def upsert_shfe_gold_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO shfe_gold_inventory (date, total_kg, total_oz)
+               VALUES (:date, :total_kg, :total_oz)""",
+            rows,
+        )
+
+
+def get_shfe_gold_history() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, total_kg, total_oz FROM shfe_gold_inventory ORDER BY date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def upsert_volume_oi_row(row: dict):
     with get_conn() as conn:
         conn.execute(
@@ -590,6 +630,44 @@ def get_latest_gold_depositories() -> list[dict]:
                       prev_registered, prev_eligible, prev_total
                FROM gold_inventory_depository
                WHERE date = (SELECT MAX(date) FROM gold_inventory_depository)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_gold_depositories_on_date(date: str) -> list[dict]:
+    """Mirrors get_depositories_on_date — see that docstring for the same
+    accumulates-forward-only/no-backfill caveat."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, depository, registered, eligible, total,
+                      prev_registered, prev_eligible, prev_total
+               FROM gold_inventory_depository
+               WHERE date = ?""",
+            (date,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_depository_history() -> list[dict]:
+    """Every persisted per-vault row across all dates (not just latest/one date)
+    — powers the Per-Vault Snapshot panel's share-of-COMEX-over-time chart.
+    Same accumulates-forward-only coverage as get_depositories_on_date (no
+    upstream backfill exists for this route)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, depository, registered, eligible, total
+               FROM inventory_depository
+               ORDER BY date"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_gold_depository_history() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, depository, registered, eligible, total
+               FROM gold_inventory_depository
+               ORDER BY date"""
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -998,6 +1076,24 @@ def get_delivery_history(type: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def upsert_gold_delivery_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO gold_delivery_notices (date, type, daily_issued, daily_stopped)
+               VALUES (:date, :type, :daily_issued, :daily_stopped)""",
+            rows,
+        )
+
+
+def get_gold_delivery_history(type: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, type, daily_issued, daily_stopped FROM gold_delivery_notices WHERE type = ? ORDER BY date",
+            (type,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def upsert_shfe_warehouse_rows(rows: list[dict]):
     with get_conn() as conn:
         conn.executemany(
@@ -1013,6 +1109,49 @@ def get_latest_shfe_warehouses() -> list[dict]:
             """SELECT date, warehouse, warrant_kg, warrant_change_kg
                FROM shfe_warehouse
                WHERE date = (SELECT MAX(date) FROM shfe_warehouse)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_shfe_warehouse_history() -> list[dict]:
+    """Every persisted per-warehouse row across all dates (not just latest)
+    — mirrors get_depository_history's role for COMEX, powers a SHFE
+    per-warehouse-over-time chart. Same accumulates-forward-only coverage
+    (no upstream backfill exists for this route)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, warehouse, warrant_kg, warrant_change_kg
+               FROM shfe_warehouse
+               ORDER BY date"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_shfe_gold_warehouse_rows(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO shfe_gold_warehouse (date, warehouse, warrant_kg, warrant_change_kg)
+               VALUES (:date, :warehouse, :warrant_kg, :warrant_change_kg)""",
+            rows,
+        )
+
+
+def get_latest_shfe_gold_warehouses() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, warehouse, warrant_kg, warrant_change_kg
+               FROM shfe_gold_warehouse
+               WHERE date = (SELECT MAX(date) FROM shfe_gold_warehouse)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_shfe_gold_warehouse_history() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, warehouse, warrant_kg, warrant_change_kg
+               FROM shfe_gold_warehouse
+               ORDER BY date"""
         ).fetchall()
         return [dict(r) for r in rows]
 

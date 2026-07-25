@@ -2,10 +2,13 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart,
   Line,
+  BarChart,
+  Bar,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
+  ReferenceLine,
   Legend,
   ResponsiveContainer,
   PieChart,
@@ -17,9 +20,9 @@ import DeliveryBehaviorPanel from "./delivery_behavior_panel";
 import TradeFlowPanel from "./trade_flow_panel";
 import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import { nearestRowDate } from "./date_utils";
 
 const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
-const STALE_MS = 5 * 60 * 1000;
 
 function fmt_moz(v) {
   if (v == null) return "—";
@@ -43,35 +46,23 @@ function delta_str(val) {
   return sign + fmt_oz(val);
 }
 
-// ── Range selector ──────────────────────────────────────────────────────────
+// Stock & Flow's own shared selector (1M/3M/6M/1Y/ALL/Custom) — drives every
+// chart in this section. An earlier per-chart RangeSelector/filterByRange
+// pair (1M/3M/1Y/5Y/ALL, no Custom) was removed 2026-07-24 once its last
+// caller (RegEligiblePanel) was removed — this is the only selector left.
+const SF_WINDOWS = ["1M", "3M", "6M", "1Y", "ALL"];
 
-const RANGES = ["1M", "3M", "1Y", "5Y", "ALL"];
-
-function RangeSelector({ value, onChange }) {
-  return (
-    <div className="comex-range-selector">
-      {RANGES.map((r) => (
-        <button
-          key={r}
-          className={`comex-range-btn${value === r ? " comex-range-btn--active" : ""}`}
-          onClick={() => onChange(r)}
-        >
-          {r}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-// ── Filtered history by range ───────────────────────────────────────────────
-
-function filterByRange(data, range) {
-  if (!data || range === "ALL") return data;
-  const now = new Date();
-  const cutoffs = { "1M": 30, "3M": 90, "1Y": 365, "5Y": 1825 };
-  const days = cutoffs[range];
+function filterBySFWindow(data, window_, customStart, customEnd) {
+  if (!data) return data;
+  if (window_ === "custom") {
+    if (!customStart || !customEnd || customStart > customEnd) return data;
+    return data.filter((r) => r.date >= customStart && r.date <= customEnd);
+  }
+  if (window_ === "ALL") return data;
+  const cutoffs = { "1M": 30, "3M": 90, "6M": 180, "1Y": 365 };
+  const days = cutoffs[window_];
   if (!days) return data;
-  const cutoff = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
   return data.filter((r) => r.date >= cutoff);
 }
 
@@ -80,105 +71,6 @@ function xTicks(data) {
   const n = Math.min(data.length, 8);
   const step = Math.floor(data.length / n);
   return data.filter((_, i) => i % step === 0).map((r) => r.date);
-}
-
-// ── Panel 2: Registered vs Eligible ────────────────────────────────────────
-
-function RegEligiblePanel({ history }) {
-  const [range, setRange] = useState("1Y");
-  const filtered = (filterByRange(history, range) ?? []).map((r) => {
-    const total = (r.registered ?? 0) + (r.eligible ?? 0);
-    return {
-      ...r,
-      pct_available: r.registered != null && total > 0 ? (r.registered / total) * 100 : null,
-    };
-  });
-  const ticks = xTicks(filtered);
-
-  return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">
-        Registered vs Eligible Silver — % Available for Delivery
-        <RangeSelector value={range} onChange={setRange} />
-      </div>
-      <div className="comex-panel-note">
-        Registered = deliverable (warranted). Eligible = stored, not warranted.
-        Sharp registered drop = delivery pressure signal. % available spike up =
-        more of total COMEX silver warranted for delivery (bullish physical demand signal).
-      </div>
-      {filtered && filtered.length > 0 ? (
-        <ResponsiveContainer width="100%" height={300}>
-          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-            <YAxis
-              yAxisId="oz"
-              tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
-              tick={{ fill: "#8a94a6", fontSize: 11 }}
-            />
-            <YAxis
-              yAxisId="pct"
-              orientation="right"
-              tickFormatter={(v) => `${v.toFixed(0)}%`}
-              tick={{ fill: "#e8ecf4", fontSize: 11 }}
-            />
-            <Tooltip
-              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-              labelStyle={{ color: "#c8d0de" }}
-              formatter={(v, name) => {
-                if (name === "pct_available") return [v != null ? v.toFixed(1) + "%" : "—", "% available for delivery — right axis"];
-                return [fmt_moz(v), name === "registered" ? "Registered — left axis" : "Eligible — left axis"];
-              }}
-            />
-            <Line
-              yAxisId="oz"
-              type="monotone"
-              dataKey="registered"
-              stroke="#4caf76"
-              dot={false}
-              strokeWidth={1.8}
-              connectNulls={false}
-            />
-            <Line
-              yAxisId="oz"
-              type="monotone"
-              dataKey="eligible"
-              stroke="#e05252"
-              dot={false}
-              strokeWidth={1.8}
-              connectNulls={false}
-            />
-            <Line
-              yAxisId="pct"
-              type="monotone"
-              dataKey="pct_available"
-              stroke="#e8ecf4"
-              dot={false}
-              strokeWidth={1.8}
-              strokeDasharray="4 3"
-              connectNulls={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      ) : (
-        <div className="comex-empty">No data</div>
-      )}
-      <div className="comex-legend-list">
-        <div className="comex-legend-item">
-          <span className="comex-legend-swatch" style={{ background: "#4caf76" }} />
-          <span><strong>Registered</strong> — deliverable (warranted) COMEX silver, left axis.</span>
-        </div>
-        <div className="comex-legend-item">
-          <span className="comex-legend-swatch" style={{ background: "#e05252" }} />
-          <span><strong>Eligible</strong> — stored at COMEX vaults but not warranted for delivery, left axis.</span>
-        </div>
-        <div className="comex-legend-item">
-          <span className="comex-legend-swatch comex-legend-swatch--dashed" style={{ borderColor: "#e8ecf4" }} />
-          <span><strong>% available for delivery</strong> — registered ÷ (registered + eligible), right axis. Higher = more of COMEX inventory is deliverable, not delivered.</span>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 // ── Panel 4: Paper leverage ratio ──────────────────────────────────────────
@@ -200,42 +92,175 @@ function shortName(name) {
 
 // ── Panel 5: Per-vault snapshot table + pie chart ──────────────────────────
 
-function VaultSnapshotPanel({ depositories, pinnedDate, pinnedDepositories, pinnedLoading }) {
+// Shows real oz AND % share together (not stacked-% alone) — a stacked-area
+// chart was tried first and dropped at the user's request: a vault's stacked
+// band can visually shrink even while its real oz rose, if other vaults grew
+// faster, which misrepresents what actually happened at that vault. Real oz
+// is now the primary series (plotted as lines); % share is still available
+// here, computed from the same day's real numbers, not baked into geometry.
+// Shows real oz AND % share together. A stacked-area chart was tried first
+// and dropped (a vault's stacked band can visually shrink even while its
+// real oz rose, if other vaults grew faster — misleading). A per-vault line
+// chart was tried next and also dropped — with no vault selected, the
+// tooltip listed all 11 vaults stacked vertically and rendered taller than
+// the 300px chart itself, covering the chart and blocking clicks entirely.
+// Fixed here by keeping the default (no vault clicked) tooltip capped to
+// the day's total + top 3 vaults, never all 11 — the full per-vault
+// breakdown is available by clicking a legend row first, which also caps
+// shownKeys to just that one vault.
+function VaultTooltipContent({ active, label, rows, vaultKeys, vaultColor, clickedVault }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  const dayTotal = vaultKeys.reduce((sum, v) => sum + (row[v]?.oz ?? 0), 0);
+  const ranked = vaultKeys.filter((v) => row[v]?.oz != null).sort((a, b) => row[b].oz - row[a].oz);
+  const shownKeys = clickedVault ? [clickedVault] : ranked.slice(0, 3);
+  const hiddenCount = clickedVault ? 0 : ranked.length - shownKeys.length;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px" }}>
+      <div style={{ color: "#c8d0de", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      <div style={{ color: "#8a94a6", marginBottom: 4 }}>Total: {fmt_oz(dayTotal)}</div>
+      {shownKeys.map((v) => (
+        <div key={v} style={{ color: vaultColor(v) }}>
+          {shortName(v)}: {fmt_oz(row[v].oz)}
+          {dayTotal > 0 && ` (${((row[v].oz / dayTotal) * 100).toFixed(1)}%)`}
+        </div>
+      ))}
+      {hiddenCount > 0 && (
+        <div style={{ color: "#5a6278", marginTop: 2 }}>
+          +{hiddenCount} more — click a legend row for detail
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VaultSnapshotPanel({ metal, depositoriesHistory, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
   const [pieMetric, setPieMetric] = useState("total");
+  const [clickedVault, setClickedVault] = useState(null);
 
-  const headerLabel = pinnedDate ? `Per-Vault Snapshot — ${pinnedDate}` : "Per-Vault Snapshot — Today";
+  // A vault clicked under one metal's legend has no meaning under the
+  // other's (different vault sets/names) — clear it on metal switch rather
+  // than leaving a highlighted selection that no longer corresponds to
+  // anything in the new dataset.
+  useEffect(() => {
+    setClickedVault(null);
+  }, [metal]);
 
-  // While a pinned-date fetch is in flight, keep showing today's rows in the
-  // background rather than swapping them out — this component always renders
-  // the exact same tree (header/note/pie-slot/table-slot never disappear),
-  // with only an overlay message toggled inside those fixed-height slots when
-  // there's nothing to show for the pinned date. Any branch that removes the
-  // ResponsiveContainer/table from the tree entirely forces Recharts to
-  // remount and briefly measure 0×0, which visibly collapses the pie — and
-  // the resulting reflow shifts the Delivery Behavior table below it, which
-  // knocks the mouse off the very row being hovered and fires a spurious
-  // mouseleave that cancels the pin.
-  const showingPinned = pinnedDate && !pinnedLoading;
-  const pinnedHasData = (pinnedDepositories?.data?.length ?? 0) > 0;
-  const effectiveDepositories = showingPinned && pinnedHasData ? pinnedDepositories : depositories;
-  const overlayMessage = showingPinned && !pinnedHasData
-    ? `No per-vault snapshot persisted for ${pinnedDate} yet — history only goes back to whenever this data first started being recorded.`
-    : !effectiveDepositories
-    ? "Loading…"
+  const metalLabel = metal === "XAU" ? "Gold" : "Silver";
+
+  // Stable vault -> color assignment (alphabetical by full depository name,
+  // not by whatever order a given day's data happens to sort into) so a
+  // vault keeps the same color across the bar chart, its legend, and the
+  // pie, rather than being re-indexed every render based on that day's
+  // total-descending sort order.
+  const allVaultNames = Array.from(
+    new Set((depositoriesHistory || []).map((r) => r.depository))
+  ).sort();
+  const vaultColor = (name) => VAULT_COLORS[allVaultNames.indexOf(name) % VAULT_COLORS.length];
+
+  // Pivot depositoriesHistory (one row per date+depository) into one row per
+  // date, each vault keyed to its own {oz} object (not a flat % field) —
+  // real oz is the thing actually plotted (as bars, one per vault); %
+  // share is derived from these same real numbers on read (in the tooltip),
+  // never baked into stacking geometry the way a stacked-area chart would.
+  const byDate = {};
+  for (const r of depositoriesHistory || []) {
+    if (r.total == null) continue;
+    if (!byDate[r.date]) byDate[r.date] = { date: r.date };
+    byDate[r.date][r.depository] = { oz: r.total, registered: r.registered, eligible: r.eligible };
+  }
+  const allHistoryRows = Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
+  const historyRows = filterBySFWindow(allHistoryRows, sfWindow, sfCustomStart, sfCustomEnd);
+  // Exact match only, per the user's 2026-07-24 request — unlike every other
+  // Stock & Flow chart (which snap a pin to their own nearest real row via
+  // nearestRowDate, since their date grids can legitimately differ), this
+  // panel blanks out instead of guessing at a nearby date when the shared
+  // pinnedDate doesn't exist in its own (short, accumulates-forward-only)
+  // per-vault history.
+  const pinnedDateSnapped = pinnedDate && historyRows.some((r) => r.date === pinnedDate) ? pinnedDate : null;
+
+  const headerLabel = pinnedDateSnapped
+    ? `${metalLabel} Per-Vault Snapshot — ${pinnedDateSnapped}`
+    : `${metalLabel} Per-Vault Snapshot — Today`;
+
+  // The pie/legend snapshot is client-side now (2026-07-24, replacing the
+  // earlier fetch-on-pin design) — computed straight from depositoriesHistory
+  // rather than a separate /api/{silver,gold}/db/depositories?date= call, since
+  // that full per-vault series is already loaded for the bar chart above.
+  // `rows` is whichever date is pinned, or the true latest date if nothing's
+  // pinned ANYWHERE (pinnedDate itself is null) — but if something IS pinned
+  // and it just doesn't exist in this panel's own data (pinnedDateSnapped
+  // came back null above), snapshotDate stays null too rather than silently
+  // falling back to "today," per the user's explicit "blank it out" request.
+  // `prevRows` is the same vaults' most recent EARLIER date in the full
+  // (unwindowed) history, used for delta — sourced from allHistoryRows, not
+  // the windowed historyRows, so a pin near the start of a narrow window
+  // (e.g. "1M") can still diff against real data just before the window's
+  // own left edge instead of finding no prior day at all.
+  const snapshotDate = pinnedDate ? pinnedDateSnapped : allHistoryRows.at(-1)?.date ?? null;
+  const snapshotIndex = snapshotDate ? allHistoryRows.findIndex((r) => r.date === snapshotDate) : -1;
+  const snapshotRow = snapshotIndex >= 0 ? allHistoryRows[snapshotIndex] : null;
+  const prevRow = snapshotIndex > 0 ? allHistoryRows[snapshotIndex - 1] : null;
+
+  const overlayMessage = !snapshotRow
+    ? pinnedDate
+      ? `No per-vault snapshot for ${pinnedDate} in this panel's data.`
+      : "Loading…"
     : null;
 
-  const rows = [...(effectiveDepositories?.data || [])].sort(
-    (a, b) => (b.total ?? 0) - (a.total ?? 0)
-  );
+  const rows = allVaultNames
+    .map((name) => {
+      const cur = snapshotRow?.[name];
+      const prev = prevRow?.[name];
+      return {
+        depository: name,
+        total: cur?.oz ?? null,
+        registered: cur?.registered ?? null,
+        eligible: cur?.eligible ?? null,
+        prev_total: prev?.oz ?? null,
+        prev_registered: prev?.registered ?? null,
+        prev_eligible: prev?.eligible ?? null,
+      };
+    })
+    .filter((r) => r.total != null)
+    .sort((a, b) => (b.total ?? 0) - (a.total ?? 0));
+
+  // Per-vault day-over-day delta, keyed by full depository name — used by
+  // the legend to dim vaults with no real change on the currently pinned
+  // date, for whichever metric the pie is currently showing.
+  function vaultDelta(name) {
+    const r = rows.find((row) => row.depository === name);
+    const prevKey = `prev_${pieMetric}`;
+    if (!r || r[pieMetric] == null || r[prevKey] == null) return null;
+    return r[pieMetric] - r[prevKey];
+  }
 
   const pieData = rows
     .filter((r) => (r[pieMetric] ?? 0) > 0)
-    .map((r, i) => ({
-      name: shortName(r.depository),
-      fullName: r.depository,
-      value: r[pieMetric],
-      color: VAULT_COLORS[i % VAULT_COLORS.length],
-    }));
+    .map((r) => {
+      const prevKey = `prev_${pieMetric}`;
+      const delta = r[pieMetric] != null && r[prevKey] != null ? r[pieMetric] - r[prevKey] : null;
+      return {
+        name: shortName(r.depository),
+        fullName: r.depository,
+        value: r[pieMetric],
+        delta,
+        color: vaultColor(r.depository),
+      };
+    });
+
+  // Total day-over-day change across every vault — lets a real total_delta
+  // on a pinned date (e.g. from Reclassification vs. Real Inflow) show up
+  // here too, not just in that other chart.
+  const totalDelta = pieData.reduce((sum, d) => (d.delta != null ? sum + d.delta : sum), 0);
+  const totalDeltaKnown = pieData.some((d) => d.delta != null);
+
+  // When a vault's legend row is clicked, the summary above the pie switches
+  // from the aggregate total/change to that specific vault's own total/
+  // change, so clicking a vault surfaces its number directly rather than
+  // only via the pie's hover tooltip.
+  const clickedVaultData = clickedVault ? pieData.find((d) => d.fullName === clickedVault) : null;
 
   const METRIC_LABELS = { total: "Total", registered: "Registered", eligible: "Eligible" };
 
@@ -243,8 +268,10 @@ function VaultSnapshotPanel({ depositories, pinnedDate, pinnedDepositories, pinn
     <div className="comex-panel comex-panel--vault-snapshot">
       <div className="comex-panel-header">{headerLabel}</div>
       <div className="comex-panel-note">
-        Sorted by total descending. Δ columns vs previous day. Green = increase, red = decrease.
-        {pinnedDate && " Pinned from a hovered Delivery Behavior date — hover away to return to today."}
+        Each vault's real ounces held, day by day — click a bar to pin that date across the
+        Stock & Flow charts below, or click a legend row to highlight one vault's segment (oz and
+        % of COMEX total together in the tooltip). Real history only goes back to whenever this
+        data first started being recorded (no upstream backfill), so this may be a short window.
       </div>
 
       <div className="comex-vault-snapshot-body">
@@ -254,84 +281,183 @@ function VaultSnapshotPanel({ depositories, pinnedDate, pinnedDepositories, pinn
           </div>
         )}
 
-        {/* Pie chart */}
-        <div className="comex-vault-pie-row">
-          <div className="comex-pie-metric-selector">
-            {Object.entries(METRIC_LABELS).map(([k, label]) => (
-              <button
-                key={k}
-                className={`comex-range-btn${pieMetric === k ? " comex-range-btn--active" : ""}`}
-                onClick={() => setPieMetric(k)}
-              >
-                {label}
-              </button>
-            ))}
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          {/* Stacked bar of each vault's real oz per day — discrete bars per
+              date, not a continuous filled area, so a vault's segment height
+              directly reflects that day's real oz with no interpolation
+              implying a trend between real data points. Clicking a legend
+              row dims the other vaults' segments rather than removing them,
+              so the whole stack (and total bar height) stays visible for
+              context — a line chart with 11 overlapping lines was tried and
+              dropped (unreadable, and its default all-vaults tooltip
+              rendered taller than the chart, blocking clicks entirely). */}
+          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+            {historyRows.length > 0 ? (
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart
+                  data={historyRows}
+                  margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+                  onClick={(state) => {
+                    if (state?.activeLabel && onPin) onPin(state.activeLabel);
+                  }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+                  <XAxis
+                    dataKey="date"
+                    tickFormatter={(d) => `${d.slice(5, 7)}/${d.slice(8, 10)}`}
+                    tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  />
+                  <YAxis
+                    tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
+                    tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  />
+                  <Tooltip
+                    content={
+                      <VaultTooltipContent
+                        rows={historyRows}
+                        vaultKeys={allVaultNames}
+                        vaultColor={vaultColor}
+                        clickedVault={clickedVault}
+                      />
+                    }
+                  />
+                  {pinnedDateSnapped && (
+                    <ReferenceLine x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
+                  )}
+                  {/* Recharts stacks Bars in render order — first-rendered
+                      sits at the bottom of the stack. Moving the clicked
+                      vault to the front of this list puts its segment flush
+                      against the x-axis, where its own shape/height is
+                      easiest to read (same move CategoryCompositionChart's
+                      stackOrder already makes for its stacked-area bands). */}
+                  {(clickedVault
+                    ? [clickedVault, ...allVaultNames.filter((v) => v !== clickedVault)]
+                    : allVaultNames
+                  ).map((v) => (
+                    <Bar
+                      key={v}
+                      dataKey={`${v}.oz`}
+                      name={v}
+                      stackId="vaults"
+                      fill={vaultColor(v)}
+                      fillOpacity={clickedVault && clickedVault !== v ? 0.2 : 0.85}
+                      isAnimationActive={false}
+                    />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="comex-empty">Loading…</div>
+            )}
           </div>
-          <ResponsiveContainer width="100%" height={300}>
-            <PieChart>
-              <Pie
-                data={pieData}
-                dataKey="value"
-                nameKey="name"
-                cx="50%"
-                cy="50%"
-                outerRadius={110}
-                innerRadius={54}
-                paddingAngle={1}
-              >
-                {pieData.map((entry) => (
-                  <Cell key={entry.fullName} fill={entry.color} />
-                ))}
-              </Pie>
-              <Tooltip
-                contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-                formatter={(v, _, props) => [fmt_oz(v), props.payload.fullName]}
-              />
-              <Legend
-                formatter={(_, entry) => (
-                  <span style={{ color: "#8a94a6", fontSize: 11 }}>{entry.payload.name}</span>
+
+          {/* Pie chart */}
+          <div className="comex-vault-pie-row" style={{ flex: "0 0 260px" }}>
+            <div className="comex-pie-metric-selector">
+              {Object.entries(METRIC_LABELS).map(([k, label]) => (
+                <button
+                  key={k}
+                  className={`comex-range-btn${pieMetric === k ? " comex-range-btn--active" : ""}`}
+                  onClick={() => setPieMetric(k)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {clickedVaultData ? (
+              <div style={{ fontSize: 12, textAlign: "center" }}>
+                <div style={{ color: vaultColor(clickedVault), fontWeight: 600 }}>
+                  {shortName(clickedVault)}
+                </div>
+                {fmt_oz(clickedVaultData.value)}
+                {clickedVaultData.delta != null && (
+                  <>
+                    {" · "}
+                    <span className={delta_class(clickedVaultData.delta)}>
+                      {delta_str(clickedVaultData.delta)}
+                    </span>
+                  </>
                 )}
-              />
-            </PieChart>
-          </ResponsiveContainer>
+              </div>
+            ) : (
+              totalDeltaKnown && (
+                <div style={{ fontSize: 12, textAlign: "center" }}>
+                  Total change:{" "}
+                  <span className={delta_class(totalDelta)}>{delta_str(totalDelta)}</span>
+                </div>
+              )
+            )}
+            <ResponsiveContainer width="100%" height={260}>
+              <PieChart>
+                <Pie
+                  data={pieData}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={100}
+                  innerRadius={50}
+                  paddingAngle={1}
+                >
+                  {pieData.map((entry) => (
+                    <Cell
+                      key={entry.fullName}
+                      fill={entry.color}
+                      fillOpacity={clickedVault && clickedVault !== entry.fullName ? 0.35 : 1}
+                      stroke={clickedVault === entry.fullName ? "#e8ecf4" : undefined}
+                      strokeWidth={clickedVault === entry.fullName ? 2 : undefined}
+                    />
+                  ))}
+                </Pie>
+                <Tooltip
+                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const d = payload[0].payload;
+                    return (
+                      <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "6px 10px" }}>
+                        <div style={{ color: "#c8d0de", fontWeight: 600 }}>{d.fullName}</div>
+                        <div style={{ color: "#8a94a6" }}>{fmt_oz(d.value)}</div>
+                        {d.delta != null && (
+                          <div className={delta_class(d.delta)}>{delta_str(d.delta)} vs. prior day</div>
+                        )}
+                      </div>
+                    );
+                  }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            {snapshotDate && (
+              <div style={{ fontSize: 11, color: "#8a94a6", textAlign: "center" }}>
+                {pinnedDateSnapped ? `As of ${snapshotDate}` : `Latest — ${snapshotDate}`}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* Table */}
-        <div className="comex-table-wrap">
-          <table className="comex-table">
-            <thead>
-              <tr>
-                <th>Depository</th>
-                <th className="right">Registered</th>
-                <th className="right">Eligible</th>
-                <th className="right">Total</th>
-                <th className="right">Δ Registered</th>
-                <th className="right">Δ Eligible</th>
-                <th className="right">Δ Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => {
-                const dReg = r.registered != null && r.prevRegistered != null
-                  ? r.registered - r.prevRegistered : null;
-                const dElig = r.eligible != null && r.prevEligible != null
-                  ? r.eligible - r.prevEligible : null;
-                const dTotal = r.total != null && r.prevTotal != null
-                  ? r.total - r.prevTotal : null;
-                return (
-                  <tr key={r.depository}>
-                    <td className="comex-vault-name">{r.depository}</td>
-                    <td className="right">{fmt_oz(r.registered)}</td>
-                    <td className="right">{fmt_oz(r.eligible)}</td>
-                    <td className="right comex-total-col">{fmt_oz(r.total)}</td>
-                    <td className={`right ${delta_class(dReg)}`}>{delta_str(dReg)}</td>
-                    <td className={`right ${delta_class(dElig)}`}>{delta_str(dElig)}</td>
-                    <td className={`right ${delta_class(dTotal)}`}>{delta_str(dTotal)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="comex-legend-list comex-legend-list--horizontal">
+          {allVaultNames.map((v) => {
+            const delta = pinnedDateSnapped ? vaultDelta(v) : null;
+            const noChange = pinnedDateSnapped && (delta == null || delta === 0);
+            return (
+            <button
+              key={v}
+              className={`comex-legend-item legend-btn-row${clickedVault === v ? " legend-btn-row--baseline" : ""}`}
+              style={{ "--legend-color": vaultColor(v), opacity: noChange ? 0.4 : 1 }}
+              onClick={() => setClickedVault((prev) => (prev === v ? null : v))}
+            >
+              <span className="comex-legend-swatch" style={{ background: vaultColor(v) }} />
+              <span>
+                {shortName(v)}
+                {pinnedDateSnapped && delta != null && delta !== 0 && (
+                  <span className={delta_class(delta)} style={{ marginLeft: 4 }}>
+                    {delta_str(delta)}
+                  </span>
+                )}
+              </span>
+            </button>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -423,14 +549,32 @@ function DeliveryNoticesPanel({ delivery }) {
 // SHFE only has ~8 months of history from metalcharts so the overlap window
 // determines how far back the combined view goes.
 
-function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
-  const [range, setRange] = useState("1Y");
-
-  if (!comexHistory && !shfeHistory) return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">COMEX vs SHFE — Combined Inventory</div>
-      <div className="comex-empty">Loading…</div>
+function CrossExchangeTooltipContent({ active, label, rows }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px" }}>
+      <div style={{ color: "#c8d0de", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      {row.comex != null && <div style={{ color: "#7b9fff" }}>COMEX (USA): {fmt_moz(row.comex)}</div>}
+      {row.shfe != null && <div style={{ color: "#f87171" }}>SHFE (China): {fmt_moz(row.shfe)}</div>}
+      {row.pslv != null && (
+        <div style={{ color: "#4caf76" }}>PSLV/Sprott (Canada): {fmt_moz(row.pslv)} (today's snapshot)</div>
+      )}
     </div>
+  );
+}
+
+function CrossExchangePanel({ comexHistory, shfeHistory, pslv, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
+  if (!comexHistory && !shfeHistory) return (
+    <details className="collapsible-pane" open>
+      <summary className="collapsible-pane-title">Silver Inventory — Exchange Reserves</summary>
+      <div className="collapsible-pane-body">
+        <div className="comex-panel">
+          <div className="comex-empty">Loading…</div>
+        </div>
+      </div>
+    </details>
   );
 
   const shfeByDate = {};
@@ -446,22 +590,17 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
     pslv: pslvOz,
   }));
 
-  const filtered = filterByRange(raw, range);
+  const filtered = filterBySFWindow(raw, sfWindow, sfCustomStart, sfCustomEnd);
   const ticks = xTicks(filtered);
 
   const hasData = filtered.some((r) => r.comex != null || r.shfe != null);
+  const pinnedDateSnapped = nearestRowDate(filtered, pinnedDate);
 
   return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">
-        COMEX vs SHFE — Physical Exchange Inventories
-        <RangeSelector value={range} onChange={setRange} />
-      </div>
-      <div className="comex-panel-note">
-        Both in troy oz. SHFE converted from kg (÷1000 × 32.1507). SHFE history
-        available from Nov 2025 via metalcharts. LME requires a paid subscription
-        and is not shown.
-      </div>
+    <details className="collapsible-pane" open>
+      <summary className="collapsible-pane-title">Silver Inventory — Exchange Reserves</summary>
+      <div className="collapsible-pane-body">
+        <div className="comex-panel">
       {hasData ? (
         <>
           {(() => {
@@ -499,7 +638,13 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
             );
           })()}
           <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={filtered} margin={{ top: 4, right: 56, left: 12, bottom: 4 }}>
+            <LineChart
+              data={filtered}
+              margin={{ top: 4, right: 56, left: 12, bottom: 4 }}
+              onClick={(state) => {
+                if (state?.activeLabel && onPin) onPin(state.activeLabel);
+              }}
+            >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
               <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
               <YAxis
@@ -515,18 +660,10 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
                 tick={{ fill: "#f87171", fontSize: 11 }}
                 width={52}
               />
-              <Tooltip
-                contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-                labelStyle={{ color: "#c8d0de" }}
-                formatter={(v, name) => [
-                  fmt_moz(v),
-                  name === "comex"
-                    ? "COMEX (USA) — left axis"
-                    : name === "pslv"
-                    ? "PSLV/Sprott (Canada) — left axis, today's snapshot"
-                    : "SHFE (China) — right axis",
-                ]}
-              />
+              <Tooltip content={<CrossExchangeTooltipContent rows={filtered} />} />
+              {pinnedDateSnapped && (
+                <ReferenceLine yAxisId="comex" x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
+              )}
               <Line yAxisId="comex" type="monotone" dataKey="comex" stroke="#7b9fff"
                 dot={false} strokeWidth={1.8} connectNulls={false} />
               <Line yAxisId="shfe" type="monotone" dataKey="shfe" stroke="#f87171"
@@ -537,6 +674,11 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
               )}
             </LineChart>
           </ResponsiveContainer>
+          {pinnedDateSnapped && (
+            <div style={{ marginTop: 4 }}>
+              <CrossExchangeTooltipContent active label={pinnedDateSnapped} rows={filtered} />
+            </div>
+          )}
           <div className="comex-legend-list">
             <div className="comex-legend-item">
               <span className="comex-legend-swatch" style={{ background: "#7b9fff" }} />
@@ -551,49 +693,65 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv }) {
               <span><strong>PSLV/Sprott (Canada)</strong> — left axis, today's snapshot only (not a historical series), Sprott Physical Silver Trust holdings.</span>
             </div>
           </div>
-          <div className="comex-dual-axis-note">
-            Dual independent axes — each line uses its own scale to show trend movement.
-            COMEX is genuinely ~12× larger than SHFE in absolute terms (see bars above).
-          </div>
         </>
       ) : (
         <div className="comex-empty">No overlapping data in this range</div>
       )}
-    </div>
+        </div>
+      </div>
+    </details>
   );
 }
 
 // ── SHFE history panel ──────────────────────────────────────────────────────
 
-function ShfeHistoryPanel({ shfeHistory }) {
-  const [range, setRange] = useState("1Y");
-  const filtered = filterByRange(shfeHistory, range);
+function ShfeHistoryTooltipContent({ active, label, rows }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px" }}>
+      <div style={{ color: "#c8d0de", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      <div style={{ color: "#f87171" }}>SHFE Total: {fmt_moz(row.total_oz)}</div>
+    </div>
+  );
+}
+
+function ShfeHistoryPanel({ shfeHistory, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
+  // Driven by Stock & Flow's shared window selector (2026-07-24), same as
+  // Silver Inventory/Per-Vault Snapshot/Delivery Behavior — dropped this
+  // chart's own independent RangeSelector.
+  const filtered = filterBySFWindow(shfeHistory, sfWindow, sfCustomStart, sfCustomEnd);
   const ticks = xTicks(filtered);
+  const pinnedDateSnapped = nearestRowDate(filtered, pinnedDate);
 
   return (
     <div className="comex-panel">
-      <div className="comex-panel-header">
-        SHFE Silver Inventory (Shanghai)
-        <RangeSelector value={range} onChange={setRange} />
-      </div>
+      <div className="comex-panel-header">SHFE Silver Inventory (Shanghai)</div>
       <div className="comex-panel-note">
         Shanghai Futures Exchange warranted silver, in troy oz (converted from kg).
-        SHFE silver is measured in kg; 1 lot = 15 kg.
+        SHFE silver is measured in kg; 1 lot = 15 kg. Click the chart to pin a date across the
+        Stock &amp; Flow charts.
       </div>
       {filtered && filtered.length > 0 ? (
         <ResponsiveContainer width="100%" height={260}>
-          <LineChart data={filtered} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+          <LineChart
+            data={filtered}
+            margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+            onClick={(state) => {
+              if (state?.activeLabel && onPin) onPin(state.activeLabel);
+            }}
+          >
             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
             <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
             <YAxis
               tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
               tick={{ fill: "#8a94a6", fontSize: 11 }}
             />
-            <Tooltip
-              contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-              labelStyle={{ color: "#c8d0de" }}
-              formatter={(v) => [fmt_moz(v), "SHFE Total"]}
-            />
+            <Tooltip content={<ShfeHistoryTooltipContent rows={filtered} />} />
+            {pinnedDateSnapped && (
+              <ReferenceLine x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
+            )}
             <Line type="monotone" dataKey="total_oz" stroke="#f87171" dot={false}
               strokeWidth={1.8} connectNulls={false} />
           </LineChart>
@@ -601,94 +759,289 @@ function ShfeHistoryPanel({ shfeHistory }) {
       ) : (
         <div className="comex-empty">No data</div>
       )}
+      {pinnedDateSnapped && (
+        <div style={{ marginTop: 4 }}>
+          <ShfeHistoryTooltipContent active label={pinnedDateSnapped} rows={filtered} />
+        </div>
+      )}
     </div>
   );
 }
 
 // ── SHFE warehouse snapshot table ───────────────────────────────────────────
 
-function ShfeWarehousePanel({ shfeWarehouses }) {
-  if (!shfeWarehouses) return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">SHFE Warehouse Snapshot</div>
-      <div className="comex-empty">Loading…</div>
+// ── SHFE per-warehouse snapshot + history (bar chart + pie, one panel) ──────
+// Merged into a single panel 2026-07-24 to match VaultSnapshotPanel's layout
+// (COMEX's stacked bar + pie live side by side in one panel; SHFE's were
+// two separate panels — inconsistent, fixed here). No registered/eligible
+// split or metric toggle exists here, unlike VaultSnapshotPanel's Total/
+// Registered/Eligible buttons — SHFE only ever reports total warrant stock,
+// so Total is the only real number this exchange has.
+
+function ShfeVaultTooltipContent({ active, label, rows, warehouseKeys, warehouseColor }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  const dayTotal = warehouseKeys.reduce((sum, w) => sum + (row[w]?.oz ?? 0), 0);
+  const ranked = warehouseKeys.filter((w) => row[w]?.oz != null).sort((a, b) => row[b].oz - row[a].oz);
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px" }}>
+      <div style={{ color: "#c8d0de", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      <div style={{ color: "#8a94a6", marginBottom: 4 }}>Total: {fmt_oz(dayTotal)}</div>
+      {ranked.slice(0, 3).map((w) => (
+        <div key={w} style={{ color: warehouseColor(w) }}>
+          {w}: {fmt_oz(row[w].oz)}
+          {dayTotal > 0 && ` (${((row[w].oz / dayTotal) * 100).toFixed(1)}%)`}
+        </div>
+      ))}
+      {ranked.length > 3 && (
+        <div style={{ color: "#5a6278", marginTop: 2 }}>
+          +{ranked.length - 3} more — click a legend row for detail
+        </div>
+      )}
     </div>
   );
+}
 
-  const rows = [...(shfeWarehouses.data || [])].sort(
-    (a, b) => (b.warrant ?? 0) - (a.warrant ?? 0)
-  );
+function ShfeWarehousePanel({ metal, shfeWarehousesHistory, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
+  const [clickedWarehouse, setClickedWarehouse] = useState(null);
 
-  const totalOz = rows.reduce((s, r) => s + (r.warrant_oz ?? 0), 0);
-  const date = rows[0]?.date ?? "—";
+  // A warehouse clicked under one metal has no meaning under the other
+  // (different warehouse sets) — clear on metal switch, same as COMEX's
+  // VaultSnapshotPanel does for clickedVault.
+  useEffect(() => {
+    setClickedWarehouse(null);
+  }, [metal]);
 
-  const pieData = rows
+  const allWarehouseNames = Array.from(
+    new Set((shfeWarehousesHistory || []).map((r) => r.warehouse))
+  ).sort();
+  const warehouseColor = (name) => VAULT_COLORS[allWarehouseNames.indexOf(name) % VAULT_COLORS.length];
+
+  // Pivot shfeWarehousesHistory (one row per date+warehouse) into one row
+  // per date, each warehouse keyed to its own {oz} object — mirrors
+  // VaultSnapshotPanel's exact pattern (COMEX) so the pie/legend/table
+  // snapshot is pin-aware here too, not just the bar chart. Previously this
+  // panel read a separate "latest" fetch (shfeWarehouses) for the pie/table,
+  // which meant the pie never actually moved when a date was pinned — a
+  // real functional gap vs. COMEX, fixed by deriving everything from the
+  // same history series the bar chart already uses.
+  const byDate = {};
+  for (const r of shfeWarehousesHistory || []) {
+    if (r.warrant_oz == null) continue;
+    if (!byDate[r.date]) byDate[r.date] = { date: r.date };
+    byDate[r.date][r.warehouse] = { oz: r.warrant_oz };
+  }
+  const allHistoryRows = Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
+  const historyRows = filterBySFWindow(allHistoryRows, sfWindow, sfCustomStart, sfCustomEnd);
+  // Exact match only, same as VaultSnapshotPanel's own pin — a pinned date
+  // that doesn't exist in SHFE's own (independently short) history blanks
+  // out rather than guessing at a nearby date.
+  const pinnedDateSnapped = pinnedDate && historyRows.some((r) => r.date === pinnedDate) ? pinnedDate : null;
+
+  const headerLabel = pinnedDateSnapped
+    ? `SHFE Warehouse Snapshot — ${pinnedDateSnapped}`
+    : "SHFE Warehouse Snapshot — Today";
+
+  // Same "pinned date if it exists here, else true latest, but stay blank
+  // if something's pinned elsewhere and just doesn't exist in this panel's
+  // data" logic as VaultSnapshotPanel.
+  const snapshotDate = pinnedDate ? pinnedDateSnapped : allHistoryRows.at(-1)?.date ?? null;
+  const snapshotIndex = snapshotDate ? allHistoryRows.findIndex((r) => r.date === snapshotDate) : -1;
+  const snapshotRow = snapshotIndex >= 0 ? allHistoryRows[snapshotIndex] : null;
+  const prevRow = snapshotIndex > 0 ? allHistoryRows[snapshotIndex - 1] : null;
+
+  const overlayMessage = !snapshotRow
+    ? pinnedDate
+      ? `No SHFE warehouse snapshot for ${pinnedDate} in this panel's data.`
+      : "Loading…"
+    : null;
+
+  const snapshotRows = allWarehouseNames
+    .map((name) => {
+      const cur = snapshotRow?.[name];
+      const prev = prevRow?.[name];
+      return {
+        warehouse: name,
+        warrant_oz: cur?.oz ?? null,
+        warrant_change_oz: cur?.oz != null && prev?.oz != null ? cur.oz - prev.oz : null,
+      };
+    })
+    .filter((r) => r.warrant_oz != null)
+    .sort((a, b) => (b.warrant_oz ?? 0) - (a.warrant_oz ?? 0));
+  const totalOz = snapshotRows.reduce((s, r) => s + (r.warrant_oz ?? 0), 0);
+
+  const stackOrder = clickedWarehouse
+    ? [clickedWarehouse, ...allWarehouseNames.filter((w) => w !== clickedWarehouse)]
+    : allWarehouseNames;
+
+  const pieData = snapshotRows
     .filter((r) => (r.warrant_oz ?? 0) > 0)
-    .map((r, i) => ({
+    .map((r) => ({
       name: r.warehouse,
       value: r.warrant_oz,
-      color: VAULT_COLORS[i % VAULT_COLORS.length],
+      delta: r.warrant_change_oz,
+      color: warehouseColor(r.warehouse),
     }));
 
+  // Total day-over-day change across every warehouse — same summary
+  // COMEX's VaultSnapshotPanel shows above its pie.
+  const totalDelta = pieData.reduce((sum, d) => (d.delta != null ? sum + d.delta : sum), 0);
+  const totalDeltaKnown = pieData.some((d) => d.delta != null);
+  const clickedWarehouseData = clickedWarehouse ? pieData.find((d) => d.name === clickedWarehouse) : null;
+
   return (
-    <div className="comex-panel">
-      <div className="comex-panel-header">SHFE Warehouse Snapshot — {date}</div>
+    <div className="comex-panel comex-panel--vault-snapshot">
+      <div className="comex-panel-header">{headerLabel}</div>
       <div className="comex-panel-note">
-        Warranted silver by approved SHFE warehouse. Δ = change from prior day.
-        Values in troy oz (converted from kg).
+        Each warehouse's real warrant ounces held, day by day — click a bar to pin that date
+        across the Stock &amp; Flow charts, or click a legend row to highlight one warehouse in
+        both the bar chart and the pie. Δ = change from prior day. Real history only goes back
+        to whenever this data first started being recorded (no upstream backfill), so this may
+        be a short window.
+        {metal === "XAU" && allWarehouseNames.length === 0 && (
+          <> <strong>metalcharts.org does not report a per-warehouse breakdown for SHFE
+          gold</strong> — confirmed live 2026-07-24 (a real 200 response with an empty data
+          array), unlike silver, which has full per-warehouse detail. SHFE gold's total is
+          still available below.</>
+        )}
       </div>
 
-      <ResponsiveContainer width="100%" height={280}>
-        <PieChart>
-          <Pie data={pieData} dataKey="value" nameKey="name"
-            cx="50%" cy="50%" outerRadius={100} innerRadius={48} paddingAngle={2}>
-            {pieData.map((entry) => (
-              <Cell key={entry.name} fill={entry.color} />
-            ))}
-          </Pie>
-          <Tooltip
-            contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-            formatter={(v, _, props) => [fmt_oz(v), props.payload.name]}
-          />
-          <Legend
-            formatter={(_, entry) => (
-              <span style={{ color: "#8a94a6", fontSize: 11 }}>{entry.payload.name}</span>
-            )}
-          />
-        </PieChart>
-      </ResponsiveContainer>
+      <div className="comex-vault-snapshot-body">
+        {overlayMessage && (
+          <div className="comex-vault-snapshot-overlay">
+            <div className="comex-empty">{overlayMessage}</div>
+          </div>
+        )}
 
-      <div className="comex-table-wrap">
-        <table className="comex-table">
-          <thead>
-            <tr>
-              <th>Warehouse</th>
-              <th className="right">Warrants (oz)</th>
-              <th className="right">Δ (oz)</th>
-              <th className="right">Share</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => {
-              const share = totalOz > 0 ? ((r.warrant_oz ?? 0) / totalOz * 100).toFixed(1) : "—";
-              const dClass = delta_class(r.warrant_change_oz);
-              return (
-                <tr key={r.warehouse}>
-                  <td className="comex-vault-name">{r.warehouse}</td>
-                  <td className="right">{fmt_oz(r.warrant_oz)}</td>
-                  <td className={`right ${dClass}`}>{delta_str(r.warrant_change_oz)}</td>
-                  <td className="right" style={{ color: "#6b778d" }}>{share}%</td>
-                </tr>
-              );
-            })}
-            <tr className="comex-table-total">
-              <td><strong>Total</strong></td>
-              <td className="right"><strong>{fmt_oz(totalOz)}</strong></td>
-              <td className="right" />
-              <td className="right" style={{ color: "#6b778d" }}>100%</td>
-            </tr>
-          </tbody>
-        </table>
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+          {historyRows.length > 0 ? (
+            <ResponsiveContainer width="100%" height={300}>
+              <BarChart
+                data={historyRows}
+                margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+                onClick={(state) => {
+                  if (state?.activeLabel && onPin) onPin(state.activeLabel);
+                }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d) => `${d.slice(5, 7)}/${d.slice(8, 10)}`}
+                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                />
+                <YAxis
+                  tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
+                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                />
+                <Tooltip
+                  content={
+                    <ShfeVaultTooltipContent
+                      rows={historyRows}
+                      warehouseKeys={allWarehouseNames}
+                      warehouseColor={warehouseColor}
+                    />
+                  }
+                />
+                {pinnedDateSnapped && (
+                  <ReferenceLine x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
+                )}
+                {stackOrder.map((w) => (
+                  <Bar
+                    key={w}
+                    dataKey={`${w}.oz`}
+                    name={w}
+                    stackId="warehouses"
+                    fill={warehouseColor(w)}
+                    fillOpacity={clickedWarehouse && clickedWarehouse !== w ? 0.2 : 0.85}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="comex-empty">Loading…</div>
+          )}
+        </div>
+
+        <div className="comex-vault-pie-row" style={{ flex: "0 0 260px" }}>
+          {clickedWarehouseData ? (
+            <div style={{ fontSize: 12, textAlign: "center" }}>
+              <div style={{ color: warehouseColor(clickedWarehouse), fontWeight: 600 }}>
+                {clickedWarehouse}
+              </div>
+              {fmt_oz(clickedWarehouseData.value)}
+              {clickedWarehouseData.delta != null && (
+                <>
+                  {" · "}
+                  <span className={delta_class(clickedWarehouseData.delta)}>
+                    {delta_str(clickedWarehouseData.delta)}
+                  </span>
+                </>
+              )}
+            </div>
+          ) : (
+            totalDeltaKnown && (
+              <div style={{ fontSize: 12, textAlign: "center" }}>
+                Total change:{" "}
+                <span className={delta_class(totalDelta)}>{delta_str(totalDelta)}</span>
+              </div>
+            )
+          )}
+          <ResponsiveContainer width="100%" height={260}>
+            <PieChart>
+              <Pie data={pieData} dataKey="value" nameKey="name"
+                cx="50%" cy="50%" outerRadius={100} innerRadius={50} paddingAngle={1}>
+                {pieData.map((entry) => (
+                  <Cell
+                    key={entry.name}
+                    fill={entry.color}
+                    fillOpacity={clickedWarehouse && clickedWarehouse !== entry.name ? 0.35 : 1}
+                    stroke={clickedWarehouse === entry.name ? "#e8ecf4" : undefined}
+                    strokeWidth={clickedWarehouse === entry.name ? 2 : undefined}
+                  />
+                ))}
+              </Pie>
+              <Tooltip
+                contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                content={({ active, payload }) => {
+                  if (!active || !payload?.length) return null;
+                  const d = payload[0].payload;
+                  return (
+                    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "6px 10px" }}>
+                      <div style={{ color: "#c8d0de", fontWeight: 600 }}>{d.name}</div>
+                      <div style={{ color: "#8a94a6" }}>{fmt_oz(d.value)}</div>
+                      {d.delta != null && (
+                        <div className={delta_class(d.delta)}>{delta_str(d.delta)} vs. prior day</div>
+                      )}
+                    </div>
+                  );
+                }}
+              />
+            </PieChart>
+          </ResponsiveContainer>
+          {snapshotDate && (
+            <div style={{ fontSize: 11, color: "#8a94a6", textAlign: "center" }}>
+              {pinnedDateSnapped ? `As of ${snapshotDate}` : `Latest — ${snapshotDate}`}
+            </div>
+          )}
+        </div>
+        </div>
+
+        <div className="comex-legend-list comex-legend-list--horizontal">
+          {allWarehouseNames.map((w) => (
+            <button
+              key={w}
+              className={`comex-legend-item legend-btn-row${clickedWarehouse === w ? " legend-btn-row--baseline" : ""}`}
+              style={{ "--legend-color": warehouseColor(w) }}
+              onClick={() => setClickedWarehouse((prev) => (prev === w ? null : w))}
+            >
+              <span className="comex-legend-swatch" style={{ background: warehouseColor(w) }} />
+              <span>{w}</span>
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -828,46 +1181,49 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
 
 export default function ComexInventoryDashboard() {
   const [history, setHistory] = useState(null);
-  const [depositories, setDepositories] = useState(null);
+  const [depositoriesHistory, setDepositoriesHistory] = useState(null);
+  const [goldDepositoriesHistory, setGoldDepositoriesHistory] = useState(null);
   const [delivery, setDelivery] = useState(null);
   const [shfeHistory, setShfeHistory] = useState(null);
-  const [shfeWarehouses, setShfeWarehouses] = useState(null);
+  const [shfeWarehousesHistory, setShfeWarehousesHistory] = useState(null);
+  const [shfeGoldHistory, setShfeGoldHistory] = useState(null);
+  const [shfeGoldWarehousesHistory, setShfeGoldWarehousesHistory] = useState(null);
   const [pslv, setPslv] = useState(null);
-  const [lastFetch, setLastFetch] = useState(null);
   const [fetchError, setFetchError] = useState(null);
   const timerRef = useRef(null);
 
-  // Hovering a Delivery Behavior reclassification row pins VaultSnapshotPanel
-  // to that date's per-depository snapshot instead of today's. Separate from
-  // `depositories` (today's data, polled) so returning to "today" doesn't
-  // require a re-fetch.
-  const [pinnedDate, setPinnedDate] = useState(null);
-  const [pinnedDepositories, setPinnedDepositories] = useState(null);
-  const [pinnedLoading, setPinnedLoading] = useState(false);
-  const pinnedRequestRef = useRef(0);
+  // Stock & Flow's own panel-wide date selector — drives every chart in this
+  // section (Silver Inventory, Per-Vault Snapshot, Delivery Behavior/
+  // Reclassification vs. Real Inflow), per the user's 2026-07-24 request,
+  // same 6-preset-plus-Custom shape as Paper Games/Dollars and Sense's own
+  // selectors. Client-side filtering of each chart's already-fetched series,
+  // same as those two panels — no per-window refetch.
+  const [sfWindow, setSfWindow] = useState("1Y");
+  const [sfCustomStart, setSfCustomStart] = useState("");
+  const [sfCustomEnd, setSfCustomEnd] = useState("");
 
-  const handleHoverDate = useCallback((date) => {
-    setPinnedDate(date);
-    if (!date) {
-      setPinnedLoading(false);
-      return;
-    }
-    const requestId = ++pinnedRequestRef.current;
-    setPinnedLoading(true);
-    fetch(`/api/silver/db/depositories?date=${date}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((json) => {
-        if (pinnedRequestRef.current === requestId) {
-          setPinnedDepositories(json);
-          setPinnedLoading(false);
-        }
-      })
-      .catch(() => {
-        if (pinnedRequestRef.current === requestId) {
-          setPinnedDepositories({ data: [] });
-          setPinnedLoading(false);
-        }
-      });
+  // Cross-chart click-to-pin (2026-07-24, replacing the earlier hover-driven,
+  // server-refetching pin) — same convention as Money Supply/Paper Games:
+  // one shared pinnedDate string, any chart's onClick can set it, every
+  // chart snaps it to its own nearest real row via nearestRowDate and draws
+  // its own ReferenceLine. Pure client-side against each chart's own
+  // already-fetched data — no fetch-on-pin, unlike the old design (which
+  // re-fetched /api/{silver,gold}/db/depositories?date= on every hover).
+  const [pinnedDate, setPinnedDate] = useState(null);
+  // comexMetal drives both VaultSnapshotPanel and DeliveryBehaviorPanel —
+  // owned here (2026-07-24) and rendered as a selector in "COMEX — New
+  // York"'s own header, since it's the shared parent of both panels. Used
+  // to live as local state inside DeliveryBehaviorPanel, reported upward via
+  // a callback; now it's a plain controlled prop passed down to both.
+  const [comexMetal, setComexMetal] = useState("XAG");
+  // shfeMetal is SHFE's own independent metal toggle (added 2026-07-24 with
+  // the SHFE gold build-out) — deliberately separate state from comexMetal,
+  // since COMEX and SHFE are different exchanges with no reason to be forced
+  // to the same metal at the same time.
+  const [shfeMetal, setShfeMetal] = useState("XAG");
+
+  const handlePin = useCallback((date) => {
+    setPinnedDate((prev) => (prev === date ? null : date));
   }, []);
 
   const fetchAll = useCallback(async () => {
@@ -891,17 +1247,21 @@ export default function ComexInventoryDashboard() {
     // server-side by the tiered background refresh (see RefreshControls).
     await get("/api/silver/db/history",           setHistory,       (j) => j.data ?? null);
     await delay(300);
-    await get("/api/silver/db/depositories",      setDepositories,  null);
+    await get("/api/silver/db/depositories/history", setDepositoriesHistory, (j) => j.data ?? null);
+    await delay(300);
+    await get("/api/gold/db/depositories/history", setGoldDepositoriesHistory, (j) => j.data ?? null);
     await delay(300);
     await get("/api/silver/db/delivery?type=mtd", setDelivery,      null);
     await delay(300);
     await get("/api/shfe/db/history",             setShfeHistory,   (j) => j.data ?? null);
     await delay(300);
-    await get("/api/shfe/db/warehouses",          setShfeWarehouses, null);
+    await get("/api/shfe/db/warehouses/history",  setShfeWarehousesHistory, (j) => j.data ?? null);
+    await delay(300);
+    await get("/api/shfe/gold/db/history",        setShfeGoldHistory, (j) => j.data ?? null);
+    await delay(300);
+    await get("/api/shfe/gold/db/warehouses/history", setShfeGoldWarehousesHistory, (j) => j.data ?? null);
     await delay(300);
     await get("/api/pslv/db",                     setPslv,           null);
-
-    setLastFetch(Date.now());
   }, []);
 
   useEffect(() => {
@@ -914,57 +1274,117 @@ export default function ComexInventoryDashboard() {
     };
   }, [fetchAll]);
 
-  const stale = lastFetch && Date.now() - lastFetch > STALE_MS;
-
   return (
-    <details className="collapsible-pane" open>
-      <summary className="collapsible-pane-title">
+    <div className="comex-panel">
+      <div className="comex-panel-header">
         Stock &amp; Flow
-        <span className="stock-flow-title-source"></span>
-      </summary>
-      <div className="collapsible-pane-body">
-        <div className="comex-shell">
-          <div className="comex-header">
-            <div className="comex-title">Silver Inventory — Exchange Reserves</div>
-            <div className="comex-subtitle">
-              COMEX (USA) · SHFE (China) · reads from AV's own database, refreshed{" "}
-              from metalcharts.org/Sprott on a server-side schedule
-            </div>
-            {lastFetch && (
-              <div className={`comex-freshness${stale ? " comex-freshness--stale" : ""}`}>
-                {stale ? "⚠ Stale — " : ""}Last updated:{" "}
-                {new Date(lastFetch).toLocaleTimeString()}
-              </div>
-            )}
-            {fetchError && (
+        <div className="comex-range-selector">
+          {pinnedDate && (
+            <button
+              className="comex-range-btn"
+              onClick={() => setPinnedDate(null)}
+              title="Click to remove the pinned date"
+            >
+              📌 {pinnedDate}
+            </button>
+          )}
+          {SF_WINDOWS.map((w) => (
+            <button
+              key={w}
+              className={`comex-range-btn${sfWindow === w ? " comex-range-btn--active" : ""}`}
+              onClick={() => setSfWindow(w)}
+            >
+              {w}
+            </button>
+          ))}
+          <button
+            className={`comex-range-btn${sfWindow === "custom" ? " comex-range-btn--active" : ""}`}
+            onClick={() => setSfWindow("custom")}
+          >
+            Custom
+          </button>
+        </div>
+      </div>
+      {sfWindow === "custom" && (
+        <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+            From
+            <input
+              type="date"
+              value={sfCustomStart}
+              onChange={(e) => setSfCustomStart(e.target.value)}
+              max={sfCustomEnd || undefined}
+            />
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+            To
+            <input
+              type="date"
+              value={sfCustomEnd}
+              onChange={(e) => setSfCustomEnd(e.target.value)}
+              min={sfCustomStart || undefined}
+            />
+          </label>
+          {sfCustomStart && sfCustomEnd && sfCustomStart > sfCustomEnd && (
+            <span style={{ fontSize: 11, color: "#e05252" }}>Start must be before end.</span>
+          )}
+        </div>
+      )}
+      <div className="comex-shell">
+          {fetchError && (
+            <div className="comex-header">
               <div className="comex-error">
                 Error fetching data: {fetchError}. Is the FastAPI proxy running?{" "}
                 <code>uvicorn main:app --reload</code>
               </div>
-            )}
-          </div>
+            </div>
+          )}
 
-          <CrossExchangePanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
+          <CrossExchangePanel
+            comexHistory={history}
+            shfeHistory={shfeHistory}
+            pslv={pslv}
+            sfWindow={sfWindow}
+            sfCustomStart={sfCustomStart}
+            sfCustomEnd={sfCustomEnd}
+            pinnedDate={pinnedDate}
+            onPin={handlePin}
+          />
 
           <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">COMEX — New York</summary>
+            <summary className="collapsible-pane-title">
+              COMEX — New York
+              <select
+                value={comexMetal}
+                onChange={(e) => setComexMetal(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                style={{ marginLeft: "auto" }}
+              >
+                <option value="XAG">Silver</option>
+                <option value="XAU">Gold</option>
+              </select>
+            </summary>
             <div className="collapsible-pane-body">
               <VaultSnapshotPanel
-                depositories={depositories}
+                metal={comexMetal}
+                depositoriesHistory={comexMetal === "XAU" ? goldDepositoriesHistory : depositoriesHistory}
+                sfWindow={sfWindow}
+                sfCustomStart={sfCustomStart}
+                sfCustomEnd={sfCustomEnd}
                 pinnedDate={pinnedDate}
-                pinnedDepositories={pinnedDepositories}
-                pinnedLoading={pinnedLoading}
+                onPin={handlePin}
               />
               <details className="collapsible-pane">
                 <summary className="collapsible-pane-title">Delivery Behavior</summary>
                 <div className="collapsible-pane-body">
-                  <DeliveryBehaviorPanel onHoverDate={handleHoverDate} />
-                </div>
-              </details>
-              <details className="collapsible-pane">
-                <summary className="collapsible-pane-title">Registered vs Eligible Silver — % Available for Delivery</summary>
-                <div className="collapsible-pane-body">
-                  <RegEligiblePanel history={history} />
+                  <DeliveryBehaviorPanel
+                    metal={comexMetal}
+                    sfWindow={sfWindow}
+                    sfCustomStart={sfCustomStart}
+                    sfCustomEnd={sfCustomEnd}
+                    pinnedDate={pinnedDate}
+                    onPin={handlePin}
+                  />
                 </div>
               </details>
               <details className="collapsible-pane">
@@ -977,13 +1397,41 @@ export default function ComexInventoryDashboard() {
           </details>
 
           <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">SHFE — Shanghai</summary>
+            <summary className="collapsible-pane-title">
+              SHFE — Shanghai
+              <select
+                value={shfeMetal}
+                onChange={(e) => setShfeMetal(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                style={{ marginLeft: "auto" }}
+              >
+                <option value="XAG">Silver</option>
+                <option value="XAU">Gold</option>
+              </select>
+            </summary>
             <div className="collapsible-pane-body">
-              <ShfeWarehousePanel shfeWarehouses={shfeWarehouses} />
+              <ShfeWarehousePanel
+                metal={shfeMetal}
+                shfeWarehousesHistory={shfeMetal === "XAU" ? shfeGoldWarehousesHistory : shfeWarehousesHistory}
+                sfWindow={sfWindow}
+                sfCustomStart={sfCustomStart}
+                sfCustomEnd={sfCustomEnd}
+                pinnedDate={pinnedDate}
+                onPin={handlePin}
+              />
               <details className="collapsible-pane">
-                <summary className="collapsible-pane-title">SHFE Silver Inventory (Shanghai)</summary>
+                <summary className="collapsible-pane-title">
+                  {shfeMetal === "XAU" ? "SHFE Gold Inventory (Shanghai)" : "SHFE Silver Inventory (Shanghai)"}
+                </summary>
                 <div className="collapsible-pane-body">
-                  <ShfeHistoryPanel shfeHistory={shfeHistory} />
+                  <ShfeHistoryPanel
+                    shfeHistory={shfeMetal === "XAU" ? shfeGoldHistory : shfeHistory}
+                    sfWindow={sfWindow}
+                    sfCustomStart={sfCustomStart}
+                    sfCustomEnd={sfCustomEnd}
+                    pinnedDate={pinnedDate}
+                    onPin={handlePin}
+                  />
                 </div>
               </details>
             </div>
@@ -1022,8 +1470,7 @@ export default function ComexInventoryDashboard() {
             proxy (Shanghai Futures Exchange, converted from kg). LME (London) requires
             a paid API subscription and is not shown. SQLite persistence in argentvigil.db.
           </div>
-        </div>
       </div>
-    </details>
+    </div>
   );
 }

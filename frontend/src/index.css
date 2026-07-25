@@ -332,11 +332,15 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border-radius: 8px; padding: 18px 20px;
   display: flex; flex-direction: column; gap: 10px;
 }
-/* Locks the panel's frame to its tallest state (pie + full depository table)
-   so hovering a Delivery Behavior row to pin a date doesn't shrink this panel
-   while its fetch is in flight — a shrink shifts everything below it,
-   including the very row being hovered, which knocks the pin right back off. */
-.comex-panel--vault-snapshot { min-height: 780px; }
+/* Locks the panel's frame to its tallest state (share-of-COMEX area chart +
+   pie side by side, each with its own header row) so hovering a Delivery
+   Behavior row to pin a date doesn't shrink this panel while its fetch is in
+   flight — a shrink shifts everything below it, including the very row being
+   hovered, which knocks the pin right back off. Was 780px when this panel
+   stacked a pie above a full depository table (pre-2026-07-23 rework); the
+   current side-by-side chart layout is much shorter, so the old value was
+   pure dead space. */
+.comex-panel--vault-snapshot { min-height: 460px; }
 .comex-vault-snapshot-body { position: relative; }
 .comex-vault-snapshot-overlay {
   position: absolute; inset: 0; z-index: 1;

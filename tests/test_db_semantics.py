@@ -180,3 +180,92 @@ def test_implied_qty_oz_never_persisted(tmp_db):
     with tmp_db.get_conn() as conn:
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(census_trade)")]
     assert "implied_qty_oz" not in cols
+
+
+# --- SHFE per-warehouse history (2026-07-24, mirrors get_depository_history) --
+
+
+def test_get_shfe_warehouse_history_returns_all_dates_and_warehouses(tmp_db):
+    tmp_db.upsert_shfe_warehouse_rows([
+        {"date": "2026-07-01", "warehouse": "CAC", "warrant_kg": 100.0, "warrant_change_kg": 0.0},
+        {"date": "2026-07-01", "warehouse": "CMST Wusong", "warrant_kg": 200.0, "warrant_change_kg": 0.0},
+        {"date": "2026-07-02", "warehouse": "CAC", "warrant_kg": 110.0, "warrant_change_kg": 10.0},
+    ])
+    rows = tmp_db.get_shfe_warehouse_history()
+    assert len(rows) == 3
+    assert [r["date"] for r in rows] == ["2026-07-01", "2026-07-01", "2026-07-02"]
+    assert {r["warehouse"] for r in rows} == {"CAC", "CMST Wusong"}
+
+
+def test_get_shfe_warehouse_history_is_upsert_not_append_only(tmp_db):
+    """metalcharts.org's SHFE warehouse snapshot is a current-state read, not
+    an immutable published report — same upsert convention as delivery
+    notices/census, INSERT OR REPLACE keyed by (date, warehouse)."""
+    tmp_db.upsert_shfe_warehouse_rows([
+        {"date": "2026-07-01", "warehouse": "CAC", "warrant_kg": 100.0, "warrant_change_kg": 0.0},
+    ])
+    tmp_db.upsert_shfe_warehouse_rows([
+        {"date": "2026-07-01", "warehouse": "CAC", "warrant_kg": 150.0, "warrant_change_kg": 50.0},
+    ])
+    rows = tmp_db.get_shfe_warehouse_history()
+    assert len(rows) == 1
+    assert rows[0]["warrant_kg"] == 150.0
+
+
+# --- SHFE gold (2026-07-24) — confirmed live that metalcharts.org's SHFE ---
+# --- aggregate endpoint supports symbol=AU with real data, but the        ---
+# --- per-warehouse endpoint returns a real empty array for gold. Both     ---
+# --- persistence paths still need to work correctly regardless.          ---
+
+
+def test_get_shfe_gold_history_returns_all_dates(tmp_db):
+    tmp_db.upsert_shfe_gold_rows([
+        {"date": "2026-07-01", "total_kg": 111648.0, "total_oz": 3591000.0},
+        {"date": "2026-07-02", "total_kg": 112647.0, "total_oz": 3623100.0},
+    ])
+    rows = tmp_db.get_shfe_gold_history()
+    assert [r["date"] for r in rows] == ["2026-07-01", "2026-07-02"]
+    assert rows[1]["total_oz"] == 3623100.0
+
+
+def test_shfe_gold_and_silver_history_are_independent_tables(tmp_db):
+    """A real bug class if these ever shared a table/route: gold's numbers
+    silently showing up as silver's, or vice versa."""
+    tmp_db.upsert_shfe_rows([{"date": "2026-07-01", "total_kg": 848665.0, "total_oz": 27287000.0}])
+    tmp_db.upsert_shfe_gold_rows([{"date": "2026-07-01", "total_kg": 111648.0, "total_oz": 3591000.0}])
+
+    silver_rows = tmp_db.get_shfe_history()
+    gold_rows = tmp_db.get_shfe_gold_history()
+    assert len(silver_rows) == 1
+    assert len(gold_rows) == 1
+    assert silver_rows[0]["total_kg"] == 848665.0
+    assert gold_rows[0]["total_kg"] == 111648.0
+
+
+def test_get_shfe_gold_warehouse_history_returns_all_dates_and_warehouses(tmp_db):
+    tmp_db.upsert_shfe_gold_warehouse_rows([
+        {"date": "2026-07-01", "warehouse": "CAC", "warrant_kg": 50.0, "warrant_change_kg": 0.0},
+        {"date": "2026-07-02", "warehouse": "CAC", "warrant_kg": 55.0, "warrant_change_kg": 5.0},
+    ])
+    rows = tmp_db.get_shfe_gold_warehouse_history()
+    assert [r["date"] for r in rows] == ["2026-07-01", "2026-07-02"]
+
+
+def test_get_shfe_gold_warehouse_history_empty_when_nothing_persisted(tmp_db):
+    """Confirmed live 2026-07-24: metalcharts.org's SHFE gold warehouses
+    endpoint returns a real 200 with an empty data array (unlike silver,
+    which has full per-warehouse detail) — nothing ever gets persisted here
+    for gold today. The read path must return a clean empty list, not error,
+    when the table has no gold rows at all."""
+    assert tmp_db.get_shfe_gold_warehouse_history() == []
+    assert tmp_db.get_latest_shfe_gold_warehouses() == []
+
+
+def test_get_latest_shfe_gold_warehouses_returns_max_date_only(tmp_db):
+    tmp_db.upsert_shfe_gold_warehouse_rows([
+        {"date": "2026-07-01", "warehouse": "CAC", "warrant_kg": 50.0, "warrant_change_kg": 0.0},
+        {"date": "2026-07-02", "warehouse": "CAC", "warrant_kg": 55.0, "warrant_change_kg": 5.0},
+    ])
+    rows = tmp_db.get_latest_shfe_gold_warehouses()
+    assert len(rows) == 1
+    assert rows[0]["date"] == "2026-07-02"

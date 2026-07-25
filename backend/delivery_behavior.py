@@ -3,12 +3,16 @@ Delivery Behavior layer. See deliveryBehavior-spec.md for the full spec and
 story list.
 
 Phase A (reclassification + deficit-context signals) is pure computation over
-data AV already persists (inventory_aggregate, delivery_notices,
-silver_market_balance.json) — no new upstream fetch, no new tables. Only
-silver has delivery_notices/inventory_aggregate coverage today (main.py's
-delivery-notices route is hardcoded to symbol=XAG, and there is no gold
-equivalent) — gold requests get a documented "unavailable" result rather than
-silently returning empty/misleading data.
+data AV already persists (inventory_aggregate/gold_inventory_aggregate,
+delivery_notices/gold_delivery_notices, silver_market_balance.json) — no new
+upstream fetch, no new tables beyond gold_delivery_notices itself. Both
+metals have delivery-notices/inventory-aggregate coverage as of 2026-07-22
+(main.py's delivery-notices routes cover symbol=XAG and symbol=XAU — gold was
+originally never wired up, not because metalcharts.org's endpoint doesn't
+support it; confirmed live it does, matching CME's own official
+MetalsIssuesAndStopsReport.pdf for a spot-checked date). A metal outside
+RECLASSIFICATION_SUPPORTED_METALS still gets a documented "unavailable"
+result rather than silently returning empty/misleading data.
 
 Phase B adds disaggregated CoT category composition (story #2), fetched via
 pipeline/fetch.py + persisted to cot_disaggregated (both metals — CFTC's
@@ -51,7 +55,7 @@ not meant as an exact trading-calendar reference.
 from datetime import date, timedelta
 
 from . import db
-from .units import SILVER_CONTRACT_OZ
+from .units import SILVER_CONTRACT_OZ, GOLD_CONTRACT_OZ
 
 
 def _is_weekday(d: date) -> bool:
@@ -113,22 +117,43 @@ def days_to_fnd(report_date: date) -> int:
     fnd = last_business_day(report_date.year, report_date.month)
     return (fnd - report_date).days
 
-RECLASSIFICATION_SUPPORTED_METALS = {"XAG"}
+RECLASSIFICATION_SUPPORTED_METALS = {"XAG", "XAU"}
 
 DISAGGREGATED_CATEGORIES = ("producer_merchant", "swap_dealer", "managed_money", "other_reportable")
 
 
 def compute_reclassification_signal(metal: str, limit: int | None = None) -> dict:
     """
-    For each day, compares that day's registered-inventory delta (inventory_aggregate)
-    against that day's delivery-notice volume (delivery_notices, ytd type — confirmed
-    live against metalcharts.org that type="ytd" returns ~85 days back to start-of-year
-    vs. type="mtd"'s handful of days-in-month, at no extra fetch cost; dailyIssued/
-    dailyStopped are the working fields on both, see CLAUDE.md's documented
-    mtdCumulative/ytdCumulative gap, which doesn't affect these fields). Flags days
-    where registered inventory rose with little/no matching delivery activity — a
-    signal that the increase looks like reclassification of existing eligible stock
-    rather than fresh metal (spec story #3).
+    Returns one row per day with real inventory_aggregate history (not just
+    registered-increase days — this is also the data source for the "Reclassification
+    vs. Real Inflow" chart's full physical-stack view, per the user's 2026-07-22
+    request to see anomalous days in the context of the whole series, not in isolation).
+    Each day carries both registered_delta and total_delta unconditionally.
+
+    `flag_type` is bi-directional, per the user's 2026-07-22 observation that a
+    multi-month registered drawdown deserved the same scrutiny as a registered
+    increase, not just a one-directional "is this reclassification" check:
+      - "reclassification": registered ROSE and that day's delivery-notice volume
+        (delivery_notices, ytd type — confirmed live against metalcharts.org that
+        type="ytd" returns ~85 days back to start-of-year vs. type="mtd"'s
+        days-in-month-so-far, at no extra fetch cost; dailyIssued/dailyStopped are
+        the working fields on both, see CLAUDE.md's documented mtdCumulative/
+        ytdCumulative gap, which doesn't affect these fields) covered less than 10%
+        of the increase — consistent with existing eligible stock being
+        re-designated registered rather than fresh metal arriving (spec story #3).
+      - "deregistration": the mirror case — registered FELL and that day's delivery
+        volume covered less than 10% of the drop — consistent with registered stock
+        being re-designated back to eligible (still in the vault, never left) rather
+        than physically withdrawn from COMEX custody.
+    Neither direction is evidence of wrongdoing — both are normal, legal vault-operator
+    actions; the flag only distinguishes "this registered move looks like a status
+    change" from "this looks like metal actually crossing COMEX's door." `flagged`
+    (bool) is kept as a derived convenience for any caller that only cares whether
+    either flag fired, not which direction. Every day without a qualifying delta or
+    without delivery-notice coverage that day is a real row with flag_type=None, not
+    omitted — omitting non-candidate days was the original design but made the signal
+    unreadable in context (only ever showing 5-ish flagged days with no sense of the
+    normal day-to-day baseline around them).
     """
     if metal not in RECLASSIFICATION_SUPPORTED_METALS:
         return {
@@ -137,10 +162,14 @@ def compute_reclassification_signal(metal: str, limit: int | None = None) -> dic
             "days": [],
         }
 
-    agg = db.get_aggregate_history()
-    delivery_by_date = {
-        row["date"]: row for row in db.get_delivery_history("ytd")
-    }
+    if metal == "XAU":
+        agg = db.get_gold_aggregate_history()
+        delivery_by_date = {row["date"]: row for row in db.get_gold_delivery_history("ytd")}
+        contract_oz = GOLD_CONTRACT_OZ
+    else:
+        agg = db.get_aggregate_history()
+        delivery_by_date = {row["date"]: row for row in db.get_delivery_history("ytd")}
+        contract_oz = SILVER_CONTRACT_OZ
 
     days = []
     prev_registered = None
@@ -165,27 +194,54 @@ def compute_reclassification_signal(metal: str, limit: int | None = None) -> dic
         prev_had_registered = True
         prev_total = total
 
-        if delta is None or delta <= 0:
+        if delta is None:
+            # First real row after a reset/gap has no prior value to diff against —
+            # a real row still worth showing (total_oz on its own is meaningful),
+            # just with no delta yet.
+            days.append({
+                "date": row["date"],
+                "registered_delta": None,
+                "delivery_volume_oz": None,
+                "total_oz": total,
+                "prev_total_oz": None,
+                "total_delta": None,
+                "flag_type": None,
+                "flagged": False,
+            })
             continue
 
-        delivery_row = delivery_by_date.get(row["date"])
-        if delivery_row is None:
-            # No delivery-notice row persisted for this date at all — a data-coverage
+        flag_type = None
+        delivery_volume_oz = None
+        if delta != 0:
+            delivery_row = delivery_by_date.get(row["date"])
+            # No delivery-notice row persisted for this date at all is a data-coverage
             # gap (delivery_notices only has history from whenever the mtd fetch
-            # started), not evidence of zero delivery activity. Skip rather than
-            # flag, since flagging here would conflate "no data" with "no match."
-            continue
+            # started), not evidence of zero delivery activity — leaves flag_type=None
+            # rather than guessing, since flagging here would conflate "no data" with
+            # "no match."
+            if delivery_row is not None:
+                issued = delivery_row["daily_issued"]
+                stopped = delivery_row["daily_stopped"]
+                if issued is not None or stopped is not None:
+                    # daily_issued/daily_stopped are COMEX contract counts (5,000 oz/
+                    # contract for silver, 100 oz/contract for gold, see CLAUDE.md's
+                    # Units convention — contract_oz selected above per metal);
+                    # registered_delta is raw troy oz from inventory_aggregate — must
+                    # convert to the same unit before comparing, or every real delivery
+                    # day looks like a reclassification. issued and stopped are the two
+                    # sides of the same clearing notice (a seller's issue is always
+                    # paired with a buyer's stop that same day) and are therefore always
+                    # equal on CME's own daily report — confirmed 2026-07-22 against
+                    # CME's real MetalsIssuesAndStopsReport.pdf, which shows TOTAL
+                    # ISSUED == TOTAL STOPPED for gold/silver/copper alike. Summing them
+                    # double-counts every notice; real daily delivery volume is just one
+                    # side (they're interchangeable when equal, but `issued` is used for
+                    # clarity since it's the "metal nominated for delivery" side this
+                    # signal actually cares about).
+                    delivery_volume_oz = (issued or stopped or 0) * contract_oz
+                    if abs(delivery_volume_oz) < abs(delta) * 0.1:
+                        flag_type = "reclassification" if delta > 0 else "deregistration"
 
-        issued = delivery_row["daily_issued"]
-        stopped = delivery_row["daily_stopped"]
-        if issued is None and stopped is None:
-            continue
-        # daily_issued/daily_stopped are COMEX contract counts (5,000 oz/contract
-        # for silver, see CLAUDE.md's Units convention); registered_delta is raw
-        # troy oz from inventory_aggregate — must convert to the same unit before
-        # comparing, or every real delivery day looks like a reclassification.
-        delivery_volume_oz = ((issued or 0) + (stopped or 0)) * SILVER_CONTRACT_OZ
-        flagged = delivery_volume_oz < delta * 0.1
         days.append({
             "date": row["date"],
             "registered_delta": round(delta, 2),
@@ -193,7 +249,8 @@ def compute_reclassification_signal(metal: str, limit: int | None = None) -> dic
             "total_oz": total,
             "prev_total_oz": total - total_delta if total_delta is not None else None,
             "total_delta": round(total_delta, 2) if total_delta is not None else None,
-            "flagged": flagged,
+            "flag_type": flag_type,
+            "flagged": flag_type is not None,
         })
 
     if limit:
@@ -204,6 +261,13 @@ def compute_reclassification_signal(metal: str, limit: int | None = None) -> dic
         "reason": None,
         "days": days,
         "days_with_coverage": len(delivery_by_date),
+        # Earliest real delivery_notices date — the frontend uses this to default
+        # the chart's window to the span where flagging was actually possible,
+        # rather than a hardcoded day count that silently drifts as delivery_notices'
+        # own coverage grows forward (see CLAUDE.md's Delivery Notices note — this
+        # table has no upstream backfill, so its start date only ever moves earlier
+        # if a future feature adds one).
+        "coverage_start_date": min(delivery_by_date) if delivery_by_date else None,
     }
 
 
