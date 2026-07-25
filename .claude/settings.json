@@ -6,6 +6,23 @@
       "Bash(bash /Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh:*)",
       "Bash(utils/vigil.sh:*)",
       "Bash(./utils/vigil.sh:*)",
+      "Bash(/Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh:*)",
+      "Bash(bash ../utils/vigil.sh:*)",
+      "Bash(cd /Users/jrmallas/.gitRepos/ArgentVigil && bash utils/vigil.sh:*)",
+      "Bash(bash /Users/jrmallas/gitRepos/ArgentVigil/utils/vigil.sh:*)",
+      "Bash(/Users/jrmallas/gitRepos/ArgentVigil/utils/vigil.sh:*)",
+      "Bash(cd /Users/jrmallas/gitRepos/ArgentVigil && bash utils/vigil.sh:*)",
+      "Bash(bash utils/local.sh:*)",
+      "Bash(bash /Users/jrmallas/.gitRepos/ArgentVigil/utils/local.sh:*)",
+      "Bash(bash ../utils/local.sh:*)",
+      "Bash(bash /Users/jrmallas/gitRepos/ArgentVigil/utils/local.sh:*)",
+      "Bash(lsof -i:*)",
+      "Bash(lsof -ti:*)",
+      "Bash(cd /Users/jrmallas/.gitRepos/ArgentVigil/frontend && npx vite build *)",
+      "Bash(cd /Users/jrmallas/gitRepos/ArgentVigil/frontend && npx vite build *)",
+      "Bash(/Users/jrmallas/gitRepos/ArgentVigil/utils/vigil.sh restart *)",
+      "Bash(bash utils/vigil.sh status)",
+      "Bash(/Users/jrmallas/gitRepos/ArgentVigil/utils/vigil.sh:*)",
       "Bash(/Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh:*)"
     ]
   }

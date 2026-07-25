@@ -5,9 +5,13 @@ Ground rules (see CLAUDE.md's test-suite section):
   SQLite file in tmp_path via the tmp_db fixture.
 - Never calls a live upstream — outbound httpx is mocked with respx in
   test_upstream_contracts.py; everything else reads only the tmp DB.
-- Never runs main.py's lifespan (no startup fetch chain, no scheduler
-  loops) — the `client` fixture builds a TestClient without entering its
-  context manager, which is what skips lifespan.
+- The `client`/`upstream_client` fixtures below never run main.py's
+  lifespan (no startup fetch chain, no scheduler loops) — `client` builds
+  a TestClient without entering lifespan's context manager, which is what
+  skips it. test_lifespan_integration.py is the one deliberate exception:
+  it drives lifespan() directly (its own fixture, not these two) to test
+  the startup/scheduler wiring itself, still against a tmp DB with every
+  upstream host respx-mocked — see that module's own docstring.
 """
 
 import sys
