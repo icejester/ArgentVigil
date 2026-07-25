@@ -84,6 +84,48 @@ CENSUS_TRADE_FLOWS = {
     },
 }
 CENSUS_TRADE_MONTHS_PER_FETCH = 3  # cheap self-heal against late revisions between gate-interval runs
+
+TREASURY_MTS_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts"
+# Table 1 (Summary of Receipts, Outlays, and the Deficit/Surplus) republishes
+# every month of BOTH the prior and current fiscal year on every monthly
+# release — a real month's figure is identified by classification_desc
+# (a month NAME, e.g. "June") plus which fiscal-year block it's in, not a
+# real calendar-date field. Confirmed live (fed-spend-spec.md Story #0):
+# sequence_number_cd prefix "1." = prior fiscal year (Oct-Sep), "2." =
+# current fiscal year — record_fiscal_year itself is the REPORT's own FY on
+# every row regardless of block, not a per-row distinguisher.
+_MONTH_NAME_TO_NUM = {
+    "October": 10, "November": 11, "December": 12,
+    "January": 1, "February": 2, "March": 3, "April": 4, "May": 5,
+    "June": 6, "July": 7, "August": 8, "September": 9,
+}
+
+
+def _mts_fiscal_month_to_calendar(classification_desc: str, sequence_number_cd: str, record_fiscal_year: str) -> tuple[int, int] | None:
+    """Returns (calendar_year, calendar_month) for one Table 1 MTH row, or
+    None if classification_desc isn't a recognized month name (some MTH
+    rows are edge cases outside the normal 12-month cycle, per Table 1's
+    own documented caveat about hierarchy/subtotal rows)."""
+    month = _MONTH_NAME_TO_NUM.get(classification_desc.strip())
+    if month is None:
+        return None
+    report_fy = int(record_fiscal_year)
+    block_fy = report_fy - 1 if sequence_number_cd.startswith("1.") else report_fy
+    # U.S. federal fiscal year FY starts October of the PRIOR calendar year —
+    # Oct/Nov/Dec belong to calendar year (FY - 1), Jan-Sep belong to FY itself.
+    calendar_year = block_fy - 1 if month >= 10 else block_fy
+    return calendar_year, month
+
+
+TREASURY_INTEREST_CLASSIFICATION = "Total--Interest on the Public Debt"
+
+
+def _mts_amount(raw) -> float | None:
+    """MTS amount fields are strings, using the literal string "null" (not
+    JSON null) for an absent value — confirmed live."""
+    if raw is None or raw == "null":
+        return None
+    return float(raw)
 METAL_PRICE_TICKERS = {"XAG": XAG_TICKER, "XAU": XAU_TICKER}
 
 # Recoverable stock = Investment (coins/bars) + ETF/Exchange Vaults + Central
@@ -1609,6 +1651,234 @@ async def census_trade_db(
     return {"success": True, "data": rows}
 
 
+async def _fetch_and_persist_treasury_outlays() -> int:
+    """fed-spend-spec.md Story #1. No API key required. Two independent
+    MTS tables fetched and merged by (year, month): Table 1 for
+    receipts/outlays/deficit (real month reconstructed from
+    classification_desc + sequence_number_cd, see
+    _mts_fiscal_month_to_calendar), Table 5 for the
+    "Total--Interest on the Public Debt" row specifically (a genuinely
+    one-row-per-real-month figure in that table, unlike Table 1's
+    republished-hierarchy shape — confirmed live, see fed-spend-spec.md).
+    Real API coverage starts 2015-03 (NOT October 1980 as originally
+    assumed pre-investigation — fiscaldata.treasury.gov's API itself only
+    reaches back that far; deeper history lives only in Treasury's legacy
+    PDF archive, not this API). A single page[size]=10000 request covers
+    each table's full real history in one call (confirmed live: 2520 rows
+    Table 1 MTH, 136 rows Table 5's interest line — both comfortably under
+    that page size), so no pagination loop is needed."""
+    resp1 = await _client.get(
+        f"{TREASURY_MTS_BASE}/mts_table_1",
+        params={"filter": "record_type_cd:eq:MTH", "sort": "record_date", "page[size]": "10000"},
+        timeout=20,
+    )
+    resp1.raise_for_status()
+    by_month: dict[tuple[int, int], dict] = {}
+    for r in resp1.json().get("data", []):
+        parsed = _mts_fiscal_month_to_calendar(
+            r["classification_desc"], r["sequence_number_cd"], r["record_fiscal_year"]
+        )
+        if parsed is None:
+            continue
+        # Rows arrive sorted by record_date ascending — a later publication's
+        # restatement of the same real month overwrites the earlier one,
+        # same "latest publication wins" convention as the upsert itself.
+        by_month[parsed] = {
+            "receipts_usd": _mts_amount(r.get("current_month_gross_rcpt_amt")),
+            "outlays_usd": _mts_amount(r.get("current_month_gross_outly_amt")),
+            "deficit_usd": _mts_amount(r.get("current_month_dfct_sur_amt")),
+        }
+
+    resp5 = await _client.get(
+        f"{TREASURY_MTS_BASE}/mts_table_5",
+        params={
+            "filter": f"classification_desc:eq:{TREASURY_INTEREST_CLASSIFICATION}",
+            "sort": "record_date",
+            "page[size]": "10000",
+        },
+        timeout=20,
+    )
+    resp5.raise_for_status()
+    for r in resp5.json().get("data", []):
+        # Table 5 has no fiscal-year-block ambiguity for this classification
+        # — confirmed live, one real row per record_date, each already the
+        # single real month's own figure (current_month_net_outly_amt),
+        # not a YTD total. record_date is that publication's own month-end.
+        record_date = r["record_date"]
+        key = (int(record_date[:4]), int(record_date[5:7]))
+        by_month.setdefault(key, {})["interest_usd"] = _mts_amount(r.get("current_month_net_outly_amt"))
+
+    # Merge forward against whatever's already persisted for each touched
+    # month, so a fetch where one table's response happens not to include a
+    # given month (both tables are queried independently) never nulls out a
+    # field the other table already established in an earlier fetch — same
+    # "don't let a partial write erase a real prior value" concern that
+    # motivated census_trade's own partial-column ON CONFLICT DO UPDATE.
+    existing = {(r["year"], r["month"]): r for r in db.get_treasury_outlays()}
+    rows = []
+    for (y, m), v in by_month.items():
+        prior = existing.get((y, m), {})
+        rows.append({
+            "year": y,
+            "month": m,
+            "receipts_usd": v.get("receipts_usd", prior.get("receipts_usd")),
+            "outlays_usd": v.get("outlays_usd", prior.get("outlays_usd")),
+            "deficit_usd": v.get("deficit_usd", prior.get("deficit_usd")),
+            "interest_usd": v.get("interest_usd", prior.get("interest_usd")),
+        })
+    if rows:
+        db.upsert_treasury_outlays_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_treasury_outlays_startup():
+    """treasury_outlays' fetch_fn — no API key, so unlike lbma_fix/
+    census_trade there's no env-var skip branch; a real upstream failure
+    still shouldn't crash boot, so it's caught and recorded the same way."""
+    try:
+        await _fetch_and_persist_treasury_outlays()
+        db.record_fetch_attempt("treasury_outlays", success=True)
+    except Exception as e:
+        print(f"[treasury_outlays] warning: {e}")
+        db.record_fetch_attempt("treasury_outlays", success=False, error=str(e))
+
+
+# ~3yr per ongoing fetch — see fetch fn docstring for why this is bounded.
+# A one-time manual backfill (outside this bounded fetch, run once against
+# runtime/argentvigil.db directly) extended real persisted coverage back as
+# far as it will go — confirmed live that MTS Table 5 AS A WHOLE has zero
+# real data before 2015-03-31 (every record_date before that returns a real
+# HTTP 200 with an empty data array, not an error) — a harder, table-wide
+# floor than treasury_outlays' own 2013-10 floor (Table 1), and the same
+# floor already documented for the interest-on-debt figure in Story #1.
+# This constant still caps what any FUTURE fire_at_startup/manual-refresh
+# run will fetch going forward, so a fresh/cleared DB will only recover the
+# most recent 36 months automatically; the deeper 2015-2023 history won't
+# regenerate itself without re-running that one-off backfill.
+TREASURY_OUTLAYS_BY_AGENCY_MONTHS = 36
+
+
+async def _fetch_and_persist_treasury_outlays_by_agency() -> int:
+    """fed-spend-spec.md Story #0 Tier 2 — per-department/agency monthly
+    outlays, MTS Table 5. Confirmed live: level-1 rows with
+    record_type_cd="C" are department/agency headers (their own value is
+    always null — a label row, not a figure); each has exactly one direct
+    child (same record_type_cd="C", classification_desc starting
+    "Total--") carrying that department's real reported monthly total —
+    Treasury's own total, not a client-side sum of that department's
+    sub-programs. Stable 29-department list confirmed across both a 2015
+    and a 2026 publication.
+
+    Fetches one full record_date at a time (unlike treasury_outlays'
+    single filtered pull across all history) since Table 5's per-date
+    parent/child linkage requires the WHOLE table for that date to
+    resolve — no record_type_cd=MTH-style single-shot filter exists for
+    Table 5 the way Table 1 has. Deliberately bounded to the most recent
+    TREASURY_OUTLAYS_BY_AGENCY_MONTHS real months (re-derived from
+    treasury_outlays' own already-fetched year/month rows — Table 1 must
+    run first) rather than full history: full history is ~150 sequential
+    requests, real per-restart latency/load against a free public API
+    with no documented rate limit for a source that's fire_at_startup on
+    every backend restart. Already-persisted months are skipped (a cheap
+    check against what's on disk, no request spent), so history
+    accumulates forward across restarts rather than being bounded
+    forever — a restart 3 years from now still only re-fetches its own
+    trailing 36 months, not the ever-growing full history."""
+    months = db.get_treasury_outlays()[-TREASURY_OUTLAYS_BY_AGENCY_MONTHS:]
+    already = {(r["year"], r["month"]) for r in db.get_treasury_outlays_by_agency()}
+    total_rows = 0
+    for m in months:
+        if (m["year"], m["month"]) in already:
+            continue
+        record_date = f"{m['year']:04d}-{m['month']:02d}-{_last_day_of_month(m['year'], m['month']):02d}"
+        resp = await _client.get(
+            f"{TREASURY_MTS_BASE}/mts_table_5",
+            params={"filter": f"record_date:eq:{record_date}", "page[size]": "2000"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            continue
+        by_id = {r["classification_id"]: r for r in data}
+        by_parent: dict[str, list[dict]] = {}
+        for r in data:
+            by_parent.setdefault(r["parent_id"], []).append(r)
+        rows = []
+        for dept in data:
+            if dept["sequence_level_nbr"] != "1" or dept["record_type_cd"] != "C":
+                continue
+            children = by_parent.get(dept["classification_id"], [])
+            total_row = next(
+                (c for c in children if c["record_type_cd"] == "C" and c["classification_desc"].startswith("Total--")),
+                None,
+            )
+            if total_row is None:
+                continue
+            agency = dept["classification_desc"].rstrip(":").strip()
+            rows.append({
+                "year": m["year"],
+                "month": m["month"],
+                "agency": agency,
+                "outlay_usd": _mts_amount(total_row.get("current_month_net_outly_amt")),
+            })
+        if rows:
+            db.upsert_treasury_outlays_by_agency_rows(rows)
+            total_rows += len(rows)
+    return total_rows
+
+
+def _last_day_of_month(year: int, month: int) -> int:
+    if month == 12:
+        return 31
+    return (date(year, month + 1, 1) - timedelta(days=1)).day
+
+
+async def _fetch_and_persist_treasury_outlays_by_agency_startup():
+    try:
+        await _fetch_and_persist_treasury_outlays_by_agency()
+        db.record_fetch_attempt("treasury_outlays_by_agency", success=True)
+    except Exception as e:
+        print(f"[treasury_outlays_by_agency] warning: {e}")
+        db.record_fetch_attempt("treasury_outlays_by_agency", success=False, error=str(e))
+
+
+@app.get("/api/treasury-outlays-by-agency/db")
+async def treasury_outlays_by_agency_db(
+    window: str = Query("5y"),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    if window == "custom" and start:
+        since = start
+    else:
+        years = FRED_WINDOW_YEARS.get(window, 5)
+        since = str(date.today() - timedelta(days=365 * years))
+    rows = db.get_treasury_outlays_by_agency(since=since)
+    if end is not None:
+        rows = [r for r in rows if r["date"] <= end]
+    return {"success": True, "data": rows}
+
+
+@app.get("/api/treasury-outlays/db")
+async def treasury_outlays_db(
+    window: str = Query("5y"),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    if window == "custom" and start:
+        since = start
+    else:
+        years = FRED_WINDOW_YEARS.get(window, 5)
+        since = str(date.today() - timedelta(days=365 * years))
+    rows = db.get_treasury_outlays(since=since)
+    # Same end-trim convention as /api/fred/money-supply/db — get_treasury_outlays
+    # has no upper bound of its own, so this route trims client-side-of-the-route.
+    if end is not None:
+        rows = [r for r in rows if r["date"] <= end]
+    return {"success": True, "data": rows}
+
+
 @app.get("/api/refresh/settings")
 async def refresh_settings_get():
     return {"success": True, "data": _refresh_settings}
@@ -1921,6 +2191,20 @@ sources.register(SourceDefinition(
     tables=["settlement_price"],
     cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="undocumented", note="No published quota; conservative-by-design per CLAUDE.md's Yahoo Finance dev note."),
+))
+sources.register(SourceDefinition(
+    key="treasury_outlays", label="U.S. Treasury — Monthly Treasury Statement",
+    affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_outlays_startup,
+    tables=["treasury_outlays"],
+    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    rate_limit=RateLimitSpec(kind="undocumented", note="fiscaldata.treasury.gov's public API has no documented hard rate limit; no API key required."),
+))
+sources.register(SourceDefinition(
+    key="treasury_outlays_by_agency", label="U.S. Treasury — MTS Outlays by Department/Agency",
+    affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_outlays_by_agency_startup,
+    tables=["treasury_outlays_by_agency"],
+    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Same host/no-key posture as treasury_outlays. Bounded to the most recent 36 months per run (see fetch fn docstring) — one HTTP request per real month, since Table 5's parent/child hierarchy can't be filtered server-side the way Table 1's flat MTH rows can."),
 ))
 # cot_pipeline gates on PERSISTED DATA age (CFTC publishes within ~3 days
 # of its as-of date, so report age closely tracks fetch recency) — the

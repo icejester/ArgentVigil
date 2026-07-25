@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { nearestRowDate } from "./date_utils";
+import { VAULT_COLORS } from "./palette";
 import {
   ComposedChart,
   LineChart,
@@ -47,6 +48,22 @@ const DGS10_COLOR = "#e0a84c";
 const DFII10_COLOR = "#4caf76";
 const T10Y2Y_COLOR = "#c9536b";
 
+// Federal Outlays sub-panel (fed-spend-spec.md) — 4 flat series, same
+// ungrouped-lines shape as Treasury Yields, not Composition's grouped
+// pie/stack treatment (spec's explicit "close to Yields' ceiling for one
+// flat chart" framing). Outlays/Receipts share the WALCL/M2 red/green
+// convention (outlays = red/spending, receipts = green/income) since
+// they're the two flows that make up the deficit; Deficit gets its own
+// distinct color since it's a derived comparison of the two, not a flow
+// itself; Interest-on-debt is dashed, per the spec's open question #3 —
+// singled out as the most narratively-loaded figure here (what the
+// government pays just to service existing debt, independent of any new
+// spending decision).
+const OUTLAYS_COLOR = "#e05252";
+const RECEIPTS_COLOR = "#4caf76";
+const DEFICIT_COLOR = "#7b9fff";
+const INTEREST_COLOR = "#e0a84c";
+
 // M2SL is monthly with a ~4-6wk publication lag; WALCL is weekly with only a
 // few days' lag. Different thresholds reflect each series' own normal cadence.
 const M2_STALE_DAYS = 45;
@@ -60,6 +77,16 @@ function daysSince(dateStr) {
 function fmtTrillions(v) {
   if (v == null) return "—";
   return `$${v.toFixed(2)}T`;
+}
+
+// Federal Outlays / Outlays by Agency sub-panels use billions, not
+// trillions like the rest of this panel — most individual agencies' monthly
+// figures are well under $1T, which read as near-invisible fractions
+// ("$0.20T") in trillions; billions gives real precision at the actual
+// scale these numbers move at.
+function fmtBillions(v) {
+  if (v == null) return "—";
+  return `$${v.toFixed(1)}B`;
 }
 
 function fmtPct(v) {
@@ -91,6 +118,110 @@ function mergeYields(dgs2, dgs10, dfii10, t10y2y) {
     }
   }
   return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+
+// treasury_outlays/db already returns one flat row per real calendar month
+// (date, receipts_usd, outlays_usd, deficit_usd, interest_usd) — no merge
+// across series needed (unlike mergeYields' 4 separately-fetched FRED
+// series), just a trillions conversion + an interest-as-%-of-outlays figure
+// used by the sub-panel's collapsed summary.
+// U.S. federal fiscal year: Oct-Sep, labeled by the calendar year it ENDS
+// in (FY2025 = Oct 2024 - Sep 2025) — same convention Treasury's own MTS
+// data uses (matches the fiscal-year-block reconstruction already built
+// server-side for Table 1/5 parsing). date is a 'YYYY-MM-01' string.
+function fiscalYearOf(dateStr) {
+  const year = Number(dateStr.slice(0, 4));
+  const month = Number(dateStr.slice(5, 7));
+  return month >= 10 ? year + 1 : year;
+}
+
+// Rolls monthly rows up to one row per fiscal year, summing every numeric
+// field present across that FY's real months. A FY with fewer than 12 real
+// months (the in-progress current FY, or any gap) is marked monthsPresent
+// so the UI can flag it as partial rather than silently presenting a
+// 9-month sum as if it were a real complete-year total — the same
+// nulls-over-zeros spirit as everywhere else in this app, just applied to
+// "don't imply completeness that isn't there" instead of "don't fabricate
+// a missing number."
+function aggregateAnnual(monthlyRows, valueKeys) {
+  const byFy = {};
+  for (const row of monthlyRows) {
+    const fy = fiscalYearOf(row.date);
+    const bucket = (byFy[fy] ??= { fiscalYear: fy, date: String(fy), monthsPresent: 0, _sums: {} });
+    bucket.monthsPresent += 1;
+    for (const key of valueKeys) {
+      if (row[key] == null) continue;
+      bucket._sums[key] = (bucket._sums[key] ?? 0) + row[key];
+    }
+  }
+  return Object.values(byFy)
+    .map((bucket) => {
+      const out = { date: bucket.date, fiscalYear: bucket.fiscalYear, monthsPresent: bucket.monthsPresent };
+      for (const key of valueKeys) {
+        out[key] = bucket._sums[key] != null ? round1(bucket._sums[key]) : null;
+      }
+      return out;
+    })
+    .sort((a, b) => a.fiscalYear - b.fiscalYear);
+}
+
+function mergeOutlays(rows) {
+  return (rows || []).map((r) => ({
+    date: r.date,
+    outlays: r.outlays_usd != null ? round1(r.outlays_usd / 1e9) : null,
+    receipts: r.receipts_usd != null ? round1(r.receipts_usd / 1e9) : null,
+    deficit: r.deficit_usd != null ? round1(r.deficit_usd / 1e9) : null,
+    interest: r.interest_usd != null ? round1(r.interest_usd / 1e9) : null,
+    interest_pct_outlays:
+      r.interest_usd != null && r.outlays_usd
+        ? round1((r.interest_usd / r.outlays_usd) * 100)
+        : null,
+  }));
+}
+
+// treasury_outlays_by_agency/db returns one flat row per (date, agency) —
+// 29 real departments, too many for a flat multi-line/stacked-area chart to
+// read (Treasury Yields tops out at 4, Composition's own precedent groups
+// down to 2). Reduces to the top N agencies by |outlay_usd| as of the LATEST
+// real month (a fixed ranking, not re-ranked per month, so a given agency's
+// color/identity stays stable across the whole chart rather than reshuffling
+// month to month), bucketing every other agency into a single "Other" sum
+// per month. Mirrors comex_inventory.jsx's VAULT_COLORS-cycling convention
+// for "N real categories, more than a hand-picked palette" charts.
+const OUTLAYS_BY_AGENCY_TOP_N = 8;
+const OUTLAYS_OTHER_COLOR = "#5a6278";
+// Matches backend/main.py's TREASURY_OUTLAYS_BY_AGENCY_MONTHS — display copy
+// only, not a value the fetch itself depends on (the backend already trims
+// what it persists; this is just so the panel note states the same number).
+const TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL = "3 years";
+
+function topAgenciesByLatestMonth(rows, n) {
+  if (!rows || rows.length === 0) return [];
+  const latestDate = rows.reduce((max, r) => (r.date > max ? r.date : max), rows[0].date);
+  const latestRows = rows.filter((r) => r.date === latestDate);
+  return [...latestRows]
+    .sort((a, b) => Math.abs(b.outlay_usd ?? 0) - Math.abs(a.outlay_usd ?? 0))
+    .slice(0, n)
+    .map((r) => r.agency);
+}
+
+function mergeOutlaysByAgency(rows, topAgencies) {
+  const topSet = new Set(topAgencies);
+  const byDate = {};
+  for (const r of rows || []) {
+    const row = (byDate[r.date] ??= { date: r.date, other: 0, other_has_data: false });
+    if (r.outlay_usd == null) continue;
+    const billions = round1(r.outlay_usd / 1e9);
+    if (topSet.has(r.agency)) {
+      row[r.agency] = billions;
+    } else {
+      row.other += billions;
+      row.other_has_data = true;
+    }
+  }
+  return Object.values(byDate)
+    .map((row) => ({ ...row, other: row.other_has_data ? round1(row.other) : null }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
 }
 
 // M2 (monthly) and WALCL (weekly) have different date grids — merge on date
@@ -318,6 +449,39 @@ const YIELDS_LEGEND_SERIES = [
     legendLabel: "10Y–2Y Spread",
     color: T10Y2Y_COLOR,
     eli5: "10-Year yield minus 2-Year yield — the classic yield-curve slope. Negative (inverted) has historically preceded most U.S. recessions by 12-18 months; it means the market expects the Fed to cut rates more than it's currently signaling. Shown here as context alongside the two rates it's built from, not as a standalone prediction.",
+  },
+];
+
+// Federal Outlays sub-panel's legend — same click-to-highlight + click-to-reveal
+// shape as every other legend in this panel. Flat, ungrouped series (no
+// assets/liabilities split), all sharing one dollar axis, so no gradient
+// swatch needed — only Interest gets a dashed swatch, per its own dashed
+// line on the chart.
+const OUTLAYS_LEGEND_SERIES = [
+  {
+    key: "outlays",
+    legendLabel: "Outlays",
+    color: OUTLAYS_COLOR,
+    eli5: "Total federal spending for the month — every dollar the government paid out, from Social Security and defense to interest on the debt itself. Source: U.S. Treasury's Monthly Treasury Statement (Table 1), reported directly, not derived.",
+  },
+  {
+    key: "receipts",
+    legendLabel: "Receipts",
+    color: RECEIPTS_COLOR,
+    eli5: "Total federal revenue for the month — individual and corporate income tax, payroll tax, excise tax, and other collections. The other half of Outlays minus Receipts = Deficit.",
+  },
+  {
+    key: "deficit",
+    legendLabel: "Deficit / Surplus",
+    color: DEFICIT_COLOR,
+    eli5: "Outlays minus Receipts for the month, reported directly by Treasury (not computed client-side). Positive = deficit (spent more than collected, the normal case in recent decades); negative = surplus. This is the monthly figure, not a running fiscal-year or annual total — expect real month-to-month swings tied to tax-collection timing (e.g. April receipts typically spike from individual filing deadlines).",
+  },
+  {
+    key: "interest",
+    legendLabel: "Interest on the Public Debt",
+    color: INTEREST_COLOR,
+    dashed: true,
+    eli5: "The portion of Outlays that's purely the cost of servicing existing federal debt — not new spending, just interest on money already borrowed. Arguably the most direct read on \"why does the money supply keep growing\": as this line grows, more of every new dollar borrowed goes to paying interest on the last dollar borrowed, independent of any policy choice about new programs. Source: Treasury's Monthly Treasury Statement (Table 5, \"Total--Interest on the Public Debt\"). Real API coverage starts 2015-03 — earlier months on this chart will show a gap for this line specifically even where Outlays/Receipts/Deficit have real data back to 2013-10, since the two source tables have different real coverage floors (see fed-spend-spec.md). Historical description only, per AV Voice Rules — not a claim about future debt-service costs.",
   },
 ];
 
@@ -715,6 +879,58 @@ function YieldsTooltipContent({ active, label, yieldsMerged }) {
   );
 }
 
+function OutlaysTooltipContent({ active, label, outlaysMerged }) {
+  if (!active || !label) return null;
+  const row = outlaysMerged.find((r) => r.date === label);
+  if (!row) return null;
+  const headerLabel = row.fiscalYear != null
+    ? `FY${row.fiscalYear}${row.monthsPresent < 12 ? ` (partial, ${row.monthsPresent}/12 mo.)` : ""}`
+    : label;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{headerLabel}</div>
+      {row.outlays != null && <div style={{ color: OUTLAYS_COLOR }}>Outlays: {fmtBillions(row.outlays)}</div>}
+      {row.receipts != null && <div style={{ color: RECEIPTS_COLOR }}>Receipts: {fmtBillions(row.receipts)}</div>}
+      {row.deficit != null && (
+        <div style={{ color: row.deficit >= 0 ? LOSS_COLOR : WIN_COLOR }}>
+          {row.deficit >= 0 ? "Deficit" : "Surplus"}: {fmtBillions(Math.abs(row.deficit))}
+        </div>
+      )}
+      {row.interest != null && (
+        <div style={{ color: INTEREST_COLOR }}>
+          Interest on the Public Debt: {fmtBillions(row.interest)}
+          {row.interest_pct_outlays != null && ` (${fmtPct(row.interest_pct_outlays)} of Outlays)`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OutlaysByAgencyTooltipContent({ active, label, rows, topAgencies, agencyColor, otherCount }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  const headerLabel = row.fiscalYear != null
+    ? `FY${row.fiscalYear}${row.monthsPresent < 12 ? ` (partial, ${row.monthsPresent}/12 mo.)` : ""}`
+    : label;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{headerLabel}</div>
+      {topAgencies
+        .filter((a) => row[a] != null)
+        .sort((a, b) => Math.abs(row[b] ?? 0) - Math.abs(row[a] ?? 0))
+        .map((a) => (
+          <div key={a} style={{ color: agencyColor(a) }}>
+            {a}: {fmtBillions(row[a])}
+          </div>
+        ))}
+      {row.other != null && (
+        <div style={{ color: OUTLAYS_OTHER_COLOR }}>Other ({otherCount} more): {fmtBillions(row.other)}</div>
+      )}
+    </div>
+  );
+}
+
 function fmtUsd(v) {
   if (v == null) return "—";
   return `$${v.toFixed(2)}`;
@@ -783,6 +999,8 @@ export default function MoneySupply() {
   const [customEnd, setCustomEnd] = useState("");
   const [data, setData] = useState(null);
   const [metalsData, setMetalsData] = useState(null);
+  const [outlaysData, setOutlaysData] = useState(null);
+  const [outlaysByAgencyData, setOutlaysByAgencyData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -813,6 +1031,59 @@ export default function MoneySupply() {
   const [clickedQeQtKey, setClickedQeQtKey] = useState(null);
   // Same pattern applied to the Treasury Yields chart's 4-entry legend.
   const [clickedYieldsKey, setClickedYieldsKey] = useState(null);
+  // Same pattern applied to the Federal Outlays chart's 4-entry legend.
+  const [clickedOutlaysKey, setClickedOutlaysKey] = useState(null);
+  // Same pattern applied to the Outlays by Agency chart's top-N + Other legend.
+  const [clickedAgencyKey, setClickedAgencyKey] = useState(null);
+  // Shared by both Federal Outlays sub-panels (Topline, by Agency) — toggles
+  // between the real monthly rows and a client-side fiscal-year rollup of
+  // them. Not part of the panel-wide window_ state: window_ controls WHICH
+  // dates are fetched, this controls how the already-fetched monthly rows
+  // are displayed, a orthogonal concern scoped to just these two charts.
+  const [outlaysGranularity, setOutlaysGranularity] = useState("monthly"); // "monthly" | "annual"
+
+  // Real memory reduction, not just visual hiding: native <details> closed
+  // state only applies display:none — it does NOT unmount a collapsed
+  // panel's content, so Recharts' SVG trees and every chart's derived data
+  // stayed fully resident in memory regardless of collapsed/open state, a
+  // real cost the user flagged directly. Each sub-panel's body is now only
+  // rendered while its own open flag is true (defaults to false/collapsed,
+  // matching the earlier "default all sub-panels collapsed" request) —
+  // opening a panel mounts its chart fresh from already-fetched data (a
+  // re-render, not a refetch), collapsing it unmounts that render entirely.
+  // No other file in this codebase has this pattern yet (every other
+  // <details className="collapsible-pane"> is uncontrolled, just the
+  // native open attribute) — this is the first controlled one, done here
+  // because Money Supply is the panel with the memory complaint.
+  const [m2PanelOpen, setM2PanelOpen] = useState(false);
+  const [compositionPanelOpen, setCompositionPanelOpen] = useState(false);
+  const [qeQtPanelOpen, setQeQtPanelOpen] = useState(false);
+  const [yieldsPanelOpen, setYieldsPanelOpen] = useState(false);
+  const [metalsPanelOpen, setMetalsPanelOpen] = useState(false);
+  const [outlaysPanelOpen, setOutlaysPanelOpen] = useState(false);
+  const [outlaysByAgencyPanelOpen, setOutlaysByAgencyPanelOpen] = useState(false);
+  // Which real month the pie snapshot shows — pin > hover > latest, same
+  // priority rule as compositionPieRow above.
+  const [hoveredAgencyDate, setHoveredAgencyDate] = useState(null);
+
+  // A real bug caught by the user: the default 2Y window only covers ~24
+  // real months, straddling 3 fiscal years where the FIRST and LAST are
+  // both partial (e.g. FY2024 with only 3 of 12 months) — switching to
+  // Annual under that window made the "latest" summary/pie default to a
+  // 3-month partial year, which read as if the chart had reset/lost data.
+  // Switching TO annual auto-widens window_ to at least 10y (only if the
+  // current window is narrower — never fights a window the user already
+  // widened themselves) so Annual always defaults to showing several real
+  // complete fiscal years. Switching back to Monthly does NOT auto-narrow
+  // window_ back down — that's the user's own choice, not something to
+  // undo automatically.
+  const OUTLAYS_WINDOW_RANK = { "2y": 0, "5y": 1, "10y": 2, "20y": 3, custom: 4 };
+  function handleOutlaysGranularityChange(g) {
+    setOutlaysGranularity(g);
+    if (g === "annual" && (OUTLAYS_WINDOW_RANK[window_] ?? 4) < OUTLAYS_WINDOW_RANK["10y"]) {
+      setWindow("10y");
+    }
+  }
 
   // Safety net: if the mouse button is released outside the chart's own SVG
   // (e.g. dragged off it before releasing), the chart's own onMouseUp never
@@ -830,16 +1101,24 @@ export default function MoneySupply() {
     setError(null);
     try {
       const rangeParams = w === "custom" && start && end ? `&start=${start}&end=${end}` : "";
-      const [moneyRes, metalsRes] = await Promise.all([
+      const [moneyRes, metalsRes, outlaysRes, outlaysByAgencyRes] = await Promise.all([
         fetch(`/api/fred/money-supply/db?window=${w}${rangeParams}`),
         fetch(`/api/metals/prices/db?window=${w}${rangeParams}`),
+        fetch(`/api/treasury-outlays/db?window=${w}${rangeParams}`),
+        fetch(`/api/treasury-outlays-by-agency/db?window=${w}${rangeParams}`),
       ]);
       if (!moneyRes.ok) throw new Error(`HTTP ${moneyRes.status}`);
       if (!metalsRes.ok) throw new Error(`HTTP ${metalsRes.status}`);
+      if (!outlaysRes.ok) throw new Error(`HTTP ${outlaysRes.status}`);
+      if (!outlaysByAgencyRes.ok) throw new Error(`HTTP ${outlaysByAgencyRes.status}`);
       const moneyJson = await moneyRes.json();
       const metalsJson = await metalsRes.json();
+      const outlaysJson = await outlaysRes.json();
+      const outlaysByAgencyJson = await outlaysByAgencyRes.json();
       setData(moneyJson.data ?? null);
       setMetalsData(metalsJson.data ?? null);
+      setOutlaysData(outlaysJson.data ?? null);
+      setOutlaysByAgencyData(outlaysByAgencyJson.data ?? null);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -895,6 +1174,47 @@ export default function MoneySupply() {
   );
   const yieldsTicks = useMemo(() => xTicks(yieldsMerged), [yieldsMerged]);
 
+  const outlaysMonthly = useMemo(() => mergeOutlays(outlaysData), [outlaysData]);
+  // Annual rollup sums outlays/receipts/deficit/interest across each FY's
+  // real months, then recomputes interest_pct_outlays from the SUMMED
+  // figures (not a sum/average of the monthly percentages, which would be
+  // a meaningless number — the ratio only makes sense computed against the
+  // annual totals directly).
+  const outlaysAnnual = useMemo(() => {
+    const rows = aggregateAnnual(outlaysMonthly, ["outlays", "receipts", "deficit", "interest"]);
+    return rows.map((row) => ({
+      ...row,
+      interest_pct_outlays:
+        row.interest != null && row.outlays ? round1((row.interest / row.outlays) * 100) : null,
+    }));
+  }, [outlaysMonthly]);
+  const outlaysMerged = outlaysGranularity === "annual" ? outlaysAnnual : outlaysMonthly;
+  const outlaysTicks = useMemo(() => xTicks(outlaysMerged), [outlaysMerged]);
+
+  const topAgencies = useMemo(
+    () => topAgenciesByLatestMonth(outlaysByAgencyData, OUTLAYS_BY_AGENCY_TOP_N),
+    [outlaysByAgencyData]
+  );
+  const outlaysByAgencyMonthly = useMemo(
+    () => mergeOutlaysByAgency(outlaysByAgencyData, topAgencies),
+    [outlaysByAgencyData, topAgencies]
+  );
+  const outlaysByAgencyAnnual = useMemo(
+    () => aggregateAnnual(outlaysByAgencyMonthly, [...topAgencies, "other"]),
+    [outlaysByAgencyMonthly, topAgencies]
+  );
+  const outlaysByAgencyMerged = outlaysGranularity === "annual" ? outlaysByAgencyAnnual : outlaysByAgencyMonthly;
+  const outlaysByAgencyTicks = useMemo(
+    () => xTicks(outlaysByAgencyMerged, outlaysGranularity === "annual" ? 8 : 4),
+    [outlaysByAgencyMerged, outlaysGranularity]
+  );
+  const allAgencyNames = useMemo(
+    () => [...new Set((outlaysByAgencyData || []).map((r) => r.agency))],
+    [outlaysByAgencyData]
+  );
+  const agencyColor = (name) => VAULT_COLORS[topAgencies.indexOf(name) % VAULT_COLORS.length];
+  const outlaysOtherCount = Math.max(0, allAgencyNames.length - topAgencies.length);
+
   const composition = useMemo(() => (data ? mergeComposition(data) : []), [data]);
   // Fewer ticks than the default 8 — this chart shares its row with the pie
   // (see the flex layout below), so it has less width than the other
@@ -946,6 +1266,25 @@ export default function MoneySupply() {
   // date strings).
   const pinnedDateMerged = nearestRowDate(merged, pinnedDate);
   const pinnedDateYields = nearestRowDate(yieldsMerged, pinnedDate);
+  const pinnedDateOutlays = nearestRowDate(outlaysMerged, pinnedDate);
+  const pinnedDateOutlaysByAgency = nearestRowDate(outlaysByAgencyMerged, pinnedDate);
+  // Pin > hover > latest, same priority rule as compositionPieRow.
+  const outlaysByAgencyPieDate = pinnedDate
+    ? pinnedDateOutlaysByAgency
+    : hoveredAgencyDate
+      ? nearestRowDate(outlaysByAgencyMerged, hoveredAgencyDate)
+      : outlaysByAgencyMerged[outlaysByAgencyMerged.length - 1]?.date;
+  const outlaysByAgencyPieRow = outlaysByAgencyMerged.find((r) => r.date === outlaysByAgencyPieDate);
+  const outlaysByAgencyPieData = outlaysByAgencyPieRow
+    ? [
+        ...topAgencies
+          .filter((a) => outlaysByAgencyPieRow[a] != null && outlaysByAgencyPieRow[a] > 0)
+          .map((a) => ({ key: a, name: a, value: outlaysByAgencyPieRow[a], color: agencyColor(a) })),
+        ...(outlaysByAgencyPieRow.other != null && outlaysByAgencyPieRow.other > 0
+          ? [{ key: "other", name: `Other (${outlaysOtherCount} more)`, value: outlaysByAgencyPieRow.other, color: OUTLAYS_OTHER_COLOR }]
+          : []),
+      ]
+    : [];
   const pinnedDateComposition = nearestRowDate(composition, pinnedDate);
   // QE/QT renders a filtered subset of `composition` (only rows with a real
   // assetsChangeBillions), a different date grid than the unfiltered
@@ -1060,7 +1399,7 @@ export default function MoneySupply() {
         </div>
       )}
 
-      <details className="collapsible-pane" open>
+      <details className="collapsible-pane" open={m2PanelOpen} onToggle={(e) => setM2PanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
         M2 Money Stock / Fed Balance Sheet
         {m2SummaryValue != null && (
@@ -1072,6 +1411,7 @@ export default function MoneySupply() {
           </span>
         )}
       </summary>
+      {m2PanelOpen && (
       <div className="collapsible-pane-body">
       <div className="comex-panel-note">
         Tracks the supply of the thing being debased. Descriptive historical series — no
@@ -1218,9 +1558,10 @@ export default function MoneySupply() {
         </div>
       )}
       </div>
+      )}
       </details>
 
-      <details className="collapsible-pane" open>
+      <details className="collapsible-pane" open={compositionPanelOpen} onToggle={(e) => setCompositionPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
         Fed Balance Sheet Composition
         {compositionPieRow?.assetsLiabilitiesRatio != null && (
@@ -1233,6 +1574,7 @@ export default function MoneySupply() {
           </span>
         )}
       </summary>
+      {compositionPanelOpen && (
       <div className="collapsible-pane-body">
       <div className="comex-panel-note">
         What the Fed Balance Sheet above is made of: <strong>Assets</strong> (what it owns) vs.{" "}
@@ -1499,9 +1841,10 @@ export default function MoneySupply() {
         </div>
       )}
       </div>
+      )}
       </details>
 
-      <details className="collapsible-pane" open>
+      <details className="collapsible-pane" open={qeQtPanelOpen} onToggle={(e) => setQeQtPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
         QE / QT
         {(() => {
@@ -1526,6 +1869,7 @@ export default function MoneySupply() {
           );
         })()}
       </summary>
+      {qeQtPanelOpen && (
       <div className="collapsible-pane-body">
       <div className="comex-panel-note">
         <strong>QE / QT</strong> — week-over-week change in Fed assets. Above zero = growing
@@ -1633,9 +1977,10 @@ export default function MoneySupply() {
         </div>
       )}
       </div>
+      )}
       </details>
 
-      <details className="collapsible-pane" open>
+      <details className="collapsible-pane" open={yieldsPanelOpen} onToggle={(e) => setYieldsPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
         Treasury Yields
         {yieldsMerged.length > 0 && (
@@ -1656,6 +2001,7 @@ export default function MoneySupply() {
           </span>
         )}
       </summary>
+      {yieldsPanelOpen && (
       <div className="collapsible-pane-body">
       <div className="comex-panel-note">
         Real FRED Treasury series, daily. Gold's most-cited "opportunity cost" driver is the
@@ -1752,9 +2098,10 @@ export default function MoneySupply() {
         </div>
       )}
       </div>
+      )}
       </details>
 
-      <details className="collapsible-pane" open>
+      <details className="collapsible-pane" open={metalsPanelOpen} onToggle={(e) => setMetalsPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
         Dollars vs Silver vs Gold as Purchasing Power
         {(() => {
@@ -1783,6 +2130,7 @@ export default function MoneySupply() {
           );
         })()}
       </summary>
+      {metalsPanelOpen && (
       <div className="collapsible-pane-body">
       <div className="comex-panel-note">
         Four ways to have held a dollar since 2006: Fiat ($100 nominal — always worth $100 of
@@ -1934,6 +2282,342 @@ export default function MoneySupply() {
         RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL. Metal prices: Yahoo Finance (SI=F, GC=F).
       </div>
       </div>
+      )}
+      </details>
+
+      <details className="collapsible-pane" open={outlaysPanelOpen} onToggle={(e) => setOutlaysPanelOpen(e.target.open)}>
+      <summary className="collapsible-pane-title">
+        Federal Outlays
+        {outlaysMerged.length > 0 && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {(() => {
+              const row = pinnedDate
+                ? outlaysMerged.find((r) => r.date === pinnedDateOutlays)
+                : outlaysMerged[outlaysMerged.length - 1];
+              if (!row) return null;
+              const label = row.fiscalYear != null
+                ? `FY${row.fiscalYear}${row.monthsPresent < 12 ? ` (partial, ${row.monthsPresent}/12 mo.)` : ""}`
+                : row.date;
+              return (
+                <>
+                  {label} ·{" "}
+                  {row.deficit != null && (
+                    <span style={{ color: row.deficit >= 0 ? LOSS_COLOR : WIN_COLOR }}>
+                      {row.deficit >= 0 ? "Deficit" : "Surplus"} {fmtBillions(Math.abs(row.deficit))}
+                    </span>
+                  )}
+                  {row.interest_pct_outlays != null &&
+                    ` · Interest ${fmtPct(row.interest_pct_outlays)} of Outlays`}
+                </>
+              );
+            })()}
+          </span>
+        )}
+      </summary>
+      {outlaysPanelOpen && (
+      <div className="collapsible-pane-body">
+      <div className="comex-panel-note">
+        Why the money supply keeps growing, alongside how much of it there already is. Federal
+        outlays, receipts, deficit/surplus, and interest expense on the public debt — U.S.
+        Treasury's Monthly Treasury Statement. Descriptive historical series only, per AV Voice
+        Rules — no forecast, no "at this rate" extrapolation.
+      </div>
+      <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+        {["monthly", "annual"].map((g) => (
+          <button
+            key={g}
+            className={`comex-range-btn${outlaysGranularity === g ? " comex-range-btn--active" : ""}`}
+            onClick={() => handleOutlaysGranularityChange(g)}
+          >
+            {g === "monthly" ? "Monthly" : "Annual (FY)"}
+          </button>
+        ))}
+      </div>
+      {outlaysGranularity === "annual" && outlaysAnnual.some((r) => r.monthsPresent < 12) && (
+        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
+          {outlaysAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
+            <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
+          ))}
+        </div>
+      )}
+      {outlaysMerged.length > 0 ? (
+        <div>
+          <ResponsiveContainer width="100%" height={280}>
+            <LineChart
+              data={outlaysMerged}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onClick={(state) => {
+                if (state?.activeLabel) setPinnedDate(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={outlaysTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                tickFormatter={(v) => `$${v.toFixed(0)}B`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip content={<OutlaysTooltipContent outlaysMerged={outlaysMerged} />} />
+              {pinnedDateOutlays && (
+                <ReferenceLine x={pinnedDateOutlays} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+              )}
+              <ReferenceLine y={0} stroke="#5a6278" strokeDasharray="2 4" />
+              {OUTLAYS_LEGEND_SERIES.map((entry) => (
+                <Line
+                  key={entry.key}
+                  type="monotone"
+                  dataKey={entry.key}
+                  stroke={entry.color}
+                  strokeDasharray={entry.dashed ? "4 3" : undefined}
+                  dot={false}
+                  strokeWidth={clickedOutlaysKey === entry.key ? 3 : 1.5}
+                  strokeOpacity={clickedOutlaysKey && clickedOutlaysKey !== entry.key ? 0.25 : 1}
+                  connectNulls
+                />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+          {pinnedDateOutlays && (
+            <div style={{ marginTop: 4 }}>
+              <OutlaysTooltipContent active label={pinnedDateOutlays} outlaysMerged={outlaysMerged} />
+            </div>
+          )}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {OUTLAYS_LEGEND_SERIES.map((entry) => (
+              <button
+                key={entry.key}
+                className={`comex-legend-item legend-btn-row${clickedOutlaysKey === entry.key ? " legend-btn-row--baseline" : ""}`}
+                onClick={() => setClickedOutlaysKey((k) => (k === entry.key ? null : entry.key))}
+              >
+                <span
+                  className={`comex-legend-swatch${entry.dashed ? " comex-legend-swatch--dashed" : ""}`}
+                  style={entry.dashed ? { borderColor: entry.color } : { background: entry.color }}
+                />
+                <span>
+                  <strong>{entry.legendLabel}</strong>
+                </span>
+              </button>
+            ))}
+          </div>
+          {clickedOutlaysKey && (
+            <div className="comex-panel-note comex-panel-note--eli5">
+              {OUTLAYS_LEGEND_SERIES.find((d) => d.key === clickedOutlaysKey)?.eli5}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Run the backend once to seed the database — this source fetches automatically at startup, no key required.</div>
+        </div>
+      )}
+      <div className="comex-panel-note" style={{ marginTop: 8 }}>
+        Source: U.S. Treasury (fiscaldata.treasury.gov) — Monthly Treasury Statement, Table 1
+        (Receipts/Outlays/Deficit) and Table 5 (Interest on the Public Debt). Real coverage:
+        Outlays/Receipts/Deficit from 2013-10, Interest from 2015-03.
+      </div>
+      </div>
+      )}
+      </details>
+
+      <details className="collapsible-pane" open={outlaysByAgencyPanelOpen} onToggle={(e) => setOutlaysByAgencyPanelOpen(e.target.open)}>
+      <summary className="collapsible-pane-title">
+        Federal Outlays by Department/Agency
+        {outlaysByAgencyPieRow?.date && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {outlaysByAgencyPieRow.fiscalYear != null
+              ? `FY${outlaysByAgencyPieRow.fiscalYear}${outlaysByAgencyPieRow.monthsPresent < 12 ? ` (partial, ${outlaysByAgencyPieRow.monthsPresent}/12 mo.)` : ""}`
+              : outlaysByAgencyPieRow.date}
+            {topAgencies[0] && outlaysByAgencyPieRow[topAgencies[0]] != null &&
+              ` · Top: ${topAgencies[0]} ${fmtBillions(outlaysByAgencyPieRow[topAgencies[0]])}`}
+          </span>
+        )}
+      </summary>
+      {outlaysByAgencyPanelOpen && (
+      <div className="collapsible-pane-body">
+      <div className="comex-panel-note">
+        Which parts of the government the Outlays line above is actually made of — top{" "}
+        {OUTLAYS_BY_AGENCY_TOP_N} departments/agencies by current spend, everything else bucketed
+        into "Other." A department's own reported total, not a client-side sum of its
+        sub-programs. Bounded to the most recent {TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL} of
+        history (see the note below) — the topline Outlays chart above goes back further.
+        Note: Department of the Treasury's own total includes interest paid on the public debt
+        (Treasury is who issues/services it) — a larger figure than the standalone "Interest on
+        the Public Debt" line in the chart above, which is scoped to interest specifically.
+      </div>
+      <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+        {["monthly", "annual"].map((g) => (
+          <button
+            key={g}
+            className={`comex-range-btn${outlaysGranularity === g ? " comex-range-btn--active" : ""}`}
+            onClick={() => handleOutlaysGranularityChange(g)}
+          >
+            {g === "monthly" ? "Monthly" : "Annual (FY)"}
+          </button>
+        ))}
+      </div>
+      {outlaysGranularity === "annual" && outlaysByAgencyAnnual.some((r) => r.monthsPresent < 12) && (
+        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
+          {outlaysByAgencyAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
+            <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
+          ))}
+        </div>
+      )}
+      {outlaysByAgencyMerged.length > 0 ? (
+        <div className="comex-vault-pie-row">
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart
+              data={outlaysByAgencyMerged}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onMouseMove={(state) => {
+                if (state?.activeLabel) setHoveredAgencyDate(state.activeLabel);
+              }}
+              onMouseLeave={() => setHoveredAgencyDate(null)}
+              onClick={(state) => {
+                if (state?.activeLabel) setPinnedDate(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={outlaysByAgencyTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                tickFormatter={(v) => `$${v.toFixed(0)}B`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip
+                content={(props) => (
+                  <OutlaysByAgencyTooltipContent
+                    {...props}
+                    rows={outlaysByAgencyMerged}
+                    topAgencies={topAgencies}
+                    agencyColor={agencyColor}
+                    otherCount={outlaysOtherCount}
+                  />
+                )}
+              />
+              {pinnedDateOutlaysByAgency && (
+                <ReferenceLine x={pinnedDateOutlaysByAgency} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+              )}
+              {topAgencies.map((a) => (
+                <Area
+                  key={a}
+                  type="monotone"
+                  dataKey={a}
+                  stackId="outlays-by-agency"
+                  stroke={agencyColor(a)}
+                  strokeWidth={clickedAgencyKey === a ? 3 : 1}
+                  fill={agencyColor(a)}
+                  fillOpacity={clickedAgencyKey && clickedAgencyKey !== a ? 0.2 : 0.65}
+                  connectNulls
+                />
+              ))}
+              <Area
+                type="monotone"
+                dataKey="other"
+                stackId="outlays-by-agency"
+                stroke={OUTLAYS_OTHER_COLOR}
+                strokeWidth={clickedAgencyKey === "other" ? 3 : 1}
+                fill={OUTLAYS_OTHER_COLOR}
+                fillOpacity={clickedAgencyKey && clickedAgencyKey !== "other" ? 0.2 : 0.45}
+                connectNulls
+              />
+            </ComposedChart>
+          </ResponsiveContainer>
+          {pinnedDateOutlaysByAgency && (
+            <div style={{ marginTop: 4 }}>
+              <OutlaysByAgencyTooltipContent
+                active
+                label={pinnedDateOutlaysByAgency}
+                rows={outlaysByAgencyMerged}
+                topAgencies={topAgencies}
+                agencyColor={agencyColor}
+                otherCount={outlaysOtherCount}
+              />
+            </div>
+          )}
+          </div>
+
+          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <ResponsiveContainer width={180} height={180}>
+              <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                <Pie
+                  data={outlaysByAgencyPieData}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={70}
+                  innerRadius={36}
+                  paddingAngle={1}
+                >
+                  {outlaysByAgencyPieData.map((entry) => (
+                    <Cell
+                      key={entry.key}
+                      fill={entry.color}
+                      fillOpacity={clickedAgencyKey && clickedAgencyKey !== entry.key ? 0.35 : 1}
+                      stroke={clickedAgencyKey === entry.key ? "#e8ecf4" : undefined}
+                      strokeWidth={clickedAgencyKey === entry.key ? 2 : undefined}
+                    />
+                  ))}
+                </Pie>
+                <Tooltip
+                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                  formatter={(v, name) => [fmtBillions(v), name]}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            {outlaysByAgencyPieRow?.date && (
+              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+                {outlaysByAgencyPieRow.fiscalYear != null
+                  ? `FY${outlaysByAgencyPieRow.fiscalYear}${outlaysByAgencyPieRow.monthsPresent < 12 ? ` (partial)` : ""}`
+                  : `As of ${outlaysByAgencyPieRow.date}`}
+              </div>
+            )}
+          </div>
+          </div>
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {topAgencies.map((a) => (
+              <button
+                key={a}
+                className={`comex-legend-item legend-btn-row${clickedAgencyKey === a ? " legend-btn-row--baseline" : ""}`}
+                onClick={() => setClickedAgencyKey((k) => (k === a ? null : a))}
+              >
+                <span className="comex-legend-swatch" style={{ background: agencyColor(a) }} />
+                <span>
+                  <strong>{a}</strong>
+                </span>
+              </button>
+            ))}
+            <button
+              className={`comex-legend-item legend-btn-row${clickedAgencyKey === "other" ? " legend-btn-row--baseline" : ""}`}
+              onClick={() => setClickedAgencyKey((k) => (k === "other" ? null : "other"))}
+            >
+              <span className="comex-legend-swatch" style={{ background: OUTLAYS_OTHER_COLOR }} />
+              <span>
+                <strong>Other ({outlaysOtherCount} more)</strong>
+              </span>
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Run the backend once to seed the database — this source fetches automatically at startup, no key required.</div>
+        </div>
+      )}
+      <div className="comex-panel-note" style={{ marginTop: 8 }}>
+        Source: U.S. Treasury (fiscaldata.treasury.gov) — Monthly Treasury Statement, Table 5,
+        per-department/agency totals. Real coverage: 2015-03 through present — Table 5 has no
+        real data at all before that (confirmed live), a harder floor than the topline Outlays
+        chart's 2013-10. Ongoing fetches (each backend restart) only pull the most recent{" "}
+        {TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL} (one HTTP request per real month against a free
+        API with no documented rate limit); the deeper 2015–2023 history was added via a one-time
+        manual backfill.
+      </div>
+      </div>
+      )}
       </details>
     </div>
   );

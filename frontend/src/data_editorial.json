@@ -606,7 +606,7 @@
       "catcor_consensus_actuals",
       "metals_prices"
     ],
-    "curl": "# FRED (Money Supply)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n\n# FRED (Treasury Yields — same call shape, different series_id)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n# also: DGS2, DFII10, T10Y2Y\n\n# ALFRED (CATCOR point-in-time vintage, e.g. CPI actual as-of the day after a release)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=${FRED_API_KEY}&file_type=json&realtime_start=2026-01-15&realtime_end=2026-01-15&sort_order=desc&limit=2\"\n\n# Yahoo Finance (metals_prices — real daily closes, resampled to month-end at read time, not fetch time)\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=20y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F",
+    "curl": "# FRED (Money Supply)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n\n# FRED (Treasury Yields \u2014 same call shape, different series_id)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n# also: DGS2, DFII10, T10Y2Y\n\n# ALFRED (CATCOR point-in-time vintage, e.g. CPI actual as-of the day after a release)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=${FRED_API_KEY}&file_type=json&realtime_start=2026-01-15&realtime_end=2026-01-15&sort_order=desc&limit=2\"\n\n# Yahoo Finance (metals_prices \u2014 real daily closes, resampled to month-end at read time, not fetch time)\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=20y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F",
     "tables": [
       {
         "name": "fred_observations",
@@ -1131,6 +1131,88 @@
           ]
         ],
         "note": "No frontend panel yet \u2014 DB + GET /api/squeeze-cases/db only this pass, per squeeze-context-spec.md's explicit scope for Story #3."
+      }
+    ]
+  },
+  {
+    "key": "treasury_outlays",
+    "label": "U.S. Treasury \u2014 Monthly Treasury Statement",
+    "origin": "fiscaldata.treasury.gov's public API, free, no key required. Table 1 (Summary of Receipts, Outlays, and the Deficit/Surplus) for receipts/outlays/deficit; Table 5 (Outlays of the U.S. Government), the \"Total--Interest on the Public Debt\" row specifically, for interest expense. Real API coverage starts 2015-03 \u2014 deeper history (back to Oct 1980) exists only in Treasury's legacy PDF archive, not this API; confirmed live during fed-spend-spec.md's Story #0 investigation. Frontend surface: the Money Supply tab's fifth sub-panel, \"Federal Outlays\" (fed-spend-spec.md Story #2).",
+    "sourceKeys": [
+      "treasury_outlays"
+    ],
+    "curl": "# Table 1: receipts/outlays/deficit, every month of the current + prior fiscal year, per publication\ncurl \"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts/mts_table_1?filter=record_type_cd:eq:MTH&sort=record_date&page%5Bsize%5D=10000\"\n\n# Table 5: interest on the public debt (one real row per real month for this classification)\ncurl \"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts/mts_table_5?filter=classification_desc:eq:Total--Interest%20on%20the%20Public%20Debt&sort=record_date&page%5Bsize%5D=10000\"",
+    "tables": [
+      {
+        "name": "treasury_outlays",
+        "fields": [
+          [
+            "year",
+            "PK \u2014 real calendar year, reconstructed from Table 1's classification_desc (month name) + sequence_number_cd's fiscal-year-block prefix ('1.'=prior FY, '2.'=current FY); NOT the same as any single row's own record_fiscal_year field, which is the REPORT's own FY on every row regardless of block."
+          ],
+          [
+            "month",
+            "PK \u2014 real calendar month (1-12), same reconstruction as year."
+          ],
+          [
+            "receipts_usd",
+            "Table 1 current_month_gross_rcpt_amt for this real month."
+          ],
+          [
+            "outlays_usd",
+            "Table 1 current_month_gross_outly_amt for this real month."
+          ],
+          [
+            "deficit_usd",
+            "Table 1 current_month_dfct_sur_amt for this real month \u2014 reported directly by Treasury, not derived from receipts \u2212 outlays client-side."
+          ],
+          [
+            "interest_usd",
+            "Table 5's \"Total--Interest on the Public Debt\" row, current_month_net_outly_amt, matched to this real month via that row's own record_date (Table 5 has no fiscal-year-block ambiguity for this classification \u2014 confirmed live, one real row per record_date, already that single month's own figure despite the field name's \"current_month\" ambiguity next to a sibling current_fytd_net_outly_amt column)."
+          ],
+          [
+            "fetched_at",
+            "Row upsert timestamp"
+          ]
+        ],
+        "note": "Upsert (INSERT ... ON CONFLICT), not append-only \u2014 MTS republishes every month of the current AND prior fiscal year on every monthly release, so a later publication's restated figure for an already-persisted month is the more current one, same reasoning as census_trade/settlement_price. Table 1 and Table 5 are fetched and matched independently (Table 1 by reconstructed year/month, Table 5 by its own record_date) \u2014 a fetch is merged forward against whatever's already persisted per (year, month) before upserting, so a fetch where one table's response happens not to cover a given month never nulls out a field the other table already established in an earlier fetch. Nulls over zeros for any field not yet correlated. Cadence: manual_only + fire_at_startup, same posture as money_supply/metals_prices \u2014 a government monthly release isn't something a page load should trigger live."
+      }
+    ]
+  },
+  {
+    "key": "treasury_outlays_by_agency",
+    "label": "U.S. Treasury \u2014 MTS Outlays by Department/Agency",
+    "origin": "fiscaldata.treasury.gov's public API, same host/no-key posture as the treasury_outlays card. Monthly Treasury Statement Table 5 (Outlays of the U.S. Government), filtered to the level-1 department/agency header rows and each one's direct \"Total--<agency>\" child row \u2014 Treasury's own reported per-department total, not a client-side sum of that department's sub-programs/bureaus. Confirmed live: a stable 29-department list (Defense, HHS, Treasury, SSA, etc.) across both a 2015 and a 2026 publication. Note: \"Department of the Treasury\"'s own total includes debt-interest payments (Treasury is who issues/services the debt) \u2014 a different, larger figure than the standalone treasury_outlays.interest_usd line, which is scoped to interest specifically. Frontend surface: the Money Supply tab's sixth sub-panel (fed-spend-spec.md Story #0 Tier 2).",
+    "sourceKeys": [
+      "treasury_outlays_by_agency"
+    ],
+    "curl": "# One record_date (month-end) at a time \u2014 Table 5's parent/child hierarchy needs the whole table for that date to resolve, no server-side filter shortcut exists the way Table 1 has record_type_cd=MTH\ncurl \"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts/mts_table_5?filter=record_date:eq:2026-06-30&page%5Bsize%5D=2000\"\n# Then client-side: level-1 record_type_cd=C rows are department headers;\n# each header's classification_id is some child row's parent_id; the real\n# total is whichever child has record_type_cd=C AND classification_desc\n# starting with \"Total--\".",
+    "tables": [
+      {
+        "name": "treasury_outlays_by_agency",
+        "fields": [
+          [
+            "year",
+            "PK \u2014 real calendar year, taken directly from that record_date's own year (Table 5's per-date rows have no fiscal-year-block ambiguity for this classification \u2014 unlike Table 1's month reconstruction)."
+          ],
+          [
+            "month",
+            "PK \u2014 real calendar month, same source as year."
+          ],
+          [
+            "agency",
+            "PK \u2014 department/agency name (Table 5's level-1 header classification_desc, colon-stripped, e.g. \"Department of Defense--Military Programs\"). Confirmed stable 29-entry list across 2015 and 2026."
+          ],
+          [
+            "outlay_usd",
+            "That department's Treasury-reported \"Total--<agency>\" monthly figure. Can be legitimately negative (offsetting receipts exceeding gross outlays that month) \u2014 confirmed live for several agencies (e.g. Department of Education, Independent Agencies) \u2014 not an error case."
+          ],
+          [
+            "fetched_at",
+            "Row upsert timestamp"
+          ]
+        ],
+        "note": "Upsert (INSERT ... ON CONFLICT), same restatement reasoning as treasury_outlays. Real persisted coverage: 2015-03 through present (136 real months as of the 2026-07-25 backfill) \u2014 confirmed live that MTS Table 5 as a whole has zero real data before 2015-03-31 (every record_date checked earlier than that returns a real HTTP 200 with an empty data array, not an error), a harder floor than treasury_outlays' own 2013-10 (Table 1) floor. The 2015-03-2023-06 portion of this history was added via a one-time manual backfill script (not shipped app code) run once against runtime/argentvigil.db directly. Ongoing fetches (fire_at_startup, every backend restart) are deliberately bounded to the most recent 36 real months per fetch (TREASURY_OUTLAYS_BY_AGENCY_MONTHS in backend/main.py) \u2014 full history would be ~150 sequential HTTP requests (one per real month, since Table 5's hierarchy can't be filtered server-side), real per-restart cost against a fire_at_startup source hitting a free public API with no documented rate limit. Already-persisted months are skipped (checked against what's on disk before spending a request), so a fresh/cleared DB would only recover the most recent 36 months automatically going forward \u2014 the deeper 2015-2023 history would need the one-off backfill re-run, it will not regenerate itself from the bounded ongoing fetch alone. Depends on treasury_outlays having already run in the same boot (reads its year/month rows to know which real months to fetch) \u2014 both sources are registered in that dependency order in backend/main.py, and _schedule_loop's startup dispatch awaits each fetch_fn in registration order, so this is not a race in practice."
       }
     ]
   }

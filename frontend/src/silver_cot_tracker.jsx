@@ -744,6 +744,55 @@ function CategoryCompositionPanel({ since, until, pinnedDate, onPin }) {
 }
 
 
+// Live spot price badge — re-added to the Silver/Gold <summary> headers
+// after the original LeverageSpotBadge (see the removal note directly
+// below) was found to have left /api/prices/db's real live data with no
+// frontend consumer anywhere in this tab. Deliberately NOT a revival of
+// the old LeverageSpotBadge/PriceHistoryChart's rolling-chart-plus-"Live"-
+// polling-toggle complexity — just a compact current-price readout, same
+// "staleness-label" inline-span convention MetalCurrentReadout's own
+// compact form already uses, reading /api/prices/db (the real metalcharts.org
+// spot tick, fast-tier/~60s cadence) via each metal's own spotKey.
+// Refetches on FORCE_REFRESH_EVENT like every other summary-row badge in
+// this file — no independent polling loop, since the panel-wide
+// force-refresh event already exists for exactly this purpose and a
+// second, separate polling timer would just be two paths doing the same job.
+function SpotPriceBadge({ metal }) {
+  const [prices, setPrices] = useState(null);
+  const { spotKey } = METAL_CONFIG[metal];
+
+  const fetchPrices = useCallback(() => {
+    fetch("/api/prices/db")
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((json) => setPrices(json.data ?? null))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    fetchPrices();
+    window.addEventListener(FORCE_REFRESH_EVENT, fetchPrices);
+    return () => window.removeEventListener(FORCE_REFRESH_EVENT, fetchPrices);
+  }, [fetchPrices]);
+
+  const row = prices?.[spotKey];
+  if (!row || row.price == null) return null;
+
+  const pct = row.changePercent24h;
+  return (
+    <span className="staleness-label">
+      <strong>${row.price.toFixed(2)}</strong>
+      {pct != null && (
+        <span style={{ color: pct >= 0 ? "#4caf76" : "#e05252" }}>
+          {" "}{pct >= 0 ? "+" : ""}{pct.toFixed(2)}%
+        </span>
+      )}
+    </span>
+  );
+}
+
 // Silver panel rebuild (2026-07) — a from-scratch replacement for the
 // Silver <details> section's old contents (PaperLeveragePanel's LBMA
 // badge/spot badge/rolling price chart/Live toggle, CurveSpreadPanel's own
@@ -753,7 +802,10 @@ function CategoryCompositionPanel({ since, until, pinnedDate, onPin }) {
 // parity in a later pass — PaperLeveragePanel/CurveSpreadPanel/
 // LeverageCurveSpreadChart/SignalBanner/LbmaFixBadge/LeverageSpotBadge/
 // PriceHistoryChart are all gone now; both metals share this same set of
-// generalized, metal-parameterized components.
+// generalized, metal-parameterized components. LeverageSpotBadge's removal
+// left /api/prices/db with no frontend consumer in this tab at all — see
+// SpotPriceBadge above, added back later as a compact-only readout, not a
+// revival of the old badge's chart/polling-toggle complexity.
 // compact=true renders a single inline <span> (same "staleness-label"
 // convention StalenessLabel uses to sit in a <summary> row's right side,
 // margin-left: auto pushes it away from the title text) instead of the
@@ -1285,6 +1337,7 @@ export default function SilverCoTTracker() {
           <details className="collapsible-pane">
             <summary className="collapsible-pane-title">
               <span>Silver</span>
+              <SpotPriceBadge metal="silver" />
               <MetalCurrentReadout metal="silver" compact />
             </summary>
             <div className="collapsible-pane-body">
@@ -1301,6 +1354,7 @@ export default function SilverCoTTracker() {
           <details className="collapsible-pane">
             <summary className="collapsible-pane-title">
               <span>Gold</span>
+              <SpotPriceBadge metal="gold" />
               <MetalCurrentReadout metal="gold" compact />
             </summary>
             <div className="collapsible-pane-body">
