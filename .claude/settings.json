@@ -23,7 +23,12 @@
       "Bash(/Users/jrmallas/gitRepos/ArgentVigil/utils/vigil.sh restart *)",
       "Bash(bash utils/vigil.sh status)",
       "Bash(/Users/jrmallas/gitRepos/ArgentVigil/utils/vigil.sh:*)",
-      "Bash(/Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh:*)"
+      "Bash(/Users/jrmallas/.gitRepos/ArgentVigil/utils/vigil.sh:*)",
+      "Bash(bash utils/vigil.sh test)",
+      "Bash(sqlite3 runtime/argentvigil.db \"SELECT security_type, COUNT\\(*\\), MIN\\(auction_date\\), MAX\\(auction_date\\) FROM treasury_auctions GROUP BY security_type;\")",
+      "Bash(curl -s \"http://localhost:8000/api/treasury-auctions/db?security_type=Note\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(len\\(d['data']\\)\\); print\\(d['data'][-1] if d['data'] else None\\)\")",
+      "Bash(curl -s \"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query?filter=auction_date:gte:2026-04-01&page%5Bsize%5D=2&fields=cusip,auction_date,security_type\")"
     ]
   }
 }

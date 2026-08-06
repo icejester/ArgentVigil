@@ -606,7 +606,7 @@
       "catcor_consensus_actuals",
       "metals_prices"
     ],
-    "curl": "# FRED (Money Supply)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n\n# FRED (Treasury Yields \u2014 same call shape, different series_id)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n# also: DGS2, DFII10, T10Y2Y\n\n# ALFRED (CATCOR point-in-time vintage, e.g. CPI actual as-of the day after a release)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=${FRED_API_KEY}&file_type=json&realtime_start=2026-01-15&realtime_end=2026-01-15&sort_order=desc&limit=2\"\n\n# Yahoo Finance (metals_prices \u2014 real daily closes, resampled to month-end at read time, not fetch time)\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=20y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F",
+    "curl": "# FRED (Money Supply)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=M2SL&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n\n# FRED (Treasury Yields \u2014 same call shape, different series_id)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n# also: DGS2, DFII10, T10Y2Y, DGS3MO, DGS5, DGS30, WSHOSHO\n\n# FRED (Foreign/TIC holdings of long-term US Treasuries, by country)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=FORLTTREASPOS42609&api_key=${FRED_API_KEY}&file_type=json&observation_start=2015-01-01\"\n# also: FORLTTREASPOS41408 (China), FORLTTREASPOS13005 (UK), FORLTTREASPOS99996 (Grand Total, LT only), etc. \u2014 see pipeline/config.py's FRED_SERIES_TIC_COUNTRIES for the full list\n\n# ALFRED (CATCOR point-in-time vintage, e.g. CPI actual as-of the day after a release)\ncurl \"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key=${FRED_API_KEY}&file_type=json&realtime_start=2026-01-15&realtime_end=2026-01-15&sort_order=desc&limit=2\"\n\n# Yahoo Finance (metals_prices \u2014 real daily closes, resampled to month-end at read time, not fetch time)\ncurl \"https://query1.finance.yahoo.com/v8/finance/chart/SI=F?interval=1d&range=20y\" \\\n  -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\"\n# gold: /v8/finance/chart/GC=F",
     "tables": [
       {
         "name": "fred_observations",
@@ -651,11 +651,11 @@
         "note": "Fetched by /api/fred/money-supply/refresh, on-demand only (source_key money_supply)."
       },
       {
-        "name": "fred_observations \u2014 WRESBAL, RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL",
+        "name": "fred_observations \u2014 WRESBAL, RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL, WSHOSHO",
         "fields": [
           [
             "series_id",
-            "'WRESBAL' / 'RRPONTSYD' / 'WSHOTSL' / 'WSHOMCB' / 'WLCFLPCL' \u2014 all 5 of FRED's H.4.1 candidate series",
+            "'WRESBAL' / 'RRPONTSYD' / 'WSHOTSL' / 'WSHOMCB' / 'WLCFLPCL' \u2014 all 5 of FRED's H.4.1 candidate series \u2014 plus 'WSHOSHO' (SOMA's own Treasury-only holdings, a subset of WSHOTSL's own total, added for the Treasuries-picture expansion)",
             "Money Supply tab \u2014 Fed Balance Sheet Composition chart"
           ],
           [
@@ -665,18 +665,18 @@
           ],
           [
             "value",
-            "Raw level, FRED's native unit per series \u2014 NOT all shared: WRESBAL/WSHOTSL/WSHOMCB/WLCFLPCL are millions of USD (like WALCL), RRPONTSYD is billions of USD (like M2SL). Confirmed live against FRED's /fred/series metadata. All converted to trillions in /api/fred/money-supply/db with their own correct divisor (_millions_to_trillions helper for the four millions-denominated series).",
+            "Raw level, FRED's native unit per series \u2014 NOT all shared: WRESBAL/WSHOTSL/WSHOMCB/WLCFLPCL/WSHOSHO are millions of USD (like WALCL), RRPONTSYD is billions of USD (like M2SL). Confirmed live against FRED's /fred/series metadata. All converted to trillions in /api/fred/money-supply/db with their own correct divisor (_millions_to_trillions helper for the millions-denominated series).",
             "\u2014"
           ]
         ],
-        "note": "Fed Balance Sheet Composition (fed-balance-spec.md) \u2014 a look inside WALCL's top-line number. All 5 candidate H.4.1 series now shipped (v1 shipped WRESBAL/RRPONTSYD only; WSHOTSL/WSHOMCB/WLCFLPCL added in a follow-up pass). Fetched by /api/fred/money-supply/refresh alongside M2SL/WALCL/CPIAUCSL, same source_key (money_supply). Raw value only, no YoY yet \u2014 frontend defaults WRESBAL/RRPONTSYD visible, the other three hidden behind a checkbox to avoid an overcrowded initial chart."
+        "note": "Fed Balance Sheet Composition (fed-balance-spec.md) \u2014 a look inside WALCL's top-line number. All 5 candidate H.4.1 series now shipped (v1 shipped WRESBAL/RRPONTSYD only; WSHOTSL/WSHOMCB/WLCFLPCL added in a follow-up pass). Fetched by /api/fred/money-supply/refresh alongside M2SL/WALCL/CPIAUCSL, same source_key (money_supply). Raw value only, no YoY yet \u2014 frontend defaults WRESBAL/RRPONTSYD visible, the other three hidden behind a checkbox to avoid an overcrowded initial chart. WSHOSHO (System Open Market Account's own Treasury holdings, weekly, confirmed live 2002-12-18 through present) was added alongside the original 5 as part of a later Treasuries-picture expansion \u2014 it's a real subset of WSHOTSL's own total, not a duplicate/competing figure, and is not part of the Composition pie's own 5-way Assets/Liabilities split (it's shown, if at all, as an overlay on the existing WSHOTSL line, not a 6th pie slice)."
       },
       {
-        "name": "fred_observations \u2014 DGS2, DGS10, DFII10, T10Y2Y",
+        "name": "fred_observations \u2014 DGS2, DGS10, DFII10, T10Y2Y, DGS3MO, DGS5, DGS30",
         "fields": [
           [
             "series_id",
-            "'DGS2' / 'DGS10' / 'DFII10' / 'T10Y2Y' \u2014 2-Year, 10-Year, 10-Year TIPS (real), and 10Y-2Y spread Treasury yields",
+            "'DGS2' / 'DGS10' / 'DFII10' / 'T10Y2Y' / 'DGS3MO' / 'DGS5' / 'DGS30' \u2014 3-Month, 2-Year, 5-Year, 10-Year, 30-Year, and 10-Year TIPS (real) Treasury yields, plus the 10Y-2Y spread",
             "Money Supply tab \u2014 Treasury Yields chart"
           ],
           [
@@ -690,7 +690,28 @@
             "\u2014"
           ]
         ],
-        "note": "Added alongside M2SL/WALCL/CPIAUCSL in the same /api/fred/money-supply/refresh call, same source_key (money_supply) \u2014 no new source or table. T10Y2Y is FRED's own maintained 10Y-2Y spread, fetched directly rather than computed client-side from DGS10/DGS2, to avoid any rounding drift. DFII10 (10-Year real/TIPS yield) is the series most commonly cited as gold's opportunity-cost driver, since gold pays no yield of its own \u2014 see the Treasury Yields legend's eli5 text for the full framing. Raw value only, no derived series."
+        "note": "Added alongside M2SL/WALCL/CPIAUCSL in the same /api/fred/money-supply/refresh call, same source_key (money_supply) \u2014 no new source or table. T10Y2Y is FRED's own maintained 10Y-2Y spread, fetched directly rather than computed client-side from DGS10/DGS2, to avoid any rounding drift. DFII10 (10-Year real/TIPS yield) is the series most commonly cited as gold's opportunity-cost driver, since gold pays no yield of its own \u2014 see the Treasury Yields legend's eli5 text for the full framing. Raw value only, no derived series. DGS3MO/DGS5/DGS30 were added in a later Treasuries-picture expansion to round out the curve \u2014 DGS3MO (constant-maturity, bond-equivalent basis) was deliberately chosen over DTB3 (secondary-market discount-basis 3-month bill rate, confirmed live to differ by a real ~13bp, not rounding) for methodological consistency with DGS2/DGS10/DGS30's own constant-maturity convention, despite DTB3's longer real history (1954 vs. 1981) \u2014 irrelevant against this panel's 2Y-20Y window options anyway."
+      },
+      {
+        "name": "fred_observations \u2014 FORLTTREASPOS* (foreign/TIC holdings)",
+        "fields": [
+          [
+            "series_id",
+            "One of 14 country-specific series (e.g. 'FORLTTREASPOS42609' for Japan) or 'FORLTTREASPOS99996' (Grand Total) \u2014 see pipeline/config.py's FRED_SERIES_TIC_COUNTRIES for the full country->series_id mapping. The numeric suffix is TIC's own 5-digit country code, sourced from Treasury's own published lookup table (ticdata.treasury.gov/Publish/cntrysec.txt), not derivable from ISO codes.",
+            "Money Supply tab \u2014 Treasuries picture, Foreign Holdings chart"
+          ],
+          [
+            "date",
+            "Observation date (monthly, FRED's native cadence). Real coverage starts 1984-12-01 for most countries; Belgium/Luxembourg/Cayman Islands only start ~2001 (a real TIC reporting-category change that year, confirmed via the same country-code lookup file, not a fetch gap).",
+            "Chart x-axis"
+          ],
+          [
+            "value",
+            "Millions of USD (confirmed live against FRED's /fred/series metadata) \u2014 same divisor convention as WRESBAL/WSHOTSL/WSHOMCB/WLCFLPCL/WSHOSHO above, converted to trillions in /api/fred/money-supply/db via the same _millions_to_trillions helper.",
+            "\u2014"
+          ]
+        ],
+        "note": "IMPORTANT, confirmed live: this FORLTTREASPOS family covers LONG-TERM Treasuries ONLY \u2014 it excludes T-bills entirely. FRED's own Grand Total (FORLTTREASPOS99996, ~$7.92T as of 2026-05) is real but meaningfully smaller than Treasury's own bills-inclusive Major Foreign Holders Grand Total (~$9.37T same month, published separately at ticdata.treasury.gov, not ingested by this app) \u2014 these two numbers must never be shown or summed as if interchangeable. Also confirmed live: 'Cayman Islands' (FORLTTREASPOS36137) is a real SUBSET of 'Total Caribbean' (FORLTTREASPOS34401), not a duplicate or alternative naming \u2014 the two differ substantially for the same month ($312B vs $469B) \u2014 summing both into one total double-counts. Fetched by /api/fred/money-supply/refresh alongside every other series on this card, same source_key (money_supply) \u2014 no new source, no new table. 11 countries plus Hong Kong/Turkey/Total Caribbean (already-confirmed anchors from the initial research pass) are wired up; adding another country means looking up its real TIC code in cntrysec.txt and adding one line to FRED_SERIES_TIC_COUNTRIES, per the same rule as every other closed-set constant in this codebase."
       },
       {
         "name": "fred_observations \u2014 CPIAUCSL",
@@ -1213,6 +1234,95 @@
           ]
         ],
         "note": "Upsert (INSERT ... ON CONFLICT), same restatement reasoning as treasury_outlays. Real persisted coverage: 2015-03 through present (136 real months as of the 2026-07-25 backfill) \u2014 confirmed live that MTS Table 5 as a whole has zero real data before 2015-03-31 (every record_date checked earlier than that returns a real HTTP 200 with an empty data array, not an error), a harder floor than treasury_outlays' own 2013-10 (Table 1) floor. The 2015-03-2023-06 portion of this history was added via a one-time manual backfill script (not shipped app code) run once against runtime/argentvigil.db directly. Ongoing fetches (fire_at_startup, every backend restart) are deliberately bounded to the most recent 36 real months per fetch (TREASURY_OUTLAYS_BY_AGENCY_MONTHS in backend/main.py) \u2014 full history would be ~150 sequential HTTP requests (one per real month, since Table 5's hierarchy can't be filtered server-side), real per-restart cost against a fire_at_startup source hitting a free public API with no documented rate limit. Already-persisted months are skipped (checked against what's on disk before spending a request), so a fresh/cleared DB would only recover the most recent 36 months automatically going forward \u2014 the deeper 2015-2023 history would need the one-off backfill re-run, it will not regenerate itself from the bounded ongoing fetch alone. Depends on treasury_outlays having already run in the same boot (reads its year/month rows to know which real months to fetch) \u2014 both sources are registered in that dependency order in backend/main.py, and _schedule_loop's startup dispatch awaits each fetch_fn in registration order, so this is not a race in practice."
+      }
+    ]
+  },
+  {
+    "key": "treasury_auctions",
+    "label": "U.S. Treasury \u2014 Auction Results",
+    "origin": "fiscaldata.treasury.gov's public API (accounting/od/auctions_query), same host/no-key posture as treasury_outlays/treasury_outlays_by_agency but a different endpoint family (Auctions Query, not Monthly Treasury Statement). Confirmed live: 11,063+ real auction records back to 1979-11-15, ~100 fields per record. A record's own lifecycle spans two fetches \u2014 it first appears at announcement (~1 week before auction_date) with every result field the literal string \"null\", then the SAME cusip+auction_date row gets its results filled in a few days later once the auction settles. Only a rolling 120-day trailing window is fetched/persisted (TREASURY_AUCTIONS_WINDOW_DAYS in backend/main.py), not the full 1979-present history \u2014 real depth on disk grows forward from whenever this feature was deployed, same 'accumulates forward across restarts' shape as treasury_outlays_by_agency's own bounded fetch. Frontend surface: Money Supply tab's Treasuries picture, bid-to-cover and buyer-category-mix charts.",
+    "sourceKeys": [
+      "treasury_auctions"
+    ],
+    "curl": "# Rolling 120-day window, fields projected to just what AV persists\ncurl \"https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query?filter=auction_date:gte:2026-04-01&fields=cusip,security_type,security_term,auction_date,issue_date,maturity_date,high_yield,bid_to_cover_ratio,offering_amt,total_tendered,total_accepted,indirect_bidder_tendered,indirect_bidder_accepted,direct_bidder_tendered,direct_bidder_accepted,primary_dealer_tendered,primary_dealer_accepted,soma_tendered,soma_accepted,soma_holdings&page%5Bsize%5D=1000&sort=-auction_date\"\n# Every numeric field is the string \"null\" (not JSON null) until the auction settles \u2014 same convention MTS Table 1/5 use, handled by the same _mts_amount() coercion helper.",
+    "tables": [
+      {
+        "name": "treasury_auctions",
+        "fields": [
+          [
+            "cusip",
+            "PK \u2014 the specific security's CUSIP identifier."
+          ],
+          [
+            "auction_date",
+            "PK \u2014 the date this security was auctioned."
+          ],
+          [
+            "security_type",
+            "'Bill' / 'Note' / 'Bond' / 'TIPS' / 'FRN' \u2014 charted separately, since bid-to-cover/yield scales aren't comparable across types."
+          ],
+          [
+            "security_term",
+            "e.g. '2-Year', '52-Week', '10-Year' \u2014 the security's stated term."
+          ],
+          [
+            "issue_date",
+            "When the security was actually issued (a few days after auction_date)."
+          ],
+          [
+            "maturity_date",
+            "When the security matures."
+          ],
+          [
+            "high_yield",
+            "The highest (worst-price) yield accepted at auction, percent. NULL until settlement."
+          ],
+          [
+            "high_discnt_rate",
+            "Bills only \u2014 the discount-basis equivalent of high_yield. NULL for coupon securities and until settlement."
+          ],
+          [
+            "high_investment_rate",
+            "Bills only \u2014 the investment-rate (bond-equivalent) form of the discount rate. NULL for coupon securities and until settlement."
+          ],
+          [
+            "bid_to_cover_ratio",
+            "Total bids tendered \u00f7 total accepted \u2014 demand strength for this specific auction. NULL until settlement."
+          ],
+          [
+            "offering_amt",
+            "USD amount Treasury offered at this auction."
+          ],
+          [
+            "total_tendered",
+            "USD amount of all bids submitted. NULL until settlement."
+          ],
+          [
+            "total_accepted",
+            "USD amount actually awarded \u2014 should be close to offering_amt. NULL until settlement."
+          ],
+          [
+            "indirect_bidder_tendered / indirect_bidder_accepted",
+            "Bids submitted/awarded through an indirect channel \u2014 the closest public proxy for foreign official and other indirect buyers (foreign central banks typically bid this way, though this field doesn't identify them individually)."
+          ],
+          [
+            "direct_bidder_tendered / direct_bidder_accepted",
+            "Bids submitted/awarded directly by non-primary-dealer institutional bidders."
+          ],
+          [
+            "primary_dealer_tendered / primary_dealer_accepted",
+            "Bids submitted/awarded by the ~24 primary dealers \u2014 typically the largest share, since dealers are obligated to bid in every auction."
+          ],
+          [
+            "soma_tendered / soma_accepted",
+            "The Fed's own System Open Market Account bids/awards at this specific auction \u2014 a real number, not derived from WSHOSHO's aggregate holdings."
+          ],
+          [
+            "soma_holdings",
+            "SOMA's total holdings of this specific maturing/related security as of the auction, separate from soma_tendered/accepted at this auction itself."
+          ]
+        ],
+        "note": "Upsert keyed by (cusip, auction_date), NOT append-only \u2014 see the table's own DDL comment in backend/db.py. A later fetch's real (non-null) value overwrites an earlier fetch's null via COALESCE; a real settled value is never reverted back to null by a subsequent fetch. Nulls over zeros throughout \u2014 an unsettled field stays NULL, never a fabricated 0."
       }
     ]
   }
