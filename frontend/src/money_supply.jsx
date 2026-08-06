@@ -4,6 +4,7 @@ import { VAULT_COLORS } from "./palette";
 import {
   ComposedChart,
   LineChart,
+  AreaChart,
   Area,
   Bar,
   Line,
@@ -47,6 +48,17 @@ const DGS2_COLOR = "#7b9fff";
 const DGS10_COLOR = "#e0a84c";
 const DFII10_COLOR = "#4caf76";
 const T10Y2Y_COLOR = "#c9536b";
+// Added to round out the curve beyond the original 4 — see
+// pipeline/config.py's own comment on DGS3MO vs. DTB3. T10Y3MO (a second,
+// real spread — the classic recession-inversion pair most commonly cited,
+// distinct from T10Y2Y) is computed client-side from dgs10/dgs3mo, unlike
+// T10Y2Y which FRED maintains directly — no equivalent FRED-maintained
+// 10Y-3mo spread series exists, confirmed during the Treasuries-picture
+// research pass.
+const DGS3MO_COLOR = "#94a3b8";
+const DGS5_COLOR = "#a78bfa";
+const DGS30_COLOR = "#f472b6";
+const T10Y3MO_COLOR = "#fb923c";
 
 // Federal Outlays sub-panel (fed-spend-spec.md) — 4 flat series, same
 // ungrouped-lines shape as Treasury Yields, not Composition's grouped
@@ -63,6 +75,92 @@ const OUTLAYS_COLOR = "#e05252";
 const RECEIPTS_COLOR = "#4caf76";
 const DEFICIT_COLOR = "#7b9fff";
 const INTEREST_COLOR = "#e0a84c";
+
+// Treasury Auctions sub-panel (Treasuries-picture expansion) — bid-to-cover
+// and buyer-category mix, per real settled auction. Security types get
+// their own distinct colors (bid-to-cover chart plots multiple types on
+// one shared axis); buyer categories get their own separate palette (the
+// %-stacked mix chart only ever shows one security type at a time, so its
+// 4 categories don't need to be visually distinct from the security-type
+// colors above).
+const AUCTION_SECURITY_TYPES = ["Bill", "Note", "Bond", "TIPS", "FRN"];
+const AUCTION_TYPE_COLOR = {
+  Bill: "#7b9fff",
+  Note: "#4caf76",
+  Bond: "#e0a84c",
+  TIPS: "#a78bfa",
+  FRN: "#f472b6",
+};
+const AUCTION_BUYER_COLORS = {
+  primary_dealer: "#7b9fff",
+  indirect_bidder: "#4caf76",
+  direct_bidder: "#e0a84c",
+  soma: "#e05252",
+};
+const AUCTION_BUYERS = [
+  { key: "primary_dealer", label: "Primary Dealers" },
+  { key: "indirect_bidder", label: "Indirect Bidders" },
+  { key: "direct_bidder", label: "Direct Bidders" },
+  { key: "soma", label: "SOMA (the Fed)" },
+];
+
+// One row per real settled auction (bid_to_cover_ratio non-null — an
+// announced-but-unsettled row has every result field null, per the
+// standing nulls-over-zeros convention, and isn't meaningful to plot).
+// buyer_mix_pct is computed here at read time (not persisted) as each
+// category's share of total_accepted — "who actually bought this auction,"
+// the % framing making auctions of very different sizes comparable on one
+// chart the way raw dollar amounts wouldn't be. This is a flat per-auction
+// list (potentially several rows sharing one date, since multiple security
+// types can auction the same day) — used by the buyer-mix chart (which
+// filters to one security type at a time, so no ambiguity there) and by
+// AuctionsTooltipContent (which explicitly looks up ALL rows for a hovered
+// date). It is NOT used directly as chart `data` for the multi-type
+// bid-to-cover chart — see mergeAuctionsByType below for why.
+function mergeAuctions(rows) {
+  return (rows || [])
+    .filter((r) => r.bid_to_cover_ratio != null)
+    .map((r) => {
+      const total = r.total_accepted;
+      const pct = (v) => (v != null && total ? round1((v / total) * 100) : null);
+      return {
+        date: r.auction_date,
+        cusip: r.cusip,
+        security_type: r.security_type,
+        security_term: r.security_term,
+        bid_to_cover_ratio: r.bid_to_cover_ratio,
+        high_yield: r.high_yield,
+        primary_dealer_pct: pct(r.primary_dealer_accepted),
+        indirect_bidder_pct: pct(r.indirect_bidder_accepted),
+        direct_bidder_pct: pct(r.direct_bidder_accepted),
+        soma_pct: pct(r.soma_accepted),
+      };
+    })
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+
+// Pivots mergeAuctions' flat per-auction list into one row per real date,
+// with each security type as its own column (bid_to_cover_ratio keyed by
+// type) — the same "one row per date, one column per series" shape every
+// other multi-line chart in this file uses. A real bug this replaces: the
+// bid-to-cover chart originally gave each <Line> its own filtered
+// data={auctionsByType[t]} array while the chart itself used the full
+// auctionsMerged as its shared data — Recharts positions a category-axis
+// point by that SERIES' OWN array index/date, not a globally shared
+// position, so two types' points landed at mismatched x-positions on the
+// same visual axis even when their real dates matched (confirmed live —
+// the user's own "same date, different location" report). Rows with only
+// ONE type auctioned that day still get every other type's column as
+// null, which Line's connectNulls already handles correctly (a real gap,
+// not a manufactured value).
+function mergeAuctionsByType(auctionRows) {
+  const byDate = {};
+  for (const r of auctionRows) {
+    const row = (byDate[r.date] ??= { date: r.date });
+    row[r.security_type] = r.bid_to_cover_ratio;
+  }
+  return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
+}
 
 // M2SL is monthly with a ~4-6wk publication lag; WALCL is weekly with only a
 // few days' lag. Different thresholds reflect each series' own normal cadence.
@@ -94,6 +192,20 @@ function fmtPct(v) {
   return `${v.toFixed(1)}%`;
 }
 
+// Lightens a hex color toward white by `amount` (0-1) — used to derive a
+// visually-related "other" shade from a base agency color, so a
+// group-of-two pie slices (e.g. Treasury split into Interest + other) reads
+// as one wedge shaded by internal proportion rather than two arbitrary
+// colors sitting side by side.
+function lightenHex(hex, amount) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  const mix = (c) => Math.round(c + (255 - c) * amount);
+  return `#${[mix(r), mix(g), mix(b)].map((c) => c.toString(16).padStart(2, "0")).join("")}`;
+}
+
 function xTicks(data, maxTicks = 8) {
   if (!data || data.length === 0) return [];
   const n = Math.min(data.length, maxTicks);
@@ -101,21 +213,68 @@ function xTicks(data, maxTicks = 8) {
   return data.filter((_, i) => i % step === 0).map((r) => r.date);
 }
 
-// All 4 Treasury yield series are real daily FRED series in the same %
+// All 7 Treasury yield series are real daily FRED series in the same %
 // units already — a plain date-key merge, no forward-fill/ratio math
 // needed (unlike mergeSeries/mergeComposition below, which bridge series
-// on genuinely different cadences).
-function mergeYields(dgs2, dgs10, dfii10, t10y2y) {
+// on genuinely different cadences). t10y3mo is the one derived field here —
+// no FRED-maintained 10Y-3mo spread series exists (confirmed during the
+// Treasuries-picture research pass, unlike T10Y2Y which FRED does maintain
+// directly) — computed client-side from dgs10/dgs3mo on whichever dates
+// both are real, same "derived values computed at read time" convention as
+// everywhere else in this app, just done in the frontend merge instead of
+// the backend route since it's a pure function of two already-fetched
+// series with no persistence involved either way.
+function mergeYields(dgs2, dgs10, dfii10, t10y2y, dgs3mo, dgs5, dgs30) {
   const byDate = {};
   for (const [key, rows] of [
     ["dgs2", dgs2],
     ["dgs10", dgs10],
     ["dfii10", dfii10],
     ["t10y2y", t10y2y],
+    ["dgs3mo", dgs3mo],
+    ["dgs5", dgs5],
+    ["dgs30", dgs30],
   ]) {
     for (const r of rows || []) {
       byDate[r.date] = { ...(byDate[r.date] || {}), date: r.date, [key]: r.value };
     }
+  }
+  const rows = Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
+  for (const row of rows) {
+    row.t10y3mo = row.dgs10 != null && row.dgs3mo != null ? round1(row.dgs10 - row.dgs3mo) : null;
+  }
+  return rows;
+}
+
+// Foreign/TIC holdings — data.tic_countries is {countryName: [{date,
+// value_trillions}]}, data.tic_grand_total is the same shape as one more
+// series. Merged into one flat per-date row (same date-key-merge pattern
+// as mergeYields) so all countries + the grand total share one chart's x
+// axis. TIC_COUNTRY_ORDER fixes a stable ranking (largest real 2026-05
+// holders first) so a country's assigned color/legend position doesn't
+// reshuffle as values change month to month — same "fixed ranking, not
+// re-ranked per period" reasoning as topAgenciesByLatestMonth's own
+// comment. Grand Total is NOT one of these countries — see its own
+// TIC_COUNTRY_ORDER exclusion and the standalone tic_grand_total field.
+const TIC_COUNTRY_ORDER = [
+  "Japan", "China", "United Kingdom", "Belgium", "Cayman Islands", "Luxembourg",
+  "Canada", "Total Caribbean", "Taiwan", "Ireland", "Switzerland", "Hong Kong",
+  "India", "Turkey",
+];
+const TIC_COUNTRY_COLOR = Object.fromEntries(
+  TIC_COUNTRY_ORDER.map((country, i) => [country, VAULT_COLORS[i % VAULT_COLORS.length]])
+);
+const TIC_GRAND_TOTAL_COLOR = "#e8ecf4";
+
+function mergeTicHoldings(ticCountries, ticGrandTotal) {
+  const byDate = {};
+  for (const country of TIC_COUNTRY_ORDER) {
+    for (const r of ticCountries?.[country] || []) {
+      byDate[r.date] = { ...(byDate[r.date] || {}), date: r.date, [country]: r.value_trillions };
+    }
+  }
+  for (const r of ticGrandTotal || []) {
+    byDate[r.date] = { ...(byDate[r.date] || {}), date: r.date, grand_total: r.value_trillions };
   }
   return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
 }
@@ -297,7 +456,15 @@ function mergeSeries(m2, walcl) {
       ? Math.max(0, round1(filledM2 - filledWalcl))
       : null;
   }
-  return rows;
+  // The row grid itself (built from the union of M2's and WALCL's own dates)
+  // still reaches WALCL's later, weekly-cadence coverage even once the
+  // stacked-area fields above have correctly gone null past M2's real last
+  // date — so the chart's x-axis kept stretching out to WALCL's latest date
+  // with a trailing empty gap, reading as "the Fed balance sheet extends
+  // past the available M2 data" even though no value was actually drawn
+  // there. Trim the grid itself to M2's own last real date so the chart's
+  // extent matches M2's real coverage, per the user's explicit call.
+  return lastRealM2Date == null ? rows : rows.filter((row) => row.date <= lastRealM2Date);
 }
 
 // All five candidate FRED H.4.1 series (fed-balance-spec.md), weekly like
@@ -425,7 +592,20 @@ const QE_QT_LEGEND_SERIES = [
 // legend in this panel (click to highlight + reveal eli5). Flat, ungrouped
 // series (no assets/liabilities split like Composition), all sharing one
 // % axis, so no dashed/gradient swatches needed here.
+// Ordered by real maturity along the curve (3mo -> 2y -> 5y -> 10y -> 30y),
+// real-10y right after nominal 10y since it's the same maturity adjusted
+// for inflation, with both spread series placed last as a group — spreads
+// are a different kind of thing (a computed comparison between two of the
+// yields above, not a maturity point on the curve themselves), so grouping
+// them at the end of the legend keeps "the curve" and "derived comparisons
+// of the curve" visually separate, per the user's explicit request.
 const YIELDS_LEGEND_SERIES = [
+  {
+    key: "dgs3mo",
+    legendLabel: "3-Month Yield",
+    color: DGS3MO_COLOR,
+    eli5: "Market yield on the 3-Month Treasury bill, daily — the very short end of the curve, closely tracking the Fed's current target rate itself rather than expectations about the future (unlike the 2-Year, which prices in where the market thinks policy is headed). DGS3MO specifically (constant-maturity, bond-equivalent basis) rather than the secondary-market discount-basis 3-month bill rate, for methodological consistency with the other constant-maturity series on this chart.",
+  },
   {
     key: "dgs2",
     legendLabel: "2-Year Yield",
@@ -433,10 +613,22 @@ const YIELDS_LEGEND_SERIES = [
     eli5: "Market yield on the 2-Year Treasury, daily — read as the market's near-term expectation for where the Fed funds rate is headed over the next couple years. Rises when the market expects tighter policy (higher rates for longer), falls when it expects cuts.",
   },
   {
+    key: "dgs5",
+    legendLabel: "5-Year Yield",
+    color: DGS5_COLOR,
+    eli5: "Market yield on the 5-Year Treasury, daily — a mid-curve reference point between the near-term-policy-driven 2-Year and the longer-run-expectations-driven 10-Year.",
+  },
+  {
     key: "dgs10",
     legendLabel: "10-Year Yield",
     color: DGS10_COLOR,
     eli5: "Market yield on the 10-Year Treasury, daily — the most commonly cited long-term rate benchmark (mortgage rates, corporate borrowing costs, and \"risk-free rate\" comparisons all reference this). Reflects longer-run growth/inflation expectations, not just near-term Fed policy.",
+  },
+  {
+    key: "dgs30",
+    legendLabel: "30-Year Yield",
+    color: DGS30_COLOR,
+    eli5: "Market yield on the 30-Year Treasury, daily — the long end of the curve, most closely tied to very-long-run growth/inflation expectations and (indirectly) 30-year mortgage rates, which typically track this yield with a spread on top rather than the 10-Year.",
   },
   {
     key: "dfii10",
@@ -449,6 +641,12 @@ const YIELDS_LEGEND_SERIES = [
     legendLabel: "10Y–2Y Spread",
     color: T10Y2Y_COLOR,
     eli5: "10-Year yield minus 2-Year yield — the classic yield-curve slope. Negative (inverted) has historically preceded most U.S. recessions by 12-18 months; it means the market expects the Fed to cut rates more than it's currently signaling. Shown here as context alongside the two rates it's built from, not as a standalone prediction.",
+  },
+  {
+    key: "t10y3mo",
+    legendLabel: "10Y–3mo Spread",
+    color: T10Y3MO_COLOR,
+    eli5: "10-Year yield minus 3-Month yield — the other classic yield-curve-inversion pair, and the one the Fed's own research has cited as the more statistically reliable recession predictor of the two spreads on this chart (vs. 10Y-2Y). No FRED-maintained series exists for this spread the way T10Y2Y is maintained directly, so it's computed here client-side from dgs10/dgs3mo, per the computed-at-read-time convention. Same non-prediction framing as 10Y-2Y — shown as context alongside the two rates it's built from.",
   },
 ];
 
@@ -630,7 +828,20 @@ function mergeMetals(xag, xau, purchasingPower) {
   for (const row of Object.values(byMonth)) {
     row.fiat_index = 100;
   }
-  return Object.values(byMonth).sort((a, b) => (a.date < b.date ? -1 : 1));
+  const rows = Object.values(byMonth).sort((a, b) => (a.date < b.date ? -1 : 1));
+  // pp_index is CPI-derived (CPIAUCSL) and reports monthly with a real
+  // publication lag, same pattern as M2 lagging WALCL in mergeSeries above —
+  // xag/xau (Yahoo daily closes, resampled to month-end) run much more
+  // current. Without a cap, the grid (built from the union of all three
+  // series' months) kept stretching out to xag/xau's latest month with
+  // Purchasing Power silently absent, reading as "this chart extends past
+  // the available data" the same way the M2/WALCL chart did. Trim to
+  // Purchasing Power's own last real month so the chart's extent matches
+  // its most-lagging real series, same fix/reasoning as mergeSeries' cap.
+  const lastRealPpDate = purchasingPower?.length
+    ? purchasingPower[purchasingPower.length - 1].date
+    : null;
+  return lastRealPpDate == null ? rows : rows.filter((row) => row.date <= lastRealPpDate);
 }
 
 // Rebase all three indexed series against whichever one is the selected
@@ -871,10 +1082,86 @@ function YieldsTooltipContent({ active, label, yieldsMerged }) {
   return (
     <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
       <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      {row.dgs3mo != null && <div style={{ color: DGS3MO_COLOR }}>3-Month: {row.dgs3mo.toFixed(2)}%</div>}
       {row.dgs2 != null && <div style={{ color: DGS2_COLOR }}>2-Year: {row.dgs2.toFixed(2)}%</div>}
+      {row.dgs5 != null && <div style={{ color: DGS5_COLOR }}>5-Year: {row.dgs5.toFixed(2)}%</div>}
       {row.dgs10 != null && <div style={{ color: DGS10_COLOR }}>10-Year: {row.dgs10.toFixed(2)}%</div>}
+      {row.dgs30 != null && <div style={{ color: DGS30_COLOR }}>30-Year: {row.dgs30.toFixed(2)}%</div>}
       {row.dfii10 != null && <div style={{ color: DFII10_COLOR }}>10-Year Real (TIPS): {row.dfii10.toFixed(2)}%</div>}
       {row.t10y2y != null && <div style={{ color: T10Y2Y_COLOR }}>10Y–2Y Spread: {row.t10y2y >= 0 ? "+" : ""}{row.t10y2y.toFixed(2)}%</div>}
+      {row.t10y3mo != null && <div style={{ color: T10Y3MO_COLOR }}>10Y–3mo Spread: {row.t10y3mo >= 0 ? "+" : ""}{row.t10y3mo.toFixed(2)}%</div>}
+    </div>
+  );
+}
+
+// Foreign Holdings chart's hover tooltip — shows only currently-visible
+// (not hidden) countries plus the grand total, sorted largest-first at
+// that date so the ranking is legible at a glance rather than fixed
+// alphabetically or by TIC_COUNTRY_ORDER's own latest-month ranking (which
+// can differ from a hovered historical date's real ranking).
+function TicHoldingsTooltipContent({ active, label, ticMerged, hiddenCountries }) {
+  if (!active || !label) return null;
+  const row = ticMerged.find((r) => r.date === label);
+  if (!row) return null;
+  const countryRows = TIC_COUNTRY_ORDER
+    .filter((c) => !hiddenCountries.has(c) && row[c] != null)
+    .map((c) => ({ name: c, value: row[c], color: TIC_COUNTRY_COLOR[c] }))
+    .sort((a, b) => b.value - a.value);
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      {row.grand_total != null && (
+        <div style={{ color: TIC_GRAND_TOTAL_COLOR, fontWeight: 600, marginBottom: 2 }}>
+          Grand Total (LT only): {fmtTrillions(row.grand_total)}
+        </div>
+      )}
+      {countryRows.map((c) => (
+        <div key={c.name} style={{ color: c.color }}>
+          {c.name}: {fmtTrillions(c.value)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Bid-to-cover chart's hover tooltip — unlike the other Money Supply
+// tooltips, more than one real auction can share the same date (a Bill and
+// a Note auctioned the same day are both real, distinct rows), so this
+// looks up ALL auctionsMerged rows for the hovered date rather than
+// find()ing a single row.
+function AuctionsTooltipContent({ active, label, auctionsMerged }) {
+  if (!active || !label) return null;
+  const rows = auctionsMerged.filter((r) => r.date === label);
+  if (!rows.length) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      {rows.map((r) => (
+        <div key={r.cusip} style={{ color: AUCTION_TYPE_COLOR[r.security_type] ?? "#c8d0de", marginBottom: 2 }}>
+          {r.security_type} ({r.security_term}): {r.bid_to_cover_ratio.toFixed(2)}x bid-to-cover
+          {r.high_yield != null && `, ${r.high_yield.toFixed(2)}% yield`}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Buyer-mix %-stacked chart's hover tooltip — single security type at a
+// time, so a plain find() by date is correct here (unlike AuctionsTooltipContent).
+function AuctionMixTooltipContent({ active, label, rows, hiddenBuyers }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>
+        {label} ({row.security_term})
+      </div>
+      {AUCTION_BUYERS.filter((b) => !hiddenBuyers?.has(b.key) && row[`${b.key}_pct`] != null).map((b) => (
+        <div key={b.key} style={{ color: AUCTION_BUYER_COLORS[b.key] }}>
+          {b.label}: {row[`${b.key}_pct`].toFixed(1)}%
+        </div>
+      ))}
     </div>
   );
 }
@@ -906,6 +1193,178 @@ function OutlaysTooltipContent({ active, label, outlaysMerged }) {
   );
 }
 
+// Interest-on-Treasury pie, shared by both the Topline and By Department
+// Federal Outlays views — a real user-requested consolidation: Interest was
+// first a standalone Topline-only pie, then folded into a Treasury/Interest
+// split inside the By Department pie, then the user asked for that SAME
+// pie to also appear in the Topline view rather than maintaining two. One
+// component, two call sites (see the pie's own comments in outlaysView's
+// JSX for how outlaysByAgencyPieData/TREASURY_AGENCY_NAME's split works).
+function OutlaysInterestPieChart({ pieData, pieRow, clickedAgencyKey }) {
+  if (!pieRow) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <ResponsiveContainer width={180} height={180}>
+        <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+          <Pie
+            data={pieData}
+            dataKey="value"
+            nameKey="name"
+            cx="50%"
+            cy="50%"
+            outerRadius={70}
+            innerRadius={36}
+            paddingAngle={1}
+          >
+            {/* Dimming/highlight keys off entry.group, not entry.key —
+                Treasury's two sub-slices (interest/other) share one group
+                value (treasuryAgencyName) so clicking Treasury's single
+                legend row highlights both sub-wedges together as one unit,
+                matching the "Treasury is one thing" framing even though
+                it's 2 real Cells under the hood. Every other agency's group
+                equals its own key, so this is a no-op change for them. */}
+            {pieData.map((entry) => (
+              <Cell
+                key={entry.key}
+                fill={entry.color}
+                fillOpacity={clickedAgencyKey && clickedAgencyKey !== entry.group ? 0.35 : 1}
+                stroke={clickedAgencyKey === entry.group ? "#e8ecf4" : undefined}
+                strokeWidth={clickedAgencyKey === entry.group ? 2 : undefined}
+              />
+            ))}
+          </Pie>
+          <Tooltip
+            contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+            formatter={(v, name) => [fmtBillions(v), name]}
+          />
+        </PieChart>
+      </ResponsiveContainer>
+      {pieRow.date && (
+        <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+          {pieRow.fiscalYear != null
+            ? `FY${pieRow.fiscalYear}${pieRow.monthsPresent < 12 ? " (partial)" : ""}`
+            : `As of ${pieRow.date}`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OutlaysInterestLegend({
+  pieRow,
+  topAgencies,
+  treasuryAgencyName,
+  interestAsOfRow,
+  agencyColor,
+  clickedAgencyKey,
+  setClickedAgencyKey,
+  otherCount,
+  hiddenAgencies,
+  setHiddenAgencies,
+}) {
+  if (!pieRow) return null;
+  // Checkbox = show/hide (drives the stacked chart's Area mounting AND the
+  // y-axis rescale — see clickedAgencyYDomain/the Area-slot filter in the
+  // chart JSX), separate from the existing click-to-highlight-and-restack
+  // button — same "checkbox toggles visibility, button toggles
+  // highlight/selection" split already established by the Purchasing Power
+  // chart's own legend (metals-legend-checkbox + a separate button).
+  const toggleHidden = (key) =>
+    setHiddenAgencies((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  return (
+    <>
+      <div className="comex-legend-list comex-legend-list--horizontal">
+        {topAgencies.map((a) => {
+          // Treasury stays ONE legend row — per the user's explicit
+          // "Treasury is one thing" framing — but its swatch is a two-tone
+          // gradient (own base color for Interest's real share, a
+          // lightened tint for the remainder) so the row itself previews
+          // the same interest-proportion split the pie wedge shows, rather
+          // than a flat single-color swatch that hides it.
+          const isTreasury = a === treasuryAgencyName;
+          const treasuryTotal = isTreasury ? pieRow[a] : null;
+          const treasuryInterestPct = isTreasury && interestAsOfRow != null && treasuryTotal
+            ? Math.min(100, Math.round((Math.min(interestAsOfRow.interest, treasuryTotal) / treasuryTotal) * 100))
+            : null;
+          const swatchStyle = treasuryInterestPct != null
+            ? {
+                background: `linear-gradient(90deg, ${agencyColor(a)} ${treasuryInterestPct}%, ${lightenHex(agencyColor(a), 0.55)} ${treasuryInterestPct}%)`,
+              }
+            : { background: agencyColor(a) };
+          return (
+            <div key={a} className="metals-legend-row">
+              <input
+                type="checkbox"
+                className="metals-legend-checkbox"
+                checked={!hiddenAgencies.has(a)}
+                onChange={() => toggleHidden(a)}
+                title={hiddenAgencies.has(a) ? "Show this department" : "Hide this department"}
+              />
+              <button
+                className={`comex-legend-item legend-btn-row${clickedAgencyKey === a ? " legend-btn-row--baseline" : ""}`}
+                onClick={() => setClickedAgencyKey((k) => (k === a ? null : a))}
+              >
+                <span className="comex-legend-swatch" style={swatchStyle} />
+                <span>
+                  <strong>{a}</strong>
+                  {treasuryInterestPct != null && (
+                    <span style={{ color: "#8a94a6", fontWeight: "normal" }}> ({treasuryInterestPct}% interest)</span>
+                  )}
+                  {/* Per-department total at the resolved pin/hover/latest
+                      date (pieRow) — replaces the static full-width pinned
+                      readout box that used to render this same data below
+                      the chart, per the user's explicit request to move it
+                      here instead. */}
+                  {pieRow[a] != null && (
+                    <span style={{ color: "#8a94a6", fontWeight: "normal" }}> — {fmtBillions(pieRow[a])}</span>
+                  )}
+                </span>
+              </button>
+            </div>
+          );
+        })}
+        <div className="metals-legend-row">
+          <input
+            type="checkbox"
+            className="metals-legend-checkbox"
+            checked={!hiddenAgencies.has("other")}
+            onChange={() => toggleHidden("other")}
+            title={hiddenAgencies.has("other") ? "Show Other" : "Hide Other"}
+          />
+          <button
+            className={`comex-legend-item legend-btn-row${clickedAgencyKey === "other" ? " legend-btn-row--baseline" : ""}`}
+            onClick={() => setClickedAgencyKey((k) => (k === "other" ? null : "other"))}
+          >
+            <span className="comex-legend-swatch" style={{ background: OUTLAYS_OTHER_COLOR }} />
+            <span>
+              <strong>Other ({otherCount} more)</strong>
+              {pieRow.other != null && (
+                <span style={{ color: "#8a94a6", fontWeight: "normal" }}> — {fmtBillions(pieRow.other)}</span>
+              )}
+            </span>
+          </button>
+        </div>
+      </div>
+      <div className="comex-panel-note" style={{ marginTop: 8, color: "#8a94a6" }}>
+        Note: Department of the Treasury's own reported total includes Interest on the Public Debt
+        (Treasury is who issues/services it) — shown here as one wedge, shaded internally by its
+        own interest share (darker portion) vs. the rest of Treasury's spending (lighter portion).
+        Click the Treasury row to highlight the whole wedge.
+      </div>
+    </>
+  );
+}
+
+// Live hover tooltip for the By Department chart (Recharts' normal
+// cursor-following box). The static pinned-date box that used to render
+// this same data in a full-width grid below the chart was removed at the
+// user's request — those per-department totals now render inline next to
+// each legend row instead (see OutlaysInterestLegend's valueRow prop).
 function OutlaysByAgencyTooltipContent({ active, label, rows, topAgencies, agencyColor, otherCount }) {
   if (!active || !label) return null;
   const row = rows.find((r) => r.date === label);
@@ -1001,6 +1460,15 @@ export default function MoneySupply() {
   const [metalsData, setMetalsData] = useState(null);
   const [outlaysData, setOutlaysData] = useState(null);
   const [outlaysByAgencyData, setOutlaysByAgencyData] = useState(null);
+  // Auctions data is fetched once per mount, independent of the panel-wide
+  // window_ state — /api/treasury-auctions/db has no window param at all
+  // (deliberately: real persisted history is a rolling ~120-day trailing
+  // window on disk, not multi-year, so a window selector implying more
+  // history exists than does would be misleading — see the route's own
+  // comment in main.py). Fetched separately from `load` below rather than
+  // folded into its Promise.all, since it doesn't need to re-fire on every
+  // window/custom-range change the way the money/metals/outlays fetches do.
+  const [auctionsData, setAuctionsData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -1029,12 +1497,30 @@ export default function MoneySupply() {
   // Same click-to-toggle-ELI5 + chart-highlight legend pattern applied to
   // the QE/QT chart, per UI_STANDARDS.md.
   const [clickedQeQtKey, setClickedQeQtKey] = useState(null);
-  // Same pattern applied to the Treasury Yields chart's 4-entry legend.
+  // Same pattern applied to the Treasury Yields chart's legend.
   const [clickedYieldsKey, setClickedYieldsKey] = useState(null);
+  // Per-series show/hide for the Treasury Yields chart — same
+  // checkbox-toggles-visibility / button-toggles-highlight split as the
+  // Federal Outlays by Department legend's hiddenAgencies, applied here at
+  // the user's explicit request once the curve grew from 4 to 7 series
+  // (dense enough that hiding a few becomes genuinely useful, same
+  // motivation as the by-department legend's own hide feature).
+  const [hiddenYieldsKeys, setHiddenYieldsKeys] = useState(() => new Set());
+  // Same pattern applied to the Purchasing Power chart's companion pie
+  // (fiat/gold/silver relative-value split) — see metalsPieData below.
+  const [clickedMetalsPieKey, setClickedMetalsPieKey] = useState(null);
   // Same pattern applied to the Federal Outlays chart's 4-entry legend.
   const [clickedOutlaysKey, setClickedOutlaysKey] = useState(null);
   // Same pattern applied to the Outlays by Agency chart's top-N + Other legend.
   const [clickedAgencyKey, setClickedAgencyKey] = useState(null);
+  // Per-department show/hide for the Outlays by Agency stacked chart —
+  // separate from clickedAgencyKey (which highlights + restacks-to-bottom
+  // on click, same click-to-highlight convention as every other legend in
+  // this file). A Set of HIDDEN agency names/"other", empty by default (all
+  // visible) — same "checkbox toggles visibility, button toggles
+  // highlight" split already established by the Purchasing Power chart's
+  // own legend (metals-legend-checkbox + a separate button).
+  const [hiddenAgencies, setHiddenAgencies] = useState(() => new Set());
   // Shared by both Federal Outlays sub-panels (Topline, by Agency) — toggles
   // between the real monthly rows and a client-side fiscal-year rollup of
   // them. Not part of the panel-wide window_ state: window_ controls WHICH
@@ -1059,9 +1545,16 @@ export default function MoneySupply() {
   const [compositionPanelOpen, setCompositionPanelOpen] = useState(false);
   const [qeQtPanelOpen, setQeQtPanelOpen] = useState(false);
   const [yieldsPanelOpen, setYieldsPanelOpen] = useState(false);
+  const [auctionsPanelOpen, setAuctionsPanelOpen] = useState(false);
+  const [ticPanelOpen, setTicPanelOpen] = useState(false);
   const [metalsPanelOpen, setMetalsPanelOpen] = useState(false);
   const [outlaysPanelOpen, setOutlaysPanelOpen] = useState(false);
-  const [outlaysByAgencyPanelOpen, setOutlaysByAgencyPanelOpen] = useState(false);
+  // Topline (flat outlays/receipts/deficit/interest lines) vs. By Department
+  // (stacked area + pie, same data source split out by agency) used to be
+  // two separate collapsible panels — merged into one panel with this
+  // toggle at the user's request, since they're two views of the same
+  // Treasury data sharing one granularity/window control anyway.
+  const [outlaysView, setOutlaysView] = useState("topline"); // "topline" | "byAgency"
   // Which real month the pie snapshot shows — pin > hover > latest, same
   // priority rule as compositionPieRow above.
   const [hoveredAgencyDate, setHoveredAgencyDate] = useState(null);
@@ -1139,6 +1632,13 @@ export default function MoneySupply() {
     load(window_);
   }, [window_, customStart, customEnd, load]);
 
+  useEffect(() => {
+    fetch("/api/treasury-auctions/db")
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((json) => setAuctionsData(json.data ?? null))
+      .catch(() => setAuctionsData(null));
+  }, []);
+
   async function handleRefresh() {
     setRefreshing(true);
     try {
@@ -1169,10 +1669,64 @@ export default function MoneySupply() {
   const ticks = useMemo(() => xTicks(merged), [merged]);
 
   const yieldsMerged = useMemo(
-    () => (data ? mergeYields(data.dgs2, data.dgs10, data.dfii10, data.t10y2y) : []),
+    () => (data ? mergeYields(data.dgs2, data.dgs10, data.dfii10, data.t10y2y, data.dgs3mo, data.dgs5, data.dgs30) : []),
     [data]
   );
   const yieldsTicks = useMemo(() => xTicks(yieldsMerged), [yieldsMerged]);
+
+  const auctionsMerged = useMemo(() => mergeAuctions(auctionsData), [auctionsData]);
+  // Bid-to-cover chart plots every security type on one shared axis
+  // (auctionSelectedTypes controls which lines show, checkbox-style, same
+  // show/hide convention as the Yields/By-Department legends). The buyer-mix
+  // %-stacked chart only makes sense for ONE security type at a time (Bills
+  // vs. 30-Year Bonds have structurally different buyer compositions — an
+  // "all types stacked together" mix would be a meaningless blend), hence
+  // the separate single-select auctionMixType below.
+  const [auctionSelectedTypes, setAuctionSelectedTypes] = useState(() => new Set(AUCTION_SECURITY_TYPES));
+  const [auctionMixType, setAuctionMixType] = useState("Note");
+  // Click-to-highlight for both Treasury Auctions charts' legends — same
+  // convention as every other legend in this file (checkbox toggles
+  // visibility, a separate click highlights + dims the rest).
+  const [clickedAuctionTypeKey, setClickedAuctionTypeKey] = useState(null);
+  const [clickedAuctionBuyerKey, setClickedAuctionBuyerKey] = useState(null);
+  const [hiddenAuctionBuyers, setHiddenAuctionBuyers] = useState(() => new Set());
+  const auctionsByType = useMemo(() => {
+    const byType = {};
+    for (const t of AUCTION_SECURITY_TYPES) byType[t] = [];
+    for (const row of auctionsMerged) {
+      if (byType[row.security_type]) byType[row.security_type].push(row);
+    }
+    return byType;
+  }, [auctionsMerged]);
+  const auctionMixRows = auctionsByType[auctionMixType] || [];
+  // Bid-to-cover chart's real chart data — one row per date, one column
+  // per security type (see mergeAuctionsByType's own comment for the real
+  // mis-positioning bug this replaces). auctionsMerged itself stays a flat
+  // per-auction list, used elsewhere (buyer-mix filtering, the tooltip's
+  // multi-row-per-date lookup).
+  const auctionsPivoted = useMemo(() => mergeAuctionsByType(auctionsMerged), [auctionsMerged]);
+  const auctionsTicks = useMemo(() => xTicks(auctionsPivoted), [auctionsPivoted]);
+  const auctionMixTicks = useMemo(() => xTicks(auctionMixRows), [auctionMixRows]);
+  // Cross-chart pin (pinnedDate) never reached either Auctions chart before
+  // — a real gap the user caught ("doesn't seem to be shifting with the
+  // page like the others"): every other chart in this panel both
+  // originates a pin (click sets pinnedDate) and displays one set
+  // elsewhere via its own snapped ReferenceLine; Auctions did neither.
+  // auctionsMerged/auctionMixRows have their own date grids (auctionMixRows
+  // is additionally filtered to one security type), so each snaps
+  // independently, same "different charts, different grids" reasoning as
+  // every other nearestRowDate call in this file.
+  const pinnedDateAuctions = nearestRowDate(auctionsPivoted, pinnedDate);
+  const pinnedDateAuctionMix = nearestRowDate(auctionMixRows, pinnedDate);
+
+  // Foreign/TIC holdings — comes back inside the same /api/fred/money-supply/db
+  // response as everything else on this tab (data.tic_countries/
+  // data.tic_grand_total), so it shares the panel-wide window_ state and
+  // needs no separate fetch, unlike auctionsData above.
+  const ticMerged = useMemo(() => (data ? mergeTicHoldings(data.tic_countries, data.tic_grand_total) : []), [data]);
+  const ticTicks = useMemo(() => xTicks(ticMerged), [ticMerged]);
+  const [hiddenTicCountries, setHiddenTicCountries] = useState(() => new Set());
+  const [clickedTicKey, setClickedTicKey] = useState(null);
 
   const outlaysMonthly = useMemo(() => mergeOutlays(outlaysData), [outlaysData]);
   // Annual rollup sums outlays/receipts/deficit/interest across each FY's
@@ -1212,6 +1766,56 @@ export default function MoneySupply() {
     () => [...new Set((outlaysByAgencyData || []).map((r) => r.agency))],
     [outlaysByAgencyData]
   );
+  // Clicking a department moves it to the bottom of the stack (see the
+  // Area re-sort in the chart JSX below) so its own band starts from a flat
+  // zero baseline instead of sitting mid-stack — but the y-axis still spans
+  // the FULL stacked total (every department combined), so a smaller
+  // department's real month-to-month variation was still visually
+  // flattened to a thin sliver near the bottom of a much taller axis. Per
+  // the user's explicit request ("I don't care that it distorts the scale
+  // for the other departments when I'm looking at one"), the axis rescales
+  // to just that department's own real min/max — since it's the bottom
+  // band starting at 0, this is [0, max value * 1.05], not a min/max span
+  // (there's no meaningful "min" above 0 baseline to anchor to). Only
+  // active while a department is clicked; unclicking (or hovering the
+  // legend "Other" row, etc.) reverts to the normal full-stack domain.
+  // Hiding one or more departments (via the legend's per-department
+  // checkboxes) shrinks the real stacked total just like clicking a single
+  // department does — the axis should rescale to whatever's actually still
+  // visible, not stay sized for the full original stack (which would leave
+  // a mostly-empty chart if several large departments are hidden). Both
+  // cases funnel through the same domain: clicking one department shows
+  // just that department's own max (its bottom-of-stack band, [0, max]);
+  // otherwise, if anything is hidden, the domain is the max real total
+  // across only the currently-visible agencies+other, summed per row (this
+  // IS the actual stack height the chart will render, since Recharts stacks
+  // whatever Areas are actually mounted).
+  const clickedAgencyYDomain = useMemo(() => {
+    // Guard: if the clicked department has since been hidden via its
+    // checkbox, it's no longer rendered at all (see the Area-slot filter in
+    // the chart JSX) — fall through to the hidden-agencies branch below
+    // rather than computing a domain sized for a department that isn't on
+    // the chart.
+    if (clickedAgencyKey && !hiddenAgencies.has(clickedAgencyKey)) {
+      let max = 0;
+      for (const row of outlaysByAgencyMerged) {
+        const v = row[clickedAgencyKey];
+        if (v != null) max = Math.max(max, v);
+      }
+      return max > 0 ? [0, round1(max * 1.05)] : undefined;
+    }
+    if (hiddenAgencies.size === 0) return undefined;
+    const visibleKeys = [...topAgencies, "other"].filter((a) => !hiddenAgencies.has(a));
+    let max = 0;
+    for (const row of outlaysByAgencyMerged) {
+      let total = 0;
+      for (const key of visibleKeys) {
+        if (row[key] != null) total += row[key];
+      }
+      max = Math.max(max, total);
+    }
+    return max > 0 ? [0, round1(max * 1.05)] : undefined;
+  }, [clickedAgencyKey, outlaysByAgencyMerged, hiddenAgencies, topAgencies]);
   const agencyColor = (name) => VAULT_COLORS[topAgencies.indexOf(name) % VAULT_COLORS.length];
   const outlaysOtherCount = Math.max(0, allAgencyNames.length - topAgencies.length);
 
@@ -1267,6 +1871,28 @@ export default function MoneySupply() {
   const pinnedDateMerged = nearestRowDate(merged, pinnedDate);
   const pinnedDateYields = nearestRowDate(yieldsMerged, pinnedDate);
   const pinnedDateOutlays = nearestRowDate(outlaysMerged, pinnedDate);
+  // Topline's own simple pie: Outlays split into Interest vs. everything
+  // else, sitting beside the Topline chart the same way every other paired
+  // chart+pie in this panel is laid out. Deliberately NOT the By
+  // Department view's Treasury-splitting pie (that one only exists to
+  // solve a different problem — Treasury's reported total already
+  // including Interest) — this is a plain 2-slice pie of one period's real
+  // Outlays total, reusing outlaysMerged (the Topline series) directly
+  // rather than the by-agency date grid.
+  const outlaysToplinePieRow = pinnedDateOutlays
+    ? outlaysMerged.find((r) => r.date === pinnedDateOutlays)
+    : [...outlaysMerged].reverse().find((r) => r.interest_pct_outlays != null);
+  const outlaysToplinePieData = outlaysToplinePieRow && outlaysToplinePieRow.interest != null && outlaysToplinePieRow.outlays != null
+    ? [
+        { key: "interest", name: "Interest on the Public Debt", value: outlaysToplinePieRow.interest, color: INTEREST_COLOR },
+        {
+          key: "everything_else",
+          name: "Everything Else",
+          value: Math.max(0, round1(outlaysToplinePieRow.outlays - outlaysToplinePieRow.interest)),
+          color: OUTLAYS_COLOR,
+        },
+      ]
+    : [];
   const pinnedDateOutlaysByAgency = nearestRowDate(outlaysByAgencyMerged, pinnedDate);
   // Pin > hover > latest, same priority rule as compositionPieRow.
   const outlaysByAgencyPieDate = pinnedDate
@@ -1275,13 +1901,60 @@ export default function MoneySupply() {
       ? nearestRowDate(outlaysByAgencyMerged, hoveredAgencyDate)
       : outlaysByAgencyMerged[outlaysByAgencyMerged.length - 1]?.date;
   const outlaysByAgencyPieRow = outlaysByAgencyMerged.find((r) => r.date === outlaysByAgencyPieDate);
+  // Department of the Treasury's own reported total already includes
+  // Interest on the Public Debt mixed in with its other spending (grants,
+  // operations, etc.) — confirmed live against the real agency string
+  // ("Department of the Treasury") — so Interest isn't a separate top-level
+  // bucket in the by-agency data the way it is in the Topline series.
+  // Combining the two pies at the user's request means splitting Treasury's
+  // one slice into two: Interest on the Public Debt (pulled from the
+  // Topline outlaysMerged series, nearest date on/before this pie's own
+  // date, same "as-of" convention used elsewhere for cross-series joins —
+  // e.g. the leverage panel's registered-inventory join) and "Treasury
+  // (other)" (Treasury's reported total minus that Interest figure). Every
+  // other department's slice is unchanged. This keeps the pie's total
+  // summing to real Outlays with no double-count, rather than adding
+  // Interest as an extra overlay slice on top of an unmodified Treasury
+  // total (which would double-count Interest dollars).
+  const TREASURY_AGENCY_NAME = "Department of the Treasury";
+  const interestAsOfRow = outlaysByAgencyPieRow
+    ? [...outlaysMerged].reverse().find((r) => r.date <= outlaysByAgencyPieRow.date && r.interest != null)
+    : null;
+  // Treasury reads as ONE wedge (one legend row, one highlight target, per
+  // the user's explicit "Treasury is one thing" framing) shaded internally
+  // by its own interest share — not two arbitrarily-colored slices sitting
+  // side by side. Both sub-parts share `group: TREASURY_AGENCY_NAME` so the
+  // legend can render a single row and clicking it highlights both; the
+  // "interest" sub-slice keeps Treasury's own base color (agencyColor),
+  // "other" is a lightened tint of that same hue (lightenHex) so the two
+  // read as one color family split by proportion, not two unrelated colors.
   const outlaysByAgencyPieData = outlaysByAgencyPieRow
     ? [
         ...topAgencies
-          .filter((a) => outlaysByAgencyPieRow[a] != null && outlaysByAgencyPieRow[a] > 0)
-          .map((a) => ({ key: a, name: a, value: outlaysByAgencyPieRow[a], color: agencyColor(a) })),
-        ...(outlaysByAgencyPieRow.other != null && outlaysByAgencyPieRow.other > 0
-          ? [{ key: "other", name: `Other (${outlaysOtherCount} more)`, value: outlaysByAgencyPieRow.other, color: OUTLAYS_OTHER_COLOR }]
+          .filter((a) => outlaysByAgencyPieRow[a] != null && outlaysByAgencyPieRow[a] > 0 && !hiddenAgencies.has(a))
+          .flatMap((a) => {
+            const total = outlaysByAgencyPieRow[a];
+            if (a !== TREASURY_AGENCY_NAME || interestAsOfRow == null) {
+              return [{ key: a, group: a, name: a, value: total, color: agencyColor(a) }];
+            }
+            const interestValue = Math.min(interestAsOfRow.interest, total);
+            const otherValue = Math.max(0, round1(total - interestValue));
+            const treasuryBase = agencyColor(a);
+            return [
+              {
+                key: "interest",
+                group: a,
+                name: "Interest on the Public Debt",
+                value: interestValue,
+                color: treasuryBase,
+              },
+              ...(otherValue > 0
+                ? [{ key: a, group: a, name: "Treasury (other)", value: otherValue, color: lightenHex(treasuryBase, 0.55) }]
+                : []),
+            ];
+          }),
+        ...(outlaysByAgencyPieRow.other != null && outlaysByAgencyPieRow.other > 0 && !hiddenAgencies.has("other")
+          ? [{ key: "other", group: "other", name: `Other (${outlaysOtherCount} more)`, value: outlaysByAgencyPieRow.other, color: OUTLAYS_OTHER_COLOR }]
           : []),
       ]
     : [];
@@ -1306,6 +1979,32 @@ export default function MoneySupply() {
     return max;
   }, 0);
   const metalsYDomain = metalsMaxAbs > 0 ? [-metalsMaxAbs * 1.05, metalsMaxAbs * 1.05] : [-1, 1];
+
+  // Companion pie for the Purchasing Power chart — visualizes the exact
+  // same comparison the click-to-hold gesture's tooltip already shows in
+  // text: "since the held date, how did fiat/gold/silver each do, relative
+  // to the current baseline." Reuses computeHeldComparison directly (same
+  // function powering MetalsTooltip's held-comparison branch) rather than a
+  // separate window-start rebase, so the pie and the tooltip can never
+  // disagree about what a given held date means. Purchasing Power is
+  // excluded (same as it's excluded from baseline selection — not a
+  // holdable asset). A pie's slices must be non-negative and sum to a
+  // meaningful whole — heldComparison.stakeValue (each series' $100 grown
+  // by its relative return since the held date) already is that: an
+  // underperformer's slice just shrinks relative to the others, an
+  // outperformer's grows, and the baseline's own slice always stays exactly
+  // $100 (0% relative return by construction).
+  const METALS_PIE_SERIES = METAL_SERIES.filter((s) => s.selectableBaseline);
+  const metalsHeldComparison = heldDate ? computeHeldComparison(metalsIndexed, heldDate, baseline) : null;
+  const metalsPieData = metalsHeldComparison
+    ? METALS_PIE_SERIES.filter(({ key }) => metalsHeldComparison.stakeValue[key] != null).map(({ key, label: seriesLabel }) => ({
+        key,
+        name: seriesLabel,
+        value: metalsHeldComparison.stakeValue[key],
+        pct: metalsHeldComparison.relative[key],
+        color: METAL_SERIES_COLOR[key],
+      }))
+    : [];
 
   const m2Latest = data?.m2?.length ? data.m2[data.m2.length - 1].date : null;
   const walclLatest = data?.walcl?.length ? data.walcl[data.walcl.length - 1].date : null;
@@ -1844,6 +2543,385 @@ export default function MoneySupply() {
       )}
       </details>
 
+      <details className="collapsible-pane" open={outlaysPanelOpen} onToggle={(e) => setOutlaysPanelOpen(e.target.open)}>
+      <summary className="collapsible-pane-title">
+        Federal Outlays{outlaysView === "byAgency" ? " by Department/Agency" : ""}
+        {outlaysView === "topline" && outlaysMerged.length > 0 && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {(() => {
+              const row = pinnedDate
+                ? outlaysMerged.find((r) => r.date === pinnedDateOutlays)
+                : outlaysMerged[outlaysMerged.length - 1];
+              if (!row) return null;
+              const label = row.fiscalYear != null
+                ? `FY${row.fiscalYear}${row.monthsPresent < 12 ? ` (partial, ${row.monthsPresent}/12 mo.)` : ""}`
+                : row.date;
+              return (
+                <>
+                  {label} ·{" "}
+                  {row.deficit != null && (
+                    <span style={{ color: row.deficit >= 0 ? LOSS_COLOR : WIN_COLOR }}>
+                      {row.deficit >= 0 ? "Deficit" : "Surplus"} {fmtBillions(Math.abs(row.deficit))}
+                    </span>
+                  )}
+                  {row.interest_pct_outlays != null &&
+                    ` · Interest ${fmtPct(row.interest_pct_outlays)} of Outlays`}
+                </>
+              );
+            })()}
+          </span>
+        )}
+        {outlaysView === "byAgency" && outlaysByAgencyPieRow?.date && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {outlaysByAgencyPieRow.fiscalYear != null
+              ? `FY${outlaysByAgencyPieRow.fiscalYear}${outlaysByAgencyPieRow.monthsPresent < 12 ? ` (partial, ${outlaysByAgencyPieRow.monthsPresent}/12 mo.)` : ""}`
+              : outlaysByAgencyPieRow.date}
+            {topAgencies[0] && outlaysByAgencyPieRow[topAgencies[0]] != null &&
+              ` · Top: ${topAgencies[0]} ${fmtBillions(outlaysByAgencyPieRow[topAgencies[0]])}`}
+          </span>
+        )}
+      </summary>
+      {outlaysPanelOpen && (
+      <div className="collapsible-pane-body">
+      {/* Topline (flat lines) and By Department (stacked area + pie) used to
+          be two separate collapsible panels — merged into one at the user's
+          request, since both are the same Treasury Monthly Treasury
+          Statement data sharing one granularity/window control, just split
+          by total vs. by-agency. This toggle picks which chart body below
+          renders; outlaysGranularity/outlaysMerged/outlaysByAgencyMerged
+          etc. are unchanged from before the merge. */}
+      <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+        {[{ key: "topline", label: "Topline" }, { key: "byAgency", label: "By Department" }].map((v) => (
+          <button
+            key={v.key}
+            className={`comex-range-btn${outlaysView === v.key ? " comex-range-btn--active" : ""}`}
+            onClick={() => setOutlaysView(v.key)}
+          >
+            {v.label}
+          </button>
+        ))}
+      </div>
+      <div className="comex-panel-note">
+        {outlaysView === "topline" ? (
+          <>
+            Why the money supply keeps growing, alongside how much of it there already is. Federal
+            outlays, receipts, deficit/surplus, and interest expense on the public debt — U.S.
+            Treasury's Monthly Treasury Statement. Descriptive historical series only, per AV Voice
+            Rules — no forecast, no "at this rate" extrapolation.
+          </>
+        ) : (
+          <>
+            Which parts of the government the Topline Outlays line is actually made of — top{" "}
+            {OUTLAYS_BY_AGENCY_TOP_N} departments/agencies by current spend, everything else
+            bucketed into "Other." A department's own reported total, not a client-side sum of its
+            sub-programs. Bounded to the most recent {TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL} of
+            history (see the note below) — the Topline view goes back further. Note: the stacked
+            chart below still shows Department of the Treasury as one reported band (it includes
+            Interest on the Public Debt mixed in with Treasury's other spending, at source) — the
+            pie beside it splits that same band into "Interest on the Public Debt" and "Treasury
+            (other)" so Interest is visible as its own slice.
+          </>
+        )}
+      </div>
+      <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+        {["monthly", "annual"].map((g) => (
+          <button
+            key={g}
+            className={`comex-range-btn${outlaysGranularity === g ? " comex-range-btn--active" : ""}`}
+            onClick={() => handleOutlaysGranularityChange(g)}
+          >
+            {g === "monthly" ? "Monthly" : "Annual (FY)"}
+          </button>
+        ))}
+      </div>
+      {outlaysView === "topline" ? (
+        <>
+      {outlaysGranularity === "annual" && outlaysAnnual.some((r) => r.monthsPresent < 12) && (
+        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
+          {outlaysAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
+            <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
+          ))}
+        </div>
+      )}
+      {outlaysMerged.length > 0 ? (
+        <div className="comex-vault-pie-row">
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+          <ResponsiveContainer width="100%" height={280}>
+            <LineChart
+              data={outlaysMerged}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onClick={(state) => {
+                if (state?.activeLabel) setPinnedDate(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={outlaysTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                tickFormatter={(v) => `$${v.toFixed(0)}B`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip content={<OutlaysTooltipContent outlaysMerged={outlaysMerged} />} />
+              {pinnedDateOutlays && (
+                <ReferenceLine x={pinnedDateOutlays} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+              )}
+              <ReferenceLine y={0} stroke="#5a6278" strokeDasharray="2 4" />
+              {OUTLAYS_LEGEND_SERIES.map((entry) => (
+                <Line
+                  key={entry.key}
+                  type="monotone"
+                  dataKey={entry.key}
+                  stroke={entry.color}
+                  strokeDasharray={entry.dashed ? "4 3" : undefined}
+                  dot={false}
+                  strokeWidth={clickedOutlaysKey === entry.key ? 3 : 1.5}
+                  strokeOpacity={clickedOutlaysKey && clickedOutlaysKey !== entry.key ? 0.25 : 1}
+                  connectNulls
+                />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+          </div>
+
+          {/* Topline's own simple pie — Outlays split into Interest vs.
+              Everything Else, sitting beside the chart like every other
+              paired chart+pie in this panel. See outlaysToplinePieData's
+              own comment above for why this is a separate, simpler pie
+              from By Department's Treasury-splitting one, not a reuse of
+              it. */}
+          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <ResponsiveContainer width={180} height={180}>
+              <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                <Pie
+                  data={outlaysToplinePieData}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={70}
+                  innerRadius={36}
+                  paddingAngle={1}
+                >
+                  {outlaysToplinePieData.map((entry) => (
+                    <Cell key={entry.key} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Tooltip
+                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                  formatter={(v, name) => [
+                    `${fmtBillions(v)} (${fmtPct((v / outlaysToplinePieRow.outlays) * 100)})`,
+                    name,
+                  ]}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            {outlaysToplinePieRow?.date && (
+              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+                {outlaysToplinePieRow.fiscalYear != null
+                  ? `FY${outlaysToplinePieRow.fiscalYear}${outlaysToplinePieRow.monthsPresent < 12 ? ` (partial)` : ""}`
+                  : `As of ${outlaysToplinePieRow.date}`}
+              </div>
+            )}
+          </div>
+          </div>
+          {pinnedDateOutlays && (
+            <div style={{ marginTop: 4 }}>
+              <OutlaysTooltipContent active label={pinnedDateOutlays} outlaysMerged={outlaysMerged} />
+            </div>
+          )}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {OUTLAYS_LEGEND_SERIES.map((entry) => (
+              <button
+                key={entry.key}
+                className={`comex-legend-item legend-btn-row${clickedOutlaysKey === entry.key ? " legend-btn-row--baseline" : ""}`}
+                onClick={() => setClickedOutlaysKey((k) => (k === entry.key ? null : entry.key))}
+              >
+                <span
+                  className={`comex-legend-swatch${entry.dashed ? " comex-legend-swatch--dashed" : ""}`}
+                  style={entry.dashed ? { borderColor: entry.color } : { background: entry.color }}
+                />
+                <span>
+                  <strong>{entry.legendLabel}</strong>
+                </span>
+              </button>
+            ))}
+          </div>
+          {clickedOutlaysKey && (
+            <div className="comex-panel-note comex-panel-note--eli5">
+              {OUTLAYS_LEGEND_SERIES.find((d) => d.key === clickedOutlaysKey)?.eli5}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Run the backend once to seed the database — this source fetches automatically at startup, no key required.</div>
+        </div>
+      )}
+      <div className="comex-panel-note" style={{ marginTop: 8 }}>
+        Source: U.S. Treasury (fiscaldata.treasury.gov) — Monthly Treasury Statement, Table 1
+        (Receipts/Outlays/Deficit) and Table 5 (Interest on the Public Debt). Real coverage:
+        Outlays/Receipts/Deficit from 2013-10, Interest from 2015-03.
+      </div>
+        </>
+      ) : (
+        <>
+      {outlaysGranularity === "annual" && outlaysByAgencyAnnual.some((r) => r.monthsPresent < 12) && (
+        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
+          {outlaysByAgencyAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
+            <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
+          ))}
+        </div>
+      )}
+      {outlaysByAgencyMerged.length > 0 ? (
+        <div className="comex-vault-pie-row">
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart
+              data={outlaysByAgencyMerged}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onMouseMove={(state) => {
+                if (state?.activeLabel) setHoveredAgencyDate(state.activeLabel);
+              }}
+              onMouseLeave={() => setHoveredAgencyDate(null)}
+              onClick={(state) => {
+                if (state?.activeLabel) setPinnedDate(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={outlaysByAgencyTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                domain={clickedAgencyYDomain}
+                allowDataOverflow={!!clickedAgencyKey || hiddenAgencies.size > 0}
+                tickFormatter={(v) => `$${v.toFixed(0)}B`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip
+                content={(props) => (
+                  <OutlaysByAgencyTooltipContent
+                    {...props}
+                    rows={outlaysByAgencyMerged}
+                    topAgencies={topAgencies}
+                    agencyColor={agencyColor}
+                    otherCount={outlaysOtherCount}
+                  />
+                )}
+              />
+              {pinnedDateOutlaysByAgency && (
+                <ReferenceLine x={pinnedDateOutlaysByAgency} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+              )}
+              {/* Recharts 3.x does NOT re-derive stack order from current
+                  JSX child order on every render — each <Area> registers
+                  itself once (keyed by React key) into Recharts' own
+                  internal store on mount, and reordering the JSX array
+                  while keeping the same keys only replaces that item's
+                  props in place; it does not move its position in
+                  Recharts' internal stacking order. Confirmed live: an
+                  earlier version that re-sorted the array of <Area>
+                  elements (same keys, new order) had no effect on visual
+                  stack order at all. Fixed by keeping each <Area>'s KEY
+                  (and therefore its Recharts-internal stack slot) fixed to
+                  a stable SLOT INDEX, and instead choosing which agency's
+                  dataKey/color that slot renders — slot 0 always renders
+                  whichever agency is currently "first" (the clicked one,
+                  or the default latest-month-spend ranking if none is
+                  clicked). This is the mechanism that actually moves a
+                  clicked department to the bottom of the stack. */}
+              {(() => {
+                // Hidden agencies (per-department legend checkboxes) are
+                // dropped entirely before slot assignment — not rendered at
+                // 0 opacity — so they don't occupy a stack slot or
+                // contribute to the stacked total at all, matching what
+                // clickedAgencyYDomain computes as the real visible total.
+                const visible = [...topAgencies, "other"].filter((a) => !hiddenAgencies.has(a));
+                const order = clickedAgencyKey && visible.includes(clickedAgencyKey)
+                  ? [clickedAgencyKey, ...visible.filter((a) => a !== clickedAgencyKey)]
+                  : visible;
+                return order.map((a, slot) =>
+                  a === "other" ? (
+                    <Area
+                      key={`slot-${slot}`}
+                      type="monotone"
+                      dataKey="other"
+                      stackId="outlays-by-agency"
+                      stroke={OUTLAYS_OTHER_COLOR}
+                      strokeWidth={clickedAgencyKey === "other" ? 3 : 1}
+                      fill={OUTLAYS_OTHER_COLOR}
+                      fillOpacity={clickedAgencyKey && clickedAgencyKey !== "other" ? 0.2 : 0.45}
+                      connectNulls
+                    />
+                  ) : (
+                    <Area
+                      key={`slot-${slot}`}
+                      type="monotone"
+                      dataKey={a}
+                      stackId="outlays-by-agency"
+                      stroke={agencyColor(a)}
+                      strokeWidth={clickedAgencyKey === a ? 3 : 1}
+                      fill={agencyColor(a)}
+                      fillOpacity={clickedAgencyKey && clickedAgencyKey !== a ? 0.2 : 0.65}
+                      connectNulls
+                    />
+                  )
+                );
+              })()}
+            </ComposedChart>
+          </ResponsiveContainer>
+          </div>
+
+          <div style={{ flex: "0 0 180px" }}>
+            <OutlaysInterestPieChart
+              pieData={outlaysByAgencyPieData}
+              pieRow={outlaysByAgencyPieRow}
+              clickedAgencyKey={clickedAgencyKey}
+            />
+          </div>
+          </div>
+          {/* The static pinned-date readout (a full-width box below the
+              chart) was removed at the user's request — its per-department
+              dollar totals now render directly next to each legend row
+              instead (see OutlaysInterestLegend's own valueRow prop below),
+              so the same information no longer needs a separate floating
+              box. outlaysByAgencyPieRow already resolves the right
+              pin/hover/latest date (see its own derivation above) — passed
+              straight through as the legend's value source. */}
+          <OutlaysInterestLegend
+            pieRow={outlaysByAgencyPieRow}
+            topAgencies={topAgencies}
+            treasuryAgencyName={TREASURY_AGENCY_NAME}
+            interestAsOfRow={interestAsOfRow}
+            agencyColor={agencyColor}
+            clickedAgencyKey={clickedAgencyKey}
+            setClickedAgencyKey={setClickedAgencyKey}
+            otherCount={outlaysOtherCount}
+            hiddenAgencies={hiddenAgencies}
+            setHiddenAgencies={setHiddenAgencies}
+          />
+        </div>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Run the backend once to seed the database — this source fetches automatically at startup, no key required.</div>
+        </div>
+      )}
+      <div className="comex-panel-note" style={{ marginTop: 8 }}>
+        Source: U.S. Treasury (fiscaldata.treasury.gov) — Monthly Treasury Statement, Table 5,
+        per-department/agency totals. Real coverage: 2015-03 through present — Table 5 has no
+        real data at all before that (confirmed live), a harder floor than the Topline view's
+        2013-10. Ongoing fetches (each backend restart) only pull the most recent{" "}
+        {TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL} (one HTTP request per real month against a free
+        API with no documented rate limit); the deeper 2015–2023 history was added via a one-time
+        manual backfill.
+      </div>
+        </>
+      )}
+      </div>
+      )}
+      </details>
+
       <details className="collapsible-pane" open={qeQtPanelOpen} onToggle={(e) => setQeQtPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
         QE / QT
@@ -2051,10 +3129,10 @@ export default function MoneySupply() {
                 <ReferenceLine yAxisId="level" x={pinnedDateYields} stroke={RATIO_COLOR} strokeDasharray="3 3" />
               )}
               <ReferenceLine yAxisId="spread" y={0} stroke="#5a6278" strokeDasharray="2 4" />
-              {YIELDS_LEGEND_SERIES.map((entry) => (
+              {YIELDS_LEGEND_SERIES.filter((entry) => !hiddenYieldsKeys.has(entry.key)).map((entry) => (
                 <Line
                   key={entry.key}
-                  yAxisId={entry.key === "t10y2y" ? "spread" : "level"}
+                  yAxisId={entry.key === "t10y2y" || entry.key === "t10y3mo" ? "spread" : "level"}
                   type="monotone"
                   dataKey={entry.key}
                   stroke={entry.color}
@@ -2073,16 +3151,31 @@ export default function MoneySupply() {
           )}
           <div className="comex-legend-list comex-legend-list--horizontal">
             {YIELDS_LEGEND_SERIES.map((entry) => (
-              <button
-                key={entry.key}
-                className={`comex-legend-item legend-btn-row${clickedYieldsKey === entry.key ? " legend-btn-row--baseline" : ""}`}
-                onClick={() => setClickedYieldsKey((k) => (k === entry.key ? null : entry.key))}
-              >
-                <span className="comex-legend-swatch" style={{ background: entry.color }} />
-                <span>
-                  <strong>{entry.legendLabel}</strong>
-                </span>
-              </button>
+              <div key={entry.key} className="metals-legend-row">
+                <input
+                  type="checkbox"
+                  className="metals-legend-checkbox"
+                  checked={!hiddenYieldsKeys.has(entry.key)}
+                  onChange={() =>
+                    setHiddenYieldsKeys((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(entry.key)) next.delete(entry.key);
+                      else next.add(entry.key);
+                      return next;
+                    })
+                  }
+                  title={hiddenYieldsKeys.has(entry.key) ? "Show this series" : "Hide this series"}
+                />
+                <button
+                  className={`comex-legend-item legend-btn-row${clickedYieldsKey === entry.key ? " legend-btn-row--baseline" : ""}`}
+                  onClick={() => setClickedYieldsKey((k) => (k === entry.key ? null : entry.key))}
+                >
+                  <span className="comex-legend-swatch" style={{ background: entry.color }} />
+                  <span>
+                    <strong>{entry.legendLabel}</strong>
+                  </span>
+                </button>
+              </div>
             ))}
           </div>
           {clickedYieldsKey && (
@@ -2097,6 +3190,417 @@ export default function MoneySupply() {
           <div className="comex-empty-note">Hit Refresh to fetch from FRED, or run the refresh endpoint once to seed the database.</div>
         </div>
       )}
+      </div>
+      )}
+      </details>
+
+      <details className="collapsible-pane" open={auctionsPanelOpen} onToggle={(e) => setAuctionsPanelOpen(e.target.open)}>
+      <summary className="collapsible-pane-title">
+        Treasury Auctions
+        {auctionsMerged.length > 0 && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {(() => {
+              const latest = auctionsMerged[auctionsMerged.length - 1];
+              return `${latest.security_type} (${latest.security_term}) ${latest.date} · ${latest.bid_to_cover_ratio.toFixed(2)}x bid-to-cover`;
+            })()}
+          </span>
+        )}
+      </summary>
+      {auctionsPanelOpen && (
+      <div className="collapsible-pane-body">
+      <div className="comex-panel-note">
+        Real Treasury auction results — bid-to-cover ratio (demand strength) and who actually
+        bought each auction (primary dealers, indirect bidders — the closest public proxy for
+        foreign/other indirect buyers, direct bidders, and the Fed's own SOMA account). Real
+        persisted history is a rolling trailing window (see the note below), not multi-year —
+        this is about recent auction dynamics, not a long-run series. Descriptive only, per AV
+        Voice Rules — no claim about what a given bid-to-cover or buyer mix means for future
+        rates or prices.
+      </div>
+      {auctionsMerged.length > 0 ? (
+        <>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart
+              data={auctionsPivoted}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onClick={(state) => {
+                if (state?.activeLabel) setPinnedDate(state.activeLabel);
+              }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={auctionsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                domain={["dataMin - 0.2", "dataMax + 0.2"]}
+                tickFormatter={(v) => `${v.toFixed(1)}x`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Bid-to-Cover", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip content={<AuctionsTooltipContent auctionsMerged={auctionsMerged} />} />
+              {pinnedDateAuctions && (
+                <ReferenceLine x={pinnedDateAuctions} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+              )}
+              {AUCTION_SECURITY_TYPES.filter((t) => auctionSelectedTypes.has(t)).map((t) => (
+                <Line
+                  key={t}
+                  type="monotone"
+                  dataKey={t}
+                  name={t}
+                  stroke={AUCTION_TYPE_COLOR[t]}
+                  dot={{ r: 2 }}
+                  strokeWidth={clickedAuctionTypeKey === t ? 3 : 1.5}
+                  strokeOpacity={clickedAuctionTypeKey && clickedAuctionTypeKey !== t ? 0.25 : 1}
+                  connectNulls
+                  isAnimationActive={false}
+                />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+          {pinnedDateAuctions && (
+            <div style={{ marginTop: 4 }}>
+              <AuctionsTooltipContent active label={pinnedDateAuctions} auctionsMerged={auctionsMerged} />
+            </div>
+          )}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {AUCTION_SECURITY_TYPES.map((t) => (
+              <div key={t} className="metals-legend-row">
+                <input
+                  type="checkbox"
+                  className="metals-legend-checkbox"
+                  checked={auctionSelectedTypes.has(t)}
+                  onChange={() =>
+                    setAuctionSelectedTypes((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(t)) next.delete(t);
+                      else next.add(t);
+                      return next;
+                    })
+                  }
+                  title={auctionSelectedTypes.has(t) ? "Hide this security type" : "Show this security type"}
+                />
+                <button
+                  className={`comex-legend-item legend-btn-row${clickedAuctionTypeKey === t ? " legend-btn-row--baseline" : ""}`}
+                  onClick={() => setClickedAuctionTypeKey((k) => (k === t ? null : t))}
+                >
+                  <span className="comex-legend-swatch" style={{ background: AUCTION_TYPE_COLOR[t] }} />
+                  <span>
+                    <strong>{t}</strong>
+                  </span>
+                </button>
+              </div>
+            ))}
+          </div>
+
+          <div className="comex-panel-note" style={{ marginTop: 16 }}>
+            Buyer mix — who actually bought this security, as a % of the total accepted at
+            auction. Only one security type at a time (a Bill's buyer mix isn't comparable to a
+            30-Year Bond's on the same chart).
+          </div>
+          <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+            {AUCTION_SECURITY_TYPES.map((t) => (
+              <button
+                key={t}
+                className={`comex-range-btn${auctionMixType === t ? " comex-range-btn--active" : ""}`}
+                onClick={() => setAuctionMixType(t)}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+          {auctionMixRows.length > 0 ? (
+            <>
+            <ResponsiveContainer width="100%" height={220}>
+              <AreaChart
+                data={auctionMixRows}
+                stackOffset="expand"
+                margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+                onClick={(state) => {
+                  if (state?.activeLabel) setPinnedDate(state.activeLabel);
+                }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+                <XAxis dataKey="date" ticks={auctionMixTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+                <YAxis tickFormatter={(v) => `${Math.round(v * 100)}%`} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+                <Tooltip content={<AuctionMixTooltipContent rows={auctionMixRows} hiddenBuyers={hiddenAuctionBuyers} />} />
+                {pinnedDateAuctionMix && (
+                  <ReferenceLine x={pinnedDateAuctionMix} stroke={RATIO_COLOR} strokeDasharray="3 3" />
+                )}
+                {AUCTION_BUYERS.filter((b) => !hiddenAuctionBuyers.has(b.key)).map((b) => (
+                  <Area
+                    key={b.key}
+                    type="monotone"
+                    dataKey={`${b.key}_pct`}
+                    name={b.label}
+                    stackId="mix"
+                    stroke={AUCTION_BUYER_COLORS[b.key]}
+                    fill={AUCTION_BUYER_COLORS[b.key]}
+                    strokeWidth={clickedAuctionBuyerKey === b.key ? 3 : 1}
+                    fillOpacity={clickedAuctionBuyerKey && clickedAuctionBuyerKey !== b.key ? 0.2 : 0.7}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </AreaChart>
+            </ResponsiveContainer>
+            {pinnedDateAuctionMix && (
+              <div style={{ marginTop: 4 }}>
+                <AuctionMixTooltipContent active label={pinnedDateAuctionMix} rows={auctionMixRows} hiddenBuyers={hiddenAuctionBuyers} />
+              </div>
+            )}
+            </>
+          ) : (
+            <div className="comex-empty">
+              No settled {auctionMixType} auctions in the current window.
+            </div>
+          )}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {AUCTION_BUYERS.map((b) => (
+              <div key={b.key} className="metals-legend-row">
+                <input
+                  type="checkbox"
+                  className="metals-legend-checkbox"
+                  checked={!hiddenAuctionBuyers.has(b.key)}
+                  onChange={() =>
+                    setHiddenAuctionBuyers((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(b.key)) next.delete(b.key);
+                      else next.add(b.key);
+                      return next;
+                    })
+                  }
+                  title={hiddenAuctionBuyers.has(b.key) ? "Show this buyer category" : "Hide this buyer category"}
+                />
+                <button
+                  className={`comex-legend-item legend-btn-row${clickedAuctionBuyerKey === b.key ? " legend-btn-row--baseline" : ""}`}
+                  onClick={() => setClickedAuctionBuyerKey((k) => (k === b.key ? null : b.key))}
+                >
+                  <span className="comex-legend-swatch" style={{ background: AUCTION_BUYER_COLORS[b.key] }} />
+                  <span>
+                    <strong>{b.label}</strong>
+                  </span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Auction results accumulate on a rolling basis once the backend has run — check back after the next restart or scheduled fetch.</div>
+        </div>
+      )}
+      <div className="comex-panel-note" style={{ marginTop: 8 }}>
+        Source: U.S. Treasury (fiscaldata.treasury.gov) — Auctions Query API. Real persisted
+        history is a rolling ~120-day trailing window, refetched daily (not multi-year like the
+        other Treasury charts in this panel) — a newly-announced auction has every result field
+        null until it settles a few days later, at which point the same record is updated in
+        place with real values. "Indirect Bidders" is the closest public proxy for foreign
+        central bank and other indirect buyers — it does not identify individual countries.
+      </div>
+      </div>
+      )}
+      </details>
+
+      <details className="collapsible-pane" open={ticPanelOpen} onToggle={(e) => setTicPanelOpen(e.target.open)}>
+      <summary className="collapsible-pane-title">
+        Foreign Holdings of U.S. Treasuries
+        {ticMerged.length > 0 && (
+          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            {(() => {
+              const row = pinnedDate ? ticMerged.find((r) => r.date === nearestRowDate(ticMerged, pinnedDate)) : ticMerged[ticMerged.length - 1];
+              if (!row) return null;
+              const top = TIC_COUNTRY_ORDER.filter((c) => row[c] != null).sort((a, b) => row[b] - row[a])[0];
+              return (
+                <>
+                  {row.date}
+                  {row.grand_total != null && ` · Grand Total (LT) ${fmtTrillions(row.grand_total)}`}
+                  {top && ` · Top: ${top} ${fmtTrillions(row[top])}`}
+                </>
+              );
+            })()}
+          </span>
+        )}
+      </summary>
+      {ticPanelOpen && (
+      <div className="collapsible-pane-body">
+      <div className="comex-panel-note">
+        Which countries hold how much U.S. Treasury debt, over time — FRED's own ingestion of
+        Treasury's TIC (Treasury International Capital) data. <strong>Long-term Treasuries
+        only — excludes T-bills entirely.</strong> Treasury's own separately-published Major
+        Foreign Holders total (bills-inclusive) runs meaningfully higher than the grand total
+        this data represents; the two are not interchangeable. "Cayman Islands" is a real subset
+        of "Total Caribbean," not a duplicate — both are shown, but summing them would
+        double-count.
+      </div>
+      {ticMerged.length > 0 ? (
+        <div className="comex-vault-pie-row">
+          {(() => {
+            const pinnedDateTic = nearestRowDate(ticMerged, pinnedDate);
+            // Pin > hover > latest, same priority rule as every other pie
+            // in this panel (compositionPieRow, outlaysByAgencyPieRow).
+            const ticPieDate = pinnedDate ? pinnedDateTic : ticMerged[ticMerged.length - 1]?.date;
+            const ticPieRow = ticMerged.find((r) => r.date === ticPieDate) ?? null;
+            const ticPieData = ticPieRow
+              ? TIC_COUNTRY_ORDER
+                  .filter((c) => !hiddenTicCountries.has(c) && ticPieRow[c] != null && ticPieRow[c] > 0)
+                  .map((c) => ({ key: c, name: c, value: ticPieRow[c], color: TIC_COUNTRY_COLOR[c] }))
+              : [];
+            return (
+              <>
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
+          <ResponsiveContainer width="100%" height={280}>
+            <ComposedChart data={ticMerged} margin={{ top: 4, right: 20, left: 12, bottom: 4 }} onClick={(state) => {
+              if (state?.activeLabel) setPinnedDate(state.activeLabel);
+            }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={ticTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <YAxis
+                tickFormatter={(v) => `$${v.toFixed(1)}T`}
+                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              />
+              <Tooltip content={<TicHoldingsTooltipContent ticMerged={ticMerged} hiddenCountries={hiddenTicCountries} />} />
+              {pinnedDateTic && <ReferenceLine x={pinnedDateTic} stroke={RATIO_COLOR} strokeDasharray="3 3" />}
+              {/* Stack order highest-to-lowest at the pinned/hovered/latest
+                  date (ticPieRow, same row the companion pie already
+                  computes), per the user's explicit request — largest
+                  holder's Area renders first, landing at the bottom of the
+                  stack. Same slot-index-key mechanism as the Outlays by
+                  Agency chart's own click-to-bottom fix: Recharts does NOT
+                  re-derive stack order from current JSX child order on
+                  every render, it tracks each Area's stack position by
+                  React key at mount time. Re-sorting the .map() output
+                  alone (same keys, new order) would have no visual effect —
+                  confirmed by that earlier fix. Keeping each Area's key
+                  pinned to a stable SLOT index and choosing which country's
+                  dataKey/color that slot renders is the only way to
+                  actually move stack order here too. Hidden countries are
+                  dropped before ranking, same as before. */}
+              {(() => {
+                const visible = TIC_COUNTRY_ORDER.filter((c) => !hiddenTicCountries.has(c));
+                const ranked = ticPieRow
+                  ? [...visible].sort((a, b) => (ticPieRow[b] ?? 0) - (ticPieRow[a] ?? 0))
+                  : visible;
+                return ranked.map((c, slot) => (
+                  <Area
+                    key={`slot-${slot}`}
+                    type="monotone"
+                    dataKey={c}
+                    name={c}
+                    stackId="tic-holdings"
+                    stroke={TIC_COUNTRY_COLOR[c]}
+                    fill={TIC_COUNTRY_COLOR[c]}
+                    strokeWidth={clickedTicKey === c ? 3 : 1}
+                    fillOpacity={clickedTicKey && clickedTicKey !== c ? 0.2 : 0.65}
+                    connectNulls
+                  />
+                ));
+              })()}
+            </ComposedChart>
+          </ResponsiveContainer>
+          {pinnedDateTic && (
+            <div style={{ marginTop: 4 }}>
+              <TicHoldingsTooltipContent active label={pinnedDateTic} ticMerged={ticMerged} hiddenCountries={hiddenTicCountries} />
+            </div>
+          )}
+          </div>
+
+          {/* Companion pie, same convention as every other paired chart+pie
+              in this panel (Composition, Outlays by Agency) — a 14-country
+              line chart was genuinely illegible (the user's own word) with
+              every series drawn at once; the pie makes "who's biggest right
+              now" legible at a glance for whatever date is pinned/hovered,
+              while the line chart above stays useful for trend-over-time on
+              whichever countries are checked visible. */}
+          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <ResponsiveContainer width={180} height={180}>
+              <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                <Pie
+                  data={ticPieData}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={70}
+                  innerRadius={36}
+                  paddingAngle={1}
+                  onClick={(entry) => setClickedTicKey((k) => (k === entry.key ? null : entry.key))}
+                  style={{ cursor: "pointer" }}
+                >
+                  {ticPieData.map((entry) => (
+                    <Cell
+                      key={entry.key}
+                      fill={entry.color}
+                      fillOpacity={clickedTicKey && clickedTicKey !== entry.key ? 0.35 : 1}
+                      stroke={clickedTicKey === entry.key ? "#e8ecf4" : undefined}
+                      strokeWidth={clickedTicKey === entry.key ? 2 : undefined}
+                    />
+                  ))}
+                </Pie>
+                <Tooltip
+                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                  formatter={(v, name) => [fmtTrillions(v), name]}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            {ticPieRow?.date && (
+              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+                As of {ticPieRow.date}
+                {ticPieRow.grand_total != null && (
+                  <>
+                    <br />
+                    Grand Total (LT): {fmtTrillions(ticPieRow.grand_total)}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          </div>
+              </>
+            );
+          })()}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            {TIC_COUNTRY_ORDER.map((c) => (
+              <div key={c} className="metals-legend-row">
+                <input
+                  type="checkbox"
+                  className="metals-legend-checkbox"
+                  checked={!hiddenTicCountries.has(c)}
+                  onChange={() =>
+                    setHiddenTicCountries((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(c)) next.delete(c);
+                      else next.add(c);
+                      return next;
+                    })
+                  }
+                  title={hiddenTicCountries.has(c) ? "Show this country" : "Hide this country"}
+                />
+                <button
+                  className={`comex-legend-item legend-btn-row${clickedTicKey === c ? " legend-btn-row--baseline" : ""}`}
+                  onClick={() => setClickedTicKey((k) => (k === c ? null : c))}
+                >
+                  <span className="comex-legend-swatch" style={{ background: TIC_COUNTRY_COLOR[c] }} />
+                  <span>
+                    <strong>{c}</strong>
+                  </span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="comex-empty">
+          No data available.
+          <div className="comex-empty-note">Requires FRED_API_KEY — hit Refresh on the panel above, or run the refresh endpoint once to seed the database.</div>
+        </div>
+      )}
+      <div className="comex-panel-note" style={{ marginTop: 8 }}>
+        Source: FRED's own ingestion of U.S. Treasury's TIC (Treasury International Capital)
+        data — FORLTTREASPOS* series, monthly, real coverage from 1984-12 for most countries
+        (Belgium/Luxembourg/Cayman Islands from ~2001, a real TIC reporting-category change).
+        Country codes are TIC's own, looked up from Treasury's published country-code table,
+        not derived from ISO codes.
+      </div>
       </div>
       )}
       </details>
@@ -2138,20 +3642,31 @@ export default function MoneySupply() {
         (SI=F/GC=F), and CPI-derived Purchasing Power (what that $100 could actually buy).
         Click a line's label in the legend below to make it the baseline — the baseline renders
         flat at 0%, and the others show their return relative to it over the selected window.
-        Click the checkbox to show/hide a line. Click and hold a point on the chart to see each
-        series' return from that date to the latest data, relative to the current baseline —
-        release to return to normal. Not a claim that any one of them "should" track another.
+        Click the checkbox to show/hide a line. Click a point on the chart to see (and pin, in the
+        pie beside it) each series' return from that date to the latest data, relative to the
+        current baseline — click the same point again to clear it. Not a claim that any one of
+        them "should" track another.
       </div>
       {metalsMerged.length > 0 ? (
-        <ResponsiveContainer width="100%" height={280}>
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 420px", minWidth: 280 }}>
+          <ResponsiveContainer width="100%" height={280}>
           <ComposedChart
             data={metalsMerged}
             margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
-            onMouseDown={(state) => {
-              if (state?.activeLabel) setHeldDate(state.activeLabel);
+            // Click a point to set it as a persistent held/reference date —
+            // "since that date, how did fiat/gold/silver each do, relative
+            // to the current baseline" — shown in the tooltip and the
+            // companion pie beside this chart, and staying visible until a
+            // different point is clicked or the same one is clicked again
+            // to clear it. Replaces an earlier press-and-hold gesture
+            // (mousedown/mouseup/mouseleave), which reverted the moment the
+            // mouse button was released — too transient to actually look at
+            // the pie the user asked for without holding the mouse down the
+            // whole time.
+            onClick={(state) => {
+              if (state?.activeLabel) setHeldDate((d) => (d === state.activeLabel ? null : state.activeLabel));
             }}
-            onMouseUp={() => setHeldDate(null)}
-            onMouseLeave={() => setHeldDate(null)}
           >
             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
             <XAxis dataKey="date" ticks={metalsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
@@ -2168,7 +3683,7 @@ export default function MoneySupply() {
                   merged={metalsMerged}
                   baselineKey={baseline}
                   visible={visible}
-                  heldComparison={heldDate ? computeHeldComparison(metalsIndexed, heldDate, baseline) : null}
+                  heldComparison={metalsHeldComparison}
                 />
               }
             />
@@ -2183,8 +3698,10 @@ export default function MoneySupply() {
                 type="monotone"
                 dataKey="xau_index"
                 stroke={XAU_COLOR}
+                strokeWidth={clickedMetalsPieKey === "xau_index" ? 2.5 : 1}
                 fill={XAU_COLOR}
-                fillOpacity={0.3}
+                fillOpacity={clickedMetalsPieKey && clickedMetalsPieKey !== "xau_index" ? 0.08 : 0.3}
+                strokeOpacity={clickedMetalsPieKey && clickedMetalsPieKey !== "xau_index" ? 0.3 : 1}
                 connectNulls
               />
             )}
@@ -2193,8 +3710,10 @@ export default function MoneySupply() {
                 type="monotone"
                 dataKey="xag_index"
                 stroke={XAG_COLOR}
+                strokeWidth={clickedMetalsPieKey === "xag_index" ? 2.5 : 1}
                 fill={XAG_COLOR}
-                fillOpacity={0.3}
+                fillOpacity={clickedMetalsPieKey && clickedMetalsPieKey !== "xag_index" ? 0.08 : 0.3}
+                strokeOpacity={clickedMetalsPieKey && clickedMetalsPieKey !== "xag_index" ? 0.3 : 1}
                 connectNulls
               />
             )}
@@ -2205,6 +3724,7 @@ export default function MoneySupply() {
                 stroke={PP_COLOR}
                 dot={false}
                 strokeWidth={1.8}
+                strokeOpacity={clickedMetalsPieKey ? 0.3 : 1}
                 connectNulls
               />
             )}
@@ -2214,12 +3734,126 @@ export default function MoneySupply() {
                 dataKey="fiat_index"
                 stroke={FIAT_COLOR}
                 dot={false}
-                strokeWidth={1.8}
+                strokeWidth={clickedMetalsPieKey === "fiat_index" ? 3 : 1.8}
+                strokeOpacity={clickedMetalsPieKey && clickedMetalsPieKey !== "fiat_index" ? 0.3 : 1}
                 connectNulls
               />
             )}
           </ComposedChart>
-        </ResponsiveContainer>
+          </ResponsiveContainer>
+          </div>
+
+          {/* Companion pie: the click-to-hold comparison, visualized. Click a
+              point on the line chart to set a held date — the pie then
+              shows $100 held in fiat/gold/silver since that date, grown by
+              each series' real return relative to the current baseline
+              (the baseline's own slice always sits at exactly $100, 0%
+              relative return by construction). This is the same data
+              MetalsTooltip already renders as text when a date is held —
+              the pie is a second, visual presentation of it, not a
+              different calculation (see metalsHeldComparison above). Sits
+              beside the line chart, not below it, same layout/sizing
+              convention as the Composition pie (flex-basis 180px column,
+              180×180 container, outerRadius 70, zeroed PieChart margin) so
+              the two paired chart+pie sections in this tab read as one
+              visual pattern. Clicking a slice/legend row highlights that
+              series on the line chart above (dims the other Area/Line
+              elements the same way clickedM2Key/clickedPieKey already do
+              elsewhere in this file) — no ELI5 popup here, since the main
+              legend below already covers checkbox/baseline interactions for
+              these same 3(+PP) series and per-series explanatory text was
+              never added to it either (a deliberate choice at the time, see
+              that legend's own surrounding comment). */}
+          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+            {metalsHeldComparison ? (
+              <ResponsiveContainer width={180} height={180}>
+                <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                  <Pie
+                    data={metalsPieData}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="50%"
+                    outerRadius={70}
+                    innerRadius={36}
+                    paddingAngle={1}
+                    onClick={(entry) => setClickedMetalsPieKey((k) => (k === entry.key ? null : entry.key))}
+                    style={{ cursor: "pointer" }}
+                  >
+                    {metalsPieData.map((entry) => (
+                      <Cell
+                        key={entry.key}
+                        fill={entry.color}
+                        fillOpacity={clickedMetalsPieKey && clickedMetalsPieKey !== entry.key ? 0.35 : 1}
+                        stroke={clickedMetalsPieKey === entry.key ? "#e8ecf4" : undefined}
+                        strokeWidth={clickedMetalsPieKey === entry.key ? 2 : undefined}
+                      />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                    formatter={(v, name, item) => [
+                      `${fmtUsd(v)} (${fmtPct(item?.payload?.pct ?? 0)})`,
+                      name,
+                    ]}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            ) : (
+              // No held date yet — the pie has nothing to compare, so it
+              // prompts the click rather than rendering an empty/misleading
+              // circle (same "don't manufacture a reading" instinct as the
+              // rest of this codebase's nulls-over-zeros convention, applied
+              // to UI state rather than persisted data).
+              <div
+                style={{
+                  width: 180,
+                  height: 180,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  textAlign: "center",
+                  fontSize: 11,
+                  color: "#5a6278",
+                  border: "1px dashed #2e3547",
+                  borderRadius: "50%",
+                  padding: 16,
+                }}
+              >
+                Click a point on the chart to compare fiat/gold/silver since that date
+              </div>
+            )}
+            {/* Single-date snapshot caption, same convention as the
+                Composition pie's own "As of" line. */}
+            {metalsHeldComparison && (
+              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4, textAlign: "center" }}>
+                Since {metalsHeldComparison.heldDate} → {metalsHeldComparison.latestDate}
+                <br />
+                {"$" + HELD_STAKE_USD} held in each, relative to {METAL_SERIES.find((s) => s.key === baseline)?.shortLabel}
+              </div>
+            )}
+            {/* Small click-to-highlight swatch row, separate from the main
+                checkbox/baseline legend below the chart — clicking here only
+                drives the pie/chart highlight (clickedMetalsPieKey), it
+                doesn't toggle visibility or change the baseline the way the
+                main legend's rows do, so it's kept as its own compact row
+                rather than merged into that legend's different interaction
+                model. */}
+            <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap", justifyContent: "center" }}>
+              {METALS_PIE_SERIES.map(({ key, shortLabel }) => (
+                <button
+                  key={key}
+                  className={`comex-legend-item legend-btn-row${clickedMetalsPieKey === key ? " legend-btn-row--baseline" : ""}`}
+                  onClick={() => setClickedMetalsPieKey((k) => (k === key ? null : key))}
+                  style={{ padding: "2px 6px" }}
+                >
+                  <span className="comex-legend-swatch" style={{ background: METAL_SERIES_COLOR[key] }} />
+                  <span style={{ fontSize: 11 }}>{shortLabel}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
       ) : (
         <div className="comex-empty">
           No data available.
@@ -2280,341 +3914,6 @@ export default function MoneySupply() {
       <div className="comex-panel-note" style={{ marginTop: 8 }}>
         Source: FRED (Federal Reserve Bank of St. Louis) — M2SL, WALCL, CPIAUCSL, WRESBAL,
         RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL. Metal prices: Yahoo Finance (SI=F, GC=F).
-      </div>
-      </div>
-      )}
-      </details>
-
-      <details className="collapsible-pane" open={outlaysPanelOpen} onToggle={(e) => setOutlaysPanelOpen(e.target.open)}>
-      <summary className="collapsible-pane-title">
-        Federal Outlays
-        {outlaysMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
-            {(() => {
-              const row = pinnedDate
-                ? outlaysMerged.find((r) => r.date === pinnedDateOutlays)
-                : outlaysMerged[outlaysMerged.length - 1];
-              if (!row) return null;
-              const label = row.fiscalYear != null
-                ? `FY${row.fiscalYear}${row.monthsPresent < 12 ? ` (partial, ${row.monthsPresent}/12 mo.)` : ""}`
-                : row.date;
-              return (
-                <>
-                  {label} ·{" "}
-                  {row.deficit != null && (
-                    <span style={{ color: row.deficit >= 0 ? LOSS_COLOR : WIN_COLOR }}>
-                      {row.deficit >= 0 ? "Deficit" : "Surplus"} {fmtBillions(Math.abs(row.deficit))}
-                    </span>
-                  )}
-                  {row.interest_pct_outlays != null &&
-                    ` · Interest ${fmtPct(row.interest_pct_outlays)} of Outlays`}
-                </>
-              );
-            })()}
-          </span>
-        )}
-      </summary>
-      {outlaysPanelOpen && (
-      <div className="collapsible-pane-body">
-      <div className="comex-panel-note">
-        Why the money supply keeps growing, alongside how much of it there already is. Federal
-        outlays, receipts, deficit/surplus, and interest expense on the public debt — U.S.
-        Treasury's Monthly Treasury Statement. Descriptive historical series only, per AV Voice
-        Rules — no forecast, no "at this rate" extrapolation.
-      </div>
-      <div className="comex-range-selector" style={{ marginBottom: 8 }}>
-        {["monthly", "annual"].map((g) => (
-          <button
-            key={g}
-            className={`comex-range-btn${outlaysGranularity === g ? " comex-range-btn--active" : ""}`}
-            onClick={() => handleOutlaysGranularityChange(g)}
-          >
-            {g === "monthly" ? "Monthly" : "Annual (FY)"}
-          </button>
-        ))}
-      </div>
-      {outlaysGranularity === "annual" && outlaysAnnual.some((r) => r.monthsPresent < 12) && (
-        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
-          {outlaysAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
-            <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
-          ))}
-        </div>
-      )}
-      {outlaysMerged.length > 0 ? (
-        <div>
-          <ResponsiveContainer width="100%" height={280}>
-            <LineChart
-              data={outlaysMerged}
-              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
-              onClick={(state) => {
-                if (state?.activeLabel) setPinnedDate(state.activeLabel);
-              }}
-            >
-              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={outlaysTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-              <YAxis
-                tickFormatter={(v) => `$${v.toFixed(0)}B`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
-              />
-              <Tooltip content={<OutlaysTooltipContent outlaysMerged={outlaysMerged} />} />
-              {pinnedDateOutlays && (
-                <ReferenceLine x={pinnedDateOutlays} stroke={RATIO_COLOR} strokeDasharray="3 3" />
-              )}
-              <ReferenceLine y={0} stroke="#5a6278" strokeDasharray="2 4" />
-              {OUTLAYS_LEGEND_SERIES.map((entry) => (
-                <Line
-                  key={entry.key}
-                  type="monotone"
-                  dataKey={entry.key}
-                  stroke={entry.color}
-                  strokeDasharray={entry.dashed ? "4 3" : undefined}
-                  dot={false}
-                  strokeWidth={clickedOutlaysKey === entry.key ? 3 : 1.5}
-                  strokeOpacity={clickedOutlaysKey && clickedOutlaysKey !== entry.key ? 0.25 : 1}
-                  connectNulls
-                />
-              ))}
-            </LineChart>
-          </ResponsiveContainer>
-          {pinnedDateOutlays && (
-            <div style={{ marginTop: 4 }}>
-              <OutlaysTooltipContent active label={pinnedDateOutlays} outlaysMerged={outlaysMerged} />
-            </div>
-          )}
-          <div className="comex-legend-list comex-legend-list--horizontal">
-            {OUTLAYS_LEGEND_SERIES.map((entry) => (
-              <button
-                key={entry.key}
-                className={`comex-legend-item legend-btn-row${clickedOutlaysKey === entry.key ? " legend-btn-row--baseline" : ""}`}
-                onClick={() => setClickedOutlaysKey((k) => (k === entry.key ? null : entry.key))}
-              >
-                <span
-                  className={`comex-legend-swatch${entry.dashed ? " comex-legend-swatch--dashed" : ""}`}
-                  style={entry.dashed ? { borderColor: entry.color } : { background: entry.color }}
-                />
-                <span>
-                  <strong>{entry.legendLabel}</strong>
-                </span>
-              </button>
-            ))}
-          </div>
-          {clickedOutlaysKey && (
-            <div className="comex-panel-note comex-panel-note--eli5">
-              {OUTLAYS_LEGEND_SERIES.find((d) => d.key === clickedOutlaysKey)?.eli5}
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="comex-empty">
-          No data available.
-          <div className="comex-empty-note">Run the backend once to seed the database — this source fetches automatically at startup, no key required.</div>
-        </div>
-      )}
-      <div className="comex-panel-note" style={{ marginTop: 8 }}>
-        Source: U.S. Treasury (fiscaldata.treasury.gov) — Monthly Treasury Statement, Table 1
-        (Receipts/Outlays/Deficit) and Table 5 (Interest on the Public Debt). Real coverage:
-        Outlays/Receipts/Deficit from 2013-10, Interest from 2015-03.
-      </div>
-      </div>
-      )}
-      </details>
-
-      <details className="collapsible-pane" open={outlaysByAgencyPanelOpen} onToggle={(e) => setOutlaysByAgencyPanelOpen(e.target.open)}>
-      <summary className="collapsible-pane-title">
-        Federal Outlays by Department/Agency
-        {outlaysByAgencyPieRow?.date && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
-            {outlaysByAgencyPieRow.fiscalYear != null
-              ? `FY${outlaysByAgencyPieRow.fiscalYear}${outlaysByAgencyPieRow.monthsPresent < 12 ? ` (partial, ${outlaysByAgencyPieRow.monthsPresent}/12 mo.)` : ""}`
-              : outlaysByAgencyPieRow.date}
-            {topAgencies[0] && outlaysByAgencyPieRow[topAgencies[0]] != null &&
-              ` · Top: ${topAgencies[0]} ${fmtBillions(outlaysByAgencyPieRow[topAgencies[0]])}`}
-          </span>
-        )}
-      </summary>
-      {outlaysByAgencyPanelOpen && (
-      <div className="collapsible-pane-body">
-      <div className="comex-panel-note">
-        Which parts of the government the Outlays line above is actually made of — top{" "}
-        {OUTLAYS_BY_AGENCY_TOP_N} departments/agencies by current spend, everything else bucketed
-        into "Other." A department's own reported total, not a client-side sum of its
-        sub-programs. Bounded to the most recent {TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL} of
-        history (see the note below) — the topline Outlays chart above goes back further.
-        Note: Department of the Treasury's own total includes interest paid on the public debt
-        (Treasury is who issues/services it) — a larger figure than the standalone "Interest on
-        the Public Debt" line in the chart above, which is scoped to interest specifically.
-      </div>
-      <div className="comex-range-selector" style={{ marginBottom: 8 }}>
-        {["monthly", "annual"].map((g) => (
-          <button
-            key={g}
-            className={`comex-range-btn${outlaysGranularity === g ? " comex-range-btn--active" : ""}`}
-            onClick={() => handleOutlaysGranularityChange(g)}
-          >
-            {g === "monthly" ? "Monthly" : "Annual (FY)"}
-          </button>
-        ))}
-      </div>
-      {outlaysGranularity === "annual" && outlaysByAgencyAnnual.some((r) => r.monthsPresent < 12) && (
-        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
-          {outlaysByAgencyAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
-            <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
-          ))}
-        </div>
-      )}
-      {outlaysByAgencyMerged.length > 0 ? (
-        <div className="comex-vault-pie-row">
-          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
-          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
-          <ResponsiveContainer width="100%" height={260}>
-            <ComposedChart
-              data={outlaysByAgencyMerged}
-              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
-              onMouseMove={(state) => {
-                if (state?.activeLabel) setHoveredAgencyDate(state.activeLabel);
-              }}
-              onMouseLeave={() => setHoveredAgencyDate(null)}
-              onClick={(state) => {
-                if (state?.activeLabel) setPinnedDate(state.activeLabel);
-              }}
-            >
-              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={outlaysByAgencyTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-              <YAxis
-                tickFormatter={(v) => `$${v.toFixed(0)}B`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
-              />
-              <Tooltip
-                content={(props) => (
-                  <OutlaysByAgencyTooltipContent
-                    {...props}
-                    rows={outlaysByAgencyMerged}
-                    topAgencies={topAgencies}
-                    agencyColor={agencyColor}
-                    otherCount={outlaysOtherCount}
-                  />
-                )}
-              />
-              {pinnedDateOutlaysByAgency && (
-                <ReferenceLine x={pinnedDateOutlaysByAgency} stroke={RATIO_COLOR} strokeDasharray="3 3" />
-              )}
-              {topAgencies.map((a) => (
-                <Area
-                  key={a}
-                  type="monotone"
-                  dataKey={a}
-                  stackId="outlays-by-agency"
-                  stroke={agencyColor(a)}
-                  strokeWidth={clickedAgencyKey === a ? 3 : 1}
-                  fill={agencyColor(a)}
-                  fillOpacity={clickedAgencyKey && clickedAgencyKey !== a ? 0.2 : 0.65}
-                  connectNulls
-                />
-              ))}
-              <Area
-                type="monotone"
-                dataKey="other"
-                stackId="outlays-by-agency"
-                stroke={OUTLAYS_OTHER_COLOR}
-                strokeWidth={clickedAgencyKey === "other" ? 3 : 1}
-                fill={OUTLAYS_OTHER_COLOR}
-                fillOpacity={clickedAgencyKey && clickedAgencyKey !== "other" ? 0.2 : 0.45}
-                connectNulls
-              />
-            </ComposedChart>
-          </ResponsiveContainer>
-          {pinnedDateOutlaysByAgency && (
-            <div style={{ marginTop: 4 }}>
-              <OutlaysByAgencyTooltipContent
-                active
-                label={pinnedDateOutlaysByAgency}
-                rows={outlaysByAgencyMerged}
-                topAgencies={topAgencies}
-                agencyColor={agencyColor}
-                otherCount={outlaysOtherCount}
-              />
-            </div>
-          )}
-          </div>
-
-          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
-            <ResponsiveContainer width={180} height={180}>
-              <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                <Pie
-                  data={outlaysByAgencyPieData}
-                  dataKey="value"
-                  nameKey="name"
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={70}
-                  innerRadius={36}
-                  paddingAngle={1}
-                >
-                  {outlaysByAgencyPieData.map((entry) => (
-                    <Cell
-                      key={entry.key}
-                      fill={entry.color}
-                      fillOpacity={clickedAgencyKey && clickedAgencyKey !== entry.key ? 0.35 : 1}
-                      stroke={clickedAgencyKey === entry.key ? "#e8ecf4" : undefined}
-                      strokeWidth={clickedAgencyKey === entry.key ? 2 : undefined}
-                    />
-                  ))}
-                </Pie>
-                <Tooltip
-                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-                  formatter={(v, name) => [fmtBillions(v), name]}
-                />
-              </PieChart>
-            </ResponsiveContainer>
-            {outlaysByAgencyPieRow?.date && (
-              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
-                {outlaysByAgencyPieRow.fiscalYear != null
-                  ? `FY${outlaysByAgencyPieRow.fiscalYear}${outlaysByAgencyPieRow.monthsPresent < 12 ? ` (partial)` : ""}`
-                  : `As of ${outlaysByAgencyPieRow.date}`}
-              </div>
-            )}
-          </div>
-          </div>
-          <div className="comex-legend-list comex-legend-list--horizontal">
-            {topAgencies.map((a) => (
-              <button
-                key={a}
-                className={`comex-legend-item legend-btn-row${clickedAgencyKey === a ? " legend-btn-row--baseline" : ""}`}
-                onClick={() => setClickedAgencyKey((k) => (k === a ? null : a))}
-              >
-                <span className="comex-legend-swatch" style={{ background: agencyColor(a) }} />
-                <span>
-                  <strong>{a}</strong>
-                </span>
-              </button>
-            ))}
-            <button
-              className={`comex-legend-item legend-btn-row${clickedAgencyKey === "other" ? " legend-btn-row--baseline" : ""}`}
-              onClick={() => setClickedAgencyKey((k) => (k === "other" ? null : "other"))}
-            >
-              <span className="comex-legend-swatch" style={{ background: OUTLAYS_OTHER_COLOR }} />
-              <span>
-                <strong>Other ({outlaysOtherCount} more)</strong>
-              </span>
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div className="comex-empty">
-          No data available.
-          <div className="comex-empty-note">Run the backend once to seed the database — this source fetches automatically at startup, no key required.</div>
-        </div>
-      )}
-      <div className="comex-panel-note" style={{ marginTop: 8 }}>
-        Source: U.S. Treasury (fiscaldata.treasury.gov) — Monthly Treasury Statement, Table 5,
-        per-department/agency totals. Real coverage: 2015-03 through present — Table 5 has no
-        real data at all before that (confirmed live), a harder floor than the topline Outlays
-        chart's 2013-10. Ongoing fetches (each backend restart) only pull the most recent{" "}
-        {TREASURY_OUTLAYS_BY_AGENCY_WINDOW_LABEL} (one HTTP request per real month against a free
-        API with no documented rate limit); the deeper 2015–2023 history was added via a one-time
-        manual backfill.
       </div>
       </div>
       )}

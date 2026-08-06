@@ -38,14 +38,20 @@ from pipeline.config import (
     FRED_SERIES_CPI,
     FRED_SERIES_DFII10,
     FRED_SERIES_DGS2,
+    FRED_SERIES_DGS3MO,
+    FRED_SERIES_DGS5,
     FRED_SERIES_DGS10,
+    FRED_SERIES_DGS30,
     FRED_SERIES_M2,
     FRED_SERIES_RRPONTSYD,
     FRED_SERIES_T10Y2Y,
+    FRED_SERIES_TIC_COUNTRIES,
+    FRED_SERIES_TIC_GRAND_TOTAL,
     FRED_SERIES_WALCL,
     FRED_SERIES_WLCFLPCL,
     FRED_SERIES_WRESBAL,
     FRED_SERIES_WSHOMCB,
+    FRED_SERIES_WSHOSHO,
     FRED_SERIES_WSHOTSL,
     FRED_WALCL_YOY_LOOKBACK,
     METAL_PRICE_FETCH_YEARS,
@@ -86,6 +92,19 @@ CENSUS_TRADE_FLOWS = {
 CENSUS_TRADE_MONTHS_PER_FETCH = 3  # cheap self-heal against late revisions between gate-interval runs
 
 TREASURY_MTS_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts"
+# Same host/no-key posture as TREASURY_MTS_BASE, sibling path under
+# accounting/od (Auctions Query). Confirmed live: 11,063+ rows back to
+# 1979-11-15, ~100 fields/record, "null"-string sentinels for unsettled
+# results (same convention _mts_amount already handles for MTS).
+TREASURY_AUCTIONS_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
+# Real per-record lifecycle: announced ~1 week before auction_date (results
+# NULL), settles a few days after. A rolling trailing window catches both
+# newly-announced auctions and lets already-fetched-but-not-yet-settled
+# rows get their results filled in on a later run (see
+# upsert_treasury_auctions_rows' COALESCE). 120 days comfortably covers
+# announcement lead time + settlement lag with margin, without re-pulling
+# the full 11,000+-row history on every fetch.
+TREASURY_AUCTIONS_WINDOW_DAYS = 120
 # Table 1 (Summary of Receipts, Outlays, and the Deficit/Surplus) republishes
 # every month of BOTH the prior and current fiscal year on every monthly
 # release — a real month's figure is identified by classification_desc
@@ -1843,6 +1862,94 @@ async def _fetch_and_persist_treasury_outlays_by_agency_startup():
         db.record_fetch_attempt("treasury_outlays_by_agency", success=False, error=str(e))
 
 
+_TREASURY_AUCTION_API_FIELDS = [
+    "cusip", "security_type", "security_term", "auction_date", "issue_date", "maturity_date",
+    "high_yield", "high_discnt_rate", "high_investment_rate", "bid_to_cover_ratio",
+    "offering_amt", "total_tendered", "total_accepted",
+    "indirect_bidder_tendered", "indirect_bidder_accepted",
+    "direct_bidder_tendered", "direct_bidder_accepted",
+    "primary_dealer_tendered", "primary_dealer_accepted",
+    "soma_tendered", "soma_accepted", "soma_holdings",
+]
+
+
+async def _fetch_and_persist_treasury_auctions() -> int:
+    """Treasuries-picture expansion — bid-to-cover, buyer-category
+    breakdown (indirect/direct/primary-dealer/SOMA), and high yield per
+    auction. Confirmed live against the real API (see TREASURY_AUCTIONS_BASE
+    comment): a `fields` filter narrows the ~100-field response to just
+    what this app persists, and `auction_date:gte:` bounds the pull to a
+    rolling trailing window (TREASURY_AUCTIONS_WINDOW_DAYS) rather than the
+    full 11,000+-row history. NOTE: an earlier version of this filtered on
+    'record_date' instead — that field does not exist on this endpoint at
+    all (confirmed live: a 400 "Invalid Query Param" error, caught only
+    once actually run against the real API rather than assumed from an
+    earlier successful call that happened to sort-by, but never filter-by,
+    that field name). auction_date is the correct anchor: it's stable for a
+    given security's whole announce→settle lifecycle, so a row newly
+    announced near the trailing edge of the window is still caught, and an
+    already-fetched-but-unsettled row from earlier in the window gets
+    re-fetched (and its nulls filled in via upsert's COALESCE) on every
+    subsequent run until it settles. Every numeric field is the literal
+    string "null" for an unsettled result, same confirmed convention
+    _mts_amount already handles for MTS Table 1/5, so it's reused here
+    rather than a second parallel helper.
+    """
+    since = str(date.today() - timedelta(days=TREASURY_AUCTIONS_WINDOW_DAYS))
+    resp = await _client.get(
+        TREASURY_AUCTIONS_BASE,
+        params={
+            "filter": f"auction_date:gte:{since}",
+            "fields": ",".join(_TREASURY_AUCTION_API_FIELDS),
+            "page[size]": "1000",
+            "sort": "-auction_date",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    rows = []
+    for r in data:
+        rows.append({
+            "cusip": r["cusip"],
+            "auction_date": r["auction_date"],
+            "security_type": r.get("security_type"),
+            "security_term": r.get("security_term"),
+            "issue_date": r.get("issue_date"),
+            "maturity_date": r.get("maturity_date"),
+            "high_yield": _mts_amount(r.get("high_yield")),
+            "high_discnt_rate": _mts_amount(r.get("high_discnt_rate")),
+            "high_investment_rate": _mts_amount(r.get("high_investment_rate")),
+            "bid_to_cover_ratio": _mts_amount(r.get("bid_to_cover_ratio")),
+            "offering_amt": _mts_amount(r.get("offering_amt")),
+            "total_tendered": _mts_amount(r.get("total_tendered")),
+            "total_accepted": _mts_amount(r.get("total_accepted")),
+            "indirect_bidder_tendered": _mts_amount(r.get("indirect_bidder_tendered")),
+            "indirect_bidder_accepted": _mts_amount(r.get("indirect_bidder_accepted")),
+            "direct_bidder_tendered": _mts_amount(r.get("direct_bidder_tendered")),
+            "direct_bidder_accepted": _mts_amount(r.get("direct_bidder_accepted")),
+            "primary_dealer_tendered": _mts_amount(r.get("primary_dealer_tendered")),
+            "primary_dealer_accepted": _mts_amount(r.get("primary_dealer_accepted")),
+            "soma_tendered": _mts_amount(r.get("soma_tendered")),
+            "soma_accepted": _mts_amount(r.get("soma_accepted")),
+            "soma_holdings": _mts_amount(r.get("soma_holdings")),
+        })
+    if rows:
+        db.upsert_treasury_auctions_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_treasury_auctions_tick():
+    try:
+        n = await _fetch_and_persist_treasury_auctions()
+        db.record_fetch_attempt("treasury_auctions", success=True)
+        return n
+    except Exception as e:
+        print(f"[treasury_auctions] warning: {e}")
+        db.record_fetch_attempt("treasury_auctions", success=False, error=str(e))
+        return 0
+
+
 @app.get("/api/treasury-outlays-by-agency/db")
 async def treasury_outlays_by_agency_db(
     window: str = Query("5y"),
@@ -1877,6 +1984,19 @@ async def treasury_outlays_db(
     if end is not None:
         rows = [r for r in rows if r["date"] <= end]
     return {"success": True, "data": rows}
+
+
+@app.get("/api/treasury-auctions/db")
+async def treasury_auctions_db(security_type: str | None = Query(None)):
+    """No window param, unlike the other Treasury routes above — real
+    persisted history is deliberately bounded to a rolling
+    TREASURY_AUCTIONS_WINDOW_DAYS trailing window (see the fetch function's
+    own docstring), not multi-year, so a window selector implying more
+    history exists than does would be misleading. Returns whatever's
+    actually on disk. security_type ('Bill'/'Note'/'Bond'/'TIPS'/'FRN')
+    lets the frontend chart each security type on its own axis/series,
+    since bid-to-cover and yield scales aren't comparable across types."""
+    return {"success": True, "data": db.get_treasury_auctions(security_type=security_type)}
 
 
 @app.get("/api/refresh/settings")
@@ -1998,6 +2118,22 @@ async def fred_money_supply_refresh():
         dgs10_rows = await _fetch_fred_series(FRED_SERIES_DGS10, observation_start)
         dfii10_rows = await _fetch_fred_series(FRED_SERIES_DFII10, observation_start)
         t10y2y_rows = await _fetch_fred_series(FRED_SERIES_T10Y2Y, observation_start)
+        dgs3mo_rows = await _fetch_fred_series(FRED_SERIES_DGS3MO, observation_start)
+        dgs5_rows = await _fetch_fred_series(FRED_SERIES_DGS5, observation_start)
+        dgs30_rows = await _fetch_fred_series(FRED_SERIES_DGS30, observation_start)
+        wshosho_rows = await _fetch_fred_series(FRED_SERIES_WSHOSHO, observation_start)
+        # Foreign/TIC holdings — 14 country series + 1 grand total, looped
+        # rather than named individually (unlike every series above) purely
+        # because there are too many to reasonably enumerate as separate
+        # local variables. Same fetch/persist/response-dict shape either
+        # way — tic_rows_by_series[series_id] holds each country's own row
+        # list, keyed by the real FRED series_id (not country name), so the
+        # /db route below can look up by series_id the same way every other
+        # series in this response already is.
+        tic_series_ids = {**FRED_SERIES_TIC_COUNTRIES, "_grand_total": FRED_SERIES_TIC_GRAND_TOTAL}
+        tic_rows_by_series = {}
+        for series_id in set(tic_series_ids.values()):
+            tic_rows_by_series[series_id] = await _fetch_fred_series(series_id, observation_start)
         db.upsert_fred_observations(FRED_SERIES_M2, m2_rows)
         db.upsert_fred_observations(FRED_SERIES_WALCL, walcl_rows)
         db.upsert_fred_observations(FRED_SERIES_CPI, cpi_rows)
@@ -2010,6 +2146,12 @@ async def fred_money_supply_refresh():
         db.upsert_fred_observations(FRED_SERIES_DGS10, dgs10_rows)
         db.upsert_fred_observations(FRED_SERIES_DFII10, dfii10_rows)
         db.upsert_fred_observations(FRED_SERIES_T10Y2Y, t10y2y_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS3MO, dgs3mo_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS5, dgs5_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS30, dgs30_rows)
+        db.upsert_fred_observations(FRED_SERIES_WSHOSHO, wshosho_rows)
+        for series_id, rows in tic_rows_by_series.items():
+            db.upsert_fred_observations(series_id, rows)
         db.record_fetch_attempt("money_supply", success=True)
         return {
             "success": True,
@@ -2026,6 +2168,11 @@ async def fred_money_supply_refresh():
                 FRED_SERIES_DGS10: dgs10_rows,
                 FRED_SERIES_DFII10: dfii10_rows,
                 FRED_SERIES_T10Y2Y: t10y2y_rows,
+                FRED_SERIES_DGS3MO: dgs3mo_rows,
+                FRED_SERIES_DGS5: dgs5_rows,
+                FRED_SERIES_DGS30: dgs30_rows,
+                FRED_SERIES_WSHOSHO: wshosho_rows,
+                **tic_rows_by_series,
             },
         }
     except httpx.HTTPError as e:
@@ -2205,6 +2352,20 @@ sources.register(SourceDefinition(
     tables=["treasury_outlays_by_agency"],
     cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
     rate_limit=RateLimitSpec(kind="undocumented", note="Same host/no-key posture as treasury_outlays. Bounded to the most recent 36 months per run (see fetch fn docstring) — one HTTP request per real month, since Table 5's parent/child hierarchy can't be filtered server-side the way Table 1's flat MTH rows can."),
+))
+# Unlike treasury_outlays/treasury_outlays_by_agency's manual_only+
+# fire_at_startup (monthly-cadence upstream, restart-driven refresh is
+# plenty), auctions happen several times a week AND a single auction's own
+# record needs a second fetch days later to pick up settlement results —
+# a real interval cadence is required here, not just a startup fire. Once
+# daily is ample (auctions don't settle intraday).
+TREASURY_AUCTIONS_INTERVAL_S = 86400
+sources.register(SourceDefinition(
+    key="treasury_auctions", label="U.S. Treasury — Auction Results",
+    affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_auctions_tick,
+    tables=["treasury_auctions"],
+    cadence=CadenceSpec(trigger="interval", interval_seconds=TREASURY_AUCTIONS_INTERVAL_S, fire_at_startup=True),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Same host/no-key posture as treasury_outlays. One request per tick, filtered to a rolling 120-day window (auction_date:gte:) via a fields= projection — not a full-history pull."),
 ))
 # cot_pipeline gates on PERSISTED DATA age (CFTC publishes within ~3 days
 # of its as-of date, so report age closely tracks fetch recency) — the
@@ -2485,6 +2646,24 @@ async def fred_money_supply_db(
     dgs10_all = _trim(db.get_fred_observations(FRED_SERIES_DGS10, since))
     dfii10_all = _trim(db.get_fred_observations(FRED_SERIES_DFII10, since))
     t10y2y_all = _trim(db.get_fred_observations(FRED_SERIES_T10Y2Y, since))
+    dgs3mo_all = _trim(db.get_fred_observations(FRED_SERIES_DGS3MO, since))
+    dgs5_all = _trim(db.get_fred_observations(FRED_SERIES_DGS5, since))
+    dgs30_all = _trim(db.get_fred_observations(FRED_SERIES_DGS30, since))
+    # SOMA's own Treasury holdings — same millions-native FRED convention as
+    # WSHOTSL/WSHOMCB/WLCFLPCL (confirmed live, real values in the millions
+    # of USD range), so it goes through the same _millions_to_trillions
+    # conversion as those three, not the yields' passthrough.
+    wshosho_all = _trim(db.get_fred_observations(FRED_SERIES_WSHOSHO, since))
+    # Foreign/TIC holdings — also millions of USD (confirmed live), same
+    # conversion. Keyed by country NAME (not series_id) in the response,
+    # since that's what the frontend chart legend actually needs — the
+    # series_id is an internal FRED/TIC implementation detail the frontend
+    # has no reason to know about.
+    tic_by_country = {
+        country: _millions_to_trillions(_trim(db.get_fred_observations(series_id, since)))
+        for country, series_id in FRED_SERIES_TIC_COUNTRIES.items()
+    }
+    tic_grand_total = _millions_to_trillions(_trim(db.get_fred_observations(FRED_SERIES_TIC_GRAND_TOTAL, since)))
 
     m2_yoy = [r for r in _compute_yoy(m2_all, FRED_M2_YOY_LOOKBACK) if r["date"] >= since]
     walcl_yoy = [r for r in _compute_yoy(walcl_all, FRED_WALCL_YOY_LOOKBACK) if r["date"] >= since]
@@ -2541,6 +2720,27 @@ async def fred_money_supply_db(
             "dgs10": dgs10_all,
             "dfii10": dfii10_all,
             "t10y2y": t10y2y_all,
+            # Added to round out the yield curve beyond 2yr/10yr/real-10yr/
+            # spread — see pipeline/config.py's own comment on why DGS3MO
+            # (not DTB3) was chosen for the 3-month point.
+            "dgs3mo": dgs3mo_all,
+            "dgs5": dgs5_all,
+            "dgs30": dgs30_all,
+            # SOMA Treasury holdings — a subset of wshotsl's own total (the
+            # Fed's System Open Market Account specifically), not a
+            # duplicate figure. Same trillions conversion as wshotsl/wshomcb.
+            "wshosho": _millions_to_trillions(wshosho_all),
+            # Foreign/TIC holdings of long-term U.S. Treasuries, by country.
+            # IMPORTANT: this family EXCLUDES T-bills — tic_grand_total is
+            # real but meaningfully smaller than Treasury's own bills-
+            # inclusive Major Foreign Holders total (confirmed live, ~$7.92T
+            # vs ~$9.37T same month) — see FRED_SERIES_TIC_COUNTRIES' own
+            # comment in pipeline/config.py. Never compare/sum this against
+            # a non-FRED "grand total" from a different source. "Cayman
+            # Islands" is a real SUBSET of "Total Caribbean" (confirmed live,
+            # not a duplicate) — summing both into one total double-counts.
+            "tic_countries": tic_by_country,
+            "tic_grand_total": tic_grand_total,
         },
     }
 

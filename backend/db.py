@@ -231,6 +231,47 @@ CREATE TABLE IF NOT EXISTS treasury_outlays_by_agency (
     PRIMARY KEY (year, month, agency)
 );
 
+-- Treasury auction results (Treasuries-picture expansion) — fiscaldata.
+-- treasury.gov's v1/accounting/od/auctions_query API, same host/no-key
+-- posture as treasury_outlays/treasury_outlays_by_agency but a genuinely
+-- different table shape (per-security-per-auction, not per-month). Upsert
+-- keyed by (cusip, auction_date), NOT append-only — a real record's
+-- lifecycle spans two fetches: it first appears at announcement with every
+-- result field NULL (confirmed live), then the same row gets its results
+-- filled in once the auction settles a few days later. This is neither
+-- "never revises" (append-only's use case) nor pure current-state
+-- (ui_settings' use case) — it's one record completed over time, so upsert
+-- is the correct fit; a later fetch's non-null fields overwrite the
+-- earlier fetch's nulls, and once real values land they don't get revised
+-- again. Nulls over zeros throughout — an unsettled field stays NULL, per
+-- the standing convention, never a fabricated 0.
+CREATE TABLE IF NOT EXISTS treasury_auctions (
+    cusip TEXT NOT NULL,
+    auction_date TEXT NOT NULL,
+    security_type TEXT,
+    security_term TEXT,
+    issue_date TEXT,
+    maturity_date TEXT,
+    high_yield REAL,
+    high_discnt_rate REAL,
+    high_investment_rate REAL,
+    bid_to_cover_ratio REAL,
+    offering_amt REAL,
+    total_tendered REAL,
+    total_accepted REAL,
+    indirect_bidder_tendered REAL,
+    indirect_bidder_accepted REAL,
+    direct_bidder_tendered REAL,
+    direct_bidder_accepted REAL,
+    primary_dealer_tendered REAL,
+    primary_dealer_accepted REAL,
+    soma_tendered REAL,
+    soma_accepted REAL,
+    soma_holdings REAL,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (cusip, auction_date)
+);
+
 -- Front-month vs. next-month COMEX futures settlement spread (Squeeze
 -- Context Story #1, see squeeze-context-spec.md). Sourced from Yahoo
 -- Finance's chart API against real deferred-month contract symbols (e.g.
@@ -1106,6 +1147,57 @@ def get_treasury_outlays_by_agency(since: str | None = None) -> list[dict]:
     for row in result:
         row["date"] = f"{row['year']:04d}-{row['month']:02d}-01"
     return result
+
+
+_TREASURY_AUCTION_COLUMNS = [
+    "cusip", "auction_date", "security_type", "security_term", "issue_date", "maturity_date",
+    "high_yield", "high_discnt_rate", "high_investment_rate", "bid_to_cover_ratio",
+    "offering_amt", "total_tendered", "total_accepted",
+    "indirect_bidder_tendered", "indirect_bidder_accepted",
+    "direct_bidder_tendered", "direct_bidder_accepted",
+    "primary_dealer_tendered", "primary_dealer_accepted",
+    "soma_tendered", "soma_accepted", "soma_holdings",
+]
+
+
+def upsert_treasury_auctions_rows(rows: list[dict]):
+    """Upsert keyed by (cusip, auction_date) — see treasury_auctions' own
+    DDL comment for why this is upsert, not append-only: a real auction
+    record is announced with every result field NULL, then the SAME row is
+    fetched again with results filled in after settlement. COALESCE against
+    the existing row on every result column means a later fetch's NULL
+    (e.g. re-fetching an already-settled auction before its next revision
+    window) never clobbers an already-persisted real value back to NULL —
+    only an incoming non-NULL value overwrites."""
+    with get_conn() as conn:
+        conn.executemany(
+            f"""INSERT INTO treasury_auctions ({", ".join(_TREASURY_AUCTION_COLUMNS)})
+               VALUES ({", ".join(f":{c}" for c in _TREASURY_AUCTION_COLUMNS)})
+               ON CONFLICT (cusip, auction_date) DO UPDATE SET
+                   {", ".join(f"{c} = COALESCE(excluded.{c}, treasury_auctions.{c})" for c in _TREASURY_AUCTION_COLUMNS if c not in ("cusip", "auction_date"))},
+                   fetched_at = datetime('now')""",
+            rows,
+        )
+
+
+def get_treasury_auctions(security_type: str | None = None, since: str | None = None) -> list[dict]:
+    """Rows ordered oldest-to-newest by auction_date. security_type filters
+    to e.g. 'Note'/'Bond'/'Bill'/'TIPS'/'FRN' — the frontend charts these
+    separately since bid-to-cover/yield scales differ meaningfully by
+    security type (a bill's bid-to-cover isn't comparable to a 30-year
+    bond's on the same axis)."""
+    query = "SELECT * FROM treasury_auctions WHERE 1=1"
+    params: list = []
+    if security_type is not None:
+        query += " AND security_type = ?"
+        params.append(security_type)
+    if since is not None:
+        query += " AND auction_date >= ?"
+        params.append(since)
+    query += " ORDER BY auction_date"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_latest_census_trade_period() -> str | None:
