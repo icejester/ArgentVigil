@@ -1,16 +1,24 @@
 import { useState, useEffect } from "react";
 
 // Backend owns the actual refresh cadence (two tiers: fast for spot prices —
-// feeds the CoT panel's Paper Leverage cards — and slow for everything else,
-// mostly Stock & Flow's exchange-inventory data — see main.py's lifespan
-// background tasks). Both tiers default OFF server-side: startup does one
-// fetch to populate the DB, then each tier stays idle until toggled on here
-// (or the user hits Force update). This control reads/writes that
-// server-side setting. App-level (not scoped to one panel) since the two
-// tiers span both the CoT and Stock & Flow panels.
+// feeds the CoT panel's Paper Leverage cards — and slow for every other
+// interval-triggered source, mostly Stock & Flow's exchange-inventory data
+// plus the FRED/Treasury/LBMA/Census sources — see main.py's lifespan
+// background tasks). Both tiers default ON server-side as of the
+// per-source-cadence pass (previously slow defaulted OFF) — the user runs
+// AV continuously and expects local data to track upstream on its own.
+// "Fast" still has one real shared interval to tune (spot prices' own
+// polling rate); "Slow" no longer does — every slow-tier source now owns
+// its own real interval_seconds reflecting its own upstream cadence (see
+// each source's own CadenceSpec / the Data tab's per-source card for the
+// actual number), so this panel only offers an enable/disable toggle for
+// Slow, not an interval selector — hand-tuning one source's own cadence
+// happens via the Data tab's per-source interval override
+// (POST /api/data-sources/{key}/interval), not here. This control
+// reads/writes /api/refresh/settings. App-level (not scoped to one panel)
+// since the two tiers span every tab, not just one.
 
 const INTERVAL_OPTIONS_FAST = [30, 60, 120, 300];
-const INTERVAL_OPTIONS_SLOW = [300, 600, 1200, 1800, 3600];
 
 // Dispatched on window after a successful force-update so panels can re-fetch
 // their own /db data immediately instead of waiting for their next poll tick.
@@ -97,17 +105,8 @@ export default function RefreshControls() {
             disabled={saving}
             onChange={(e) => updateSetting("slow_enabled", e.target.checked)}
           />
-          Macro
+          Macro (each source on its own cadence — see Data tab)
         </label>
-        <select
-          value={settings.slow_interval_s}
-          disabled={saving}
-          onChange={(e) => updateSetting("slow_interval_s", Number(e.target.value))}
-        >
-          {INTERVAL_OPTIONS_SLOW.map((s) => (
-            <option key={s} value={s}>every {Math.round(s / 60)}min</option>
-          ))}
-        </select>
       </div>
       <div className="refresh-controls-row">
         <button className="refresh-controls-force" onClick={forceUpdate} disabled={forcing}>

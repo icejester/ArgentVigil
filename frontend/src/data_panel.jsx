@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { DATA_EDITORIAL } from "./data_editorial";
+import RefreshControls from "./refresh_controls";
 
 const COT_MIN_REFRESH_DAYS = 7;
 
@@ -24,7 +25,10 @@ function CopyButton({ text }) {
   );
 }
 
-function timeAgo(iso) {
+// Exported so chart_staleness.jsx's ChartStaleness badge (per-sub-panel
+// freshness, spread across every tab) can share this exact formatting
+// instead of a second copy.
+export function timeAgo(iso) {
   if (!iso) return null;
   const diffMs = Date.now() - new Date(iso).getTime();
   const mins = Math.floor(diffMs / 60000);
@@ -299,12 +303,18 @@ function SourceCard({ editorial, operationalBySourceKey, health, onRefreshed }) 
 }
 
 // Tier-level summary (Story #9) — sits above the per-source card list.
-// Reads the existing /api/refresh/settings for enabled/interval, and rolls
+// Reads the existing /api/refresh/settings for enabled state, and rolls
 // up per-source health (grouped by /api/health/db's server-derived `tier`
 // field, computed from backend/sources.py's CadenceSpec — see
 // SourceDefinition.tier) into a "healthy/total" count per tier. Summary
-// only, no controls — the tier enable/disable toggles were removed along
-// with refresh_controls.jsx's UI panel and are not reintroduced here.
+// only — RefreshControls (re-mounted in App.jsx as of the per-source-
+// cadence pass) owns the actual toggle/force-update controls; this stays a
+// read-only rollup. "Slow" no longer has one shared interval to display —
+// each slow-tier source now owns its own real interval_seconds reflecting
+// its own upstream cadence (see each SourceCard's own cadence row below
+// for the per-source number) — so this row shows enabled/disabled only,
+// same as it always did for "Fast" conceptually, just without a single
+// number that could ever have represented all of "slow" accurately.
 function TieredLoopSummary({ health }) {
   const [settings, setSettings] = useState(null);
 
@@ -343,7 +353,7 @@ function TieredLoopSummary({ health }) {
       <div className="data-health-summary-row">
         <span className="data-health-summary-tier">Slow</span>
         <span className="data-health-summary-state">
-          {settings.slow_enabled ? `enabled, every ${settings.slow_interval_s}s` : "disabled (startup-only fetch)"}
+          {settings.slow_enabled ? "enabled — each source on its own real cadence, see cards below" : "disabled (startup-only fetch)"}
         </span>
         <span className="data-health-summary-rollup">{slow.healthy}/{slow.total} healthy</span>
       </div>
@@ -404,6 +414,7 @@ export default function DataPanel() {
           rate-limit registry each card's operational rows below are read from.
         </div>
         <TieredLoopSummary health={health} />
+        <RefreshControls />
         {DATA_EDITORIAL.map((editorial) => (
           <SourceCard
             key={editorial.key}

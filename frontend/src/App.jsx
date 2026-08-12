@@ -6,6 +6,7 @@ import MoneySupply from "./money_supply";
 import CatcorPanel from "./catcor_panel";
 import DataPanel, { computeStatus } from "./data_panel";
 import ResearchPanel from "./research_panel";
+import { HealthProvider, useHealthRows } from "./health_context";
 
 const SECTIONS = [
   { key: "cot", label: "Trading" },
@@ -16,44 +17,28 @@ const SECTIONS = [
   { key: "data", label: "Data" },
 ];
 
-const HEALTH_POLL_INTERVAL_MS = 60000;
-
 // Small passive-visibility dot (Story #7) — red if any tracked source is
 // erroring, yellow if any is stale with no errors, green otherwise. Links
 // nowhere; the Data tab nav button is already one click away for the
 // per-source drill-down (Decision 4). Shares data_panel.jsx's exported
 // computeStatus rather than re-implementing the same ok/stale/error rule
-// inline (a real duplication that existed before this fix) — its numeric
-// threshold (expected_interval_s) now ships directly on each /api/health/db
-// row (derived server-side from backend/sources.py's CadenceSpec), so this
-// component no longer needs a separate static import for that number at all.
+// inline (a real duplication that existed before this fix). As of the
+// per-source-cadence pass, also shares health_context.jsx's single polled
+// HealthProvider (via useHealthRows with no sourceKey filter — every row)
+// rather than its own independent 60s poll of /api/health/db, since
+// per-sub-panel ChartStaleness badges now poll the same route too and a
+// second independent poll here would be pure duplication.
 function HeaderHealthDot() {
-  const [status, setStatus] = useState(null);
-
-  useEffect(() => {
-    const poll = () => {
-      fetch("/api/health/db")
-        .then((r) => r.json())
-        .then((j) => {
-          const rows = Object.values(j.sources ?? {});
-          let worst = "ok";
-          for (const row of rows) {
-            const rowStatus = computeStatus(row, row.expected_interval_s);
-            if (rowStatus === "error") worst = "error";
-            else if (rowStatus === "stale" && worst !== "error") worst = "stale";
-          }
-          setStatus(worst);
-        })
-        .catch(() => {});
-    };
-    poll();
-    const id = setInterval(poll, HEALTH_POLL_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, []);
-
-  if (!status) return null;
-  const color = status === "error" ? "#e0555c" : status === "stale" ? "#d9a441" : "#4caf76";
-  return <span className="header-health-dot" style={{ background: color }} title={`Data health: ${status}`} />;
+  const { rows } = useHealthRows(null);
+  if (rows.length === 0) return null;
+  let worst = "ok";
+  for (const row of rows) {
+    const rowStatus = computeStatus(row, row.expected_interval_s);
+    if (rowStatus === "error") worst = "error";
+    else if (rowStatus === "stale" && worst !== "error") worst = "stale";
+  }
+  const color = worst === "error" ? "#e0555c" : worst === "stale" ? "#d9a441" : "#4caf76";
+  return <span className="header-health-dot" style={{ background: color }} title={`Data health: ${worst}`} />;
 }
 
 const TICKER_POLL_INTERVAL_MS = 60000; // same cadence as HeaderHealthDot — the fast tier's own 60s cadence, no point polling faster than new ticks can actually arrive
@@ -220,7 +205,7 @@ export default function App() {
   }
 
   return (
-    <>
+    <HealthProvider>
       <div className="app-shell">
         <div className="app-header app-header--split">
           <div>
@@ -309,6 +294,6 @@ export default function App() {
       >
         <DataPanel />
       </div>
-    </>
+    </HealthProvider>
   );
 }

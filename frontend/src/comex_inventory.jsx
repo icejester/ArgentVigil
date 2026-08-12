@@ -21,6 +21,7 @@ import TradeFlowPanel from "./trade_flow_panel";
 import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { nearestRowDate } from "./date_utils";
+import ChartStaleness from "./chart_staleness";
 
 const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
 
@@ -598,7 +599,10 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv, sfWindow, sfCusto
 
   return (
     <details className="collapsible-pane" open>
-      <summary className="collapsible-pane-title">Silver Inventory — Exchange Reserves</summary>
+      <summary className="collapsible-pane-title">
+        <ChartStaleness sourceKey={["comex_silver_history", "shfe_silver_history", "pslv"]} />
+        <span>Silver Inventory — Exchange Reserves</span>
+      </summary>
       <div className="collapsible-pane-body">
         <div className="comex-panel">
       {hasData ? (
@@ -1353,7 +1357,8 @@ export default function ComexInventoryDashboard() {
 
           <details className="collapsible-pane">
             <summary className="collapsible-pane-title">
-              COMEX — New York
+              <ChartStaleness sourceKey={comexMetal === "XAU" ? "comex_gold_depositories" : "comex_silver_depositories"} />
+              <span>COMEX — New York</span>
               <select
                 value={comexMetal}
                 onChange={(e) => setComexMetal(e.target.value)}
@@ -1375,7 +1380,16 @@ export default function ComexInventoryDashboard() {
                 onPin={handlePin}
               />
               <details className="collapsible-pane">
-                <summary className="collapsible-pane-title">Delivery Behavior</summary>
+                <summary className="collapsible-pane-title">
+                  <ChartStaleness
+                    sourceKey={
+                      comexMetal === "XAU"
+                        ? ["comex_gold_history", "gold_delivery_notices"]
+                        : ["comex_silver_history", "delivery_notices"]
+                    }
+                  />
+                  <span>Delivery Behavior</span>
+                </summary>
                 <div className="collapsible-pane-body">
                   <DeliveryBehaviorPanel
                     metal={comexMetal}
@@ -1388,7 +1402,10 @@ export default function ComexInventoryDashboard() {
                 </div>
               </details>
               <details className="collapsible-pane">
-                <summary className="collapsible-pane-title">Delivery Notices — Month to Date</summary>
+                <summary className="collapsible-pane-title">
+                  <ChartStaleness sourceKey="delivery_notices" />
+                  <span>Delivery Notices — Month to Date</span>
+                </summary>
                 <div className="collapsible-pane-body">
                   <DeliveryNoticesPanel delivery={delivery} />
                 </div>
@@ -1398,7 +1415,8 @@ export default function ComexInventoryDashboard() {
 
           <details className="collapsible-pane">
             <summary className="collapsible-pane-title">
-              SHFE — Shanghai
+              <ChartStaleness sourceKey={shfeMetal === "XAU" ? "shfe_gold_warehouses" : "shfe_warehouses"} />
+              <span>SHFE — Shanghai</span>
               <select
                 value={shfeMetal}
                 onChange={(e) => setShfeMetal(e.target.value)}
@@ -1421,7 +1439,8 @@ export default function ComexInventoryDashboard() {
               />
               <details className="collapsible-pane">
                 <summary className="collapsible-pane-title">
-                  {shfeMetal === "XAU" ? "SHFE Gold Inventory (Shanghai)" : "SHFE Silver Inventory (Shanghai)"}
+                  <ChartStaleness sourceKey={shfeMetal === "XAU" ? "shfe_gold_history" : "shfe_silver_history"} />
+                  <span>{shfeMetal === "XAU" ? "SHFE Gold Inventory (Shanghai)" : "SHFE Silver Inventory (Shanghai)"}</span>
                 </summary>
                 <div className="collapsible-pane-body">
                   <ShfeHistoryPanel
@@ -1452,14 +1471,20 @@ export default function ComexInventoryDashboard() {
           </details>
 
           <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">Global Context</summary>
+            <summary className="collapsible-pane-title">
+              <ChartStaleness sourceKey={["comex_silver_history", "shfe_silver_history", "pslv"]} />
+              <span>Global Context</span>
+            </summary>
             <div className="collapsible-pane-body">
               <GlobalSilverPanel comexHistory={history} shfeHistory={shfeHistory} pslv={pslv} />
             </div>
           </details>
 
           <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">Trade Flow</summary>
+            <summary className="collapsible-pane-title">
+              <ChartStaleness sourceKey="census_trade" />
+              <span>Trade Flow</span>
+            </summary>
             <div className="collapsible-pane-body">
               <TradeFlowPanel />
             </div>

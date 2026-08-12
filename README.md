@@ -1,4 +1,4 @@
-# ArgentVigil v2.0.0
+# ArgentVigil v2.1.1
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -38,7 +38,7 @@ A workbench for testing one claim at a time — "SLV shorts are covering," "indu
 
 #### Data
 
-Provenance and health. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. This panel is held to a strict rule: any change to what the app stores or fetches must land a matching Data-tab update in the same change — enforced by the test suite, not by memory.
+Provenance and health. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. Every source that recurs on its own now does so at its own real upstream cadence — daily for exchange-inventory data, weekly/monthly for slower macro sources — rather than one shared polling interval, and that same freshness readout follows the data itself: every tab's sub-panels carry their own compact "how stale is this, refresh now" badge, not just the Data tab. This panel is held to a strict rule: any change to what the app stores or fetches must land a matching Data-tab update in the same change — enforced by the test suite, not by memory.
 
 ### Where does the data come from, and why?
 

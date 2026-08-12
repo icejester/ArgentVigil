@@ -38,6 +38,11 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   transition: transform 0.15s ease;
 }
 .collapsible-pane[open] > .collapsible-pane-title::before { transform: rotate(90deg); }
+/* When a ChartStaleness glyph stands in as the row's own collapse marker
+   (chart_staleness.jsx's --marker variant), suppress the default ▸ arrow —
+   the glyph carries that same rotate-on-open signal itself instead of
+   showing both. */
+.collapsible-pane-title:has(.chart-staleness--marker)::before { content: none; }
 .collapsible-pane-body {
   display: flex; flex-direction: column; gap: 20px;
   padding: 0 16px 16px;
@@ -142,6 +147,74 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   padding: 4px 8px;
   display: inline-block;
 }
+
+/* Per-sub-panel staleness indicator (chart_staleness.jsx) — a small
+   circled-info glyph, colored by status, that reveals a popover
+   (last-updated + refresh button) on hover/focus. Positioned relative so
+   the popover can float below it without disturbing the <summary> row's
+   own layout. The --marker variant sits first in the row, replacing the
+   default ▸ collapse arrow (suppressed via the :has() rule above) — order:
+   1 (first-child) plus a right margin instead of .staleness-label's own
+   margin-left: auto right-alignment, and it carries the arrow's
+   rotate-on-open animation itself so that signal isn't lost. */
+.chart-staleness {
+  position: relative;
+  display: inline-flex;
+}
+.chart-staleness--marker {
+  order: -1;
+  margin-right: 4px;
+}
+.chart-staleness-glyph {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%; font-size: 17px;
+  font-style: normal; cursor: default; line-height: 1;
+  border: 1px solid transparent;
+}
+/* Gray = fine, nothing to look at. Yellow = stale, but the source's own
+   gate explains why (e.g. CoT hasn't published a new weekly report yet).
+   Red = stale with no such explanation — an error, or overdue with no
+   skip ever recorded. Deliberately distinct palette from computeStatus's
+   ok/stale/error (green/amber/red) used elsewhere (Data tab,
+   HeaderHealthDot) — gray-as-the-good-state is specific to this glyph. */
+.chart-staleness-glyph--fine { color: #6b7488; }
+.chart-staleness-glyph--explained-stale { color: #d9a441; }
+.chart-staleness-glyph--unexplained-stale { color: #e0555c; }
+.chart-staleness-glyph--unknown { color: #6b7488; }
+.chart-staleness-glyph:hover,
+.chart-staleness-glyph:focus { outline: none; border-color: currentColor; }
+
+.chart-staleness-popover {
+  position: absolute; top: 100%; left: 0; margin-top: 4px; z-index: 20;
+  width: max-content; max-width: min(280px, calc(100vw - 32px));
+  background: #161a24; border: 1px solid #2e3547;
+  border-radius: 6px; padding: 8px 10px; box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+  font-size: 11px; color: #c8d0de; text-align: left;
+  display: flex; flex-direction: column; gap: 6px;
+  opacity: 0; visibility: hidden; transform: translateY(-2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  pointer-events: none;
+}
+.chart-staleness:hover .chart-staleness-popover,
+.chart-staleness:focus-within .chart-staleness-popover {
+  opacity: 1; visibility: visible; transform: translateY(0);
+  pointer-events: auto;
+}
+.chart-staleness-popover-label { font-weight: 600; color: #8a94a6; }
+.chart-staleness-popover-row { white-space: normal; }
+.chart-staleness-popover-error { color: #e0555c; }
+.chart-staleness-refresh { align-self: flex-start; padding: 2px 8px; font-size: 10px; }
+
+/* One block per underlying source_key — definition + that source's own
+   last-sync time. A single-source badge (the common case) gets one block
+   with no extra visual weight; a multi-source badge (e.g. leverage + curve
+   spread) gets a divider between blocks so each source's own identity/
+   timestamp stays legible rather than blending together. */
+.chart-staleness-popover-source { display: flex; flex-direction: column; gap: 3px; }
+.chart-staleness-popover-source + .chart-staleness-popover-source {
+  padding-top: 6px; border-top: 1px solid #2e3547;
+}
+.chart-staleness-popover-source-name { font-weight: 600; color: #c8d0de; }
 
 /* ── Signal banner ── */
 .signal-banner {

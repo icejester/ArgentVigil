@@ -433,7 +433,8 @@ CREATE TABLE IF NOT EXISTS research_log (
 
 CREATE TABLE IF NOT EXISTS ui_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    pinned_section TEXT
+    pinned_section TEXT,
+    refresh_enabled INTEGER
 );
 """
 
@@ -527,6 +528,17 @@ def init_db():
                 conn.execute(stmt)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # refresh_enabled: whether the interval-triggered scheduler tier
+        # runs at all, persisted so the user's choice survives a restart
+        # (previously in-memory-only, _refresh_settings, which silently
+        # reset to the hardcoded default on every reboot). NULL means
+        # "never set" — main.py falls back to True (its own hardcoded
+        # default) rather than treating NULL as False, same as
+        # get_pinned_section()'s None-means-unset convention below.
+        try:
+            conn.execute("ALTER TABLE ui_settings ADD COLUMN refresh_enabled INTEGER")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def upsert_aggregate_rows(rows: list[dict]):
@@ -1760,6 +1772,29 @@ def get_pinned_section() -> str | None:
     with get_conn() as conn:
         row = conn.execute("SELECT pinned_section FROM ui_settings WHERE id = 1").fetchone()
         return row["pinned_section"] if row else None
+
+
+def set_refresh_enabled(enabled: bool):
+    """Whether the interval-triggered scheduler tier runs at all — same
+    single-row-upsert convention as set_pinned_section above, so the
+    user's choice survives a backend restart instead of resetting to
+    main.py's hardcoded in-memory default."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO ui_settings (id, refresh_enabled) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET refresh_enabled = excluded.refresh_enabled",
+            (1 if enabled else 0,),
+        )
+
+
+def get_refresh_enabled() -> bool | None:
+    """None means never explicitly set — caller falls back to its own
+    default rather than treating None as False."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT refresh_enabled FROM ui_settings WHERE id = 1").fetchone()
+        if row is None or row["refresh_enabled"] is None:
+            return None
+        return bool(row["refresh_enabled"])
 
 
 def record_fetch_attempt(source_key: str, success: bool, error: str | None = None, skipped: bool = False):
