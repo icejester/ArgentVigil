@@ -1,4 +1,4 @@
-# ArgentVigil v1.35.0
+# ArgentVigil v2.1.1
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -22,7 +22,7 @@ The paper market. Weekly CFTC Commitment of Traders positioning for COMEX silver
 
 #### Money Supply ("Dollars and Sense")
 
-The denominator side of every metals chart. M2 money stock with the Fed's balance sheet (WALCL) drawn as the share of M2 it represents; a look inside that balance sheet split correctly into **assets** (Treasuries, MBS, discount-window lending) and **liabilities** (bank reserves, reverse repo) — two sides of one balance sheet, never summed together; a weekly **QE/QT momentum** view (is the balance sheet growing or shrinking, week by week, against its level); and a **purchasing-power race** — $100 of fiat vs. gold vs. silver vs. CPI-adjusted dollars since 2006, rebased against any baseline you pick. If the metals panels ask "is silver moving," this panel asks "or is the yardstick shrinking?"
+The denominator side of every metals chart. M2 money stock with the Fed's balance sheet (WALCL) drawn as the share of M2 it represents; a look inside that balance sheet split correctly into **assets** (Treasuries, MBS, discount-window lending) and **liabilities** (bank reserves, reverse repo) — two sides of one balance sheet, never summed together; a weekly **QE/QT momentum** view (is the balance sheet growing or shrinking, week by week, against its level); the federal fiscal picture — monthly **outlays/receipts/deficit** topline and by department, **Treasury auction** bid-to-cover and buyer mix, and **foreign holdings of U.S. Treasuries** by country; the Treasury yield curve; and a **purchasing-power race** — $100 of fiat vs. gold vs. silver vs. CPI-adjusted dollars since 2006, rebased against any baseline you pick. If the metals panels ask "is silver moving," this panel asks "or is the yardstick shrinking, and who's still buying the debt that shrinks it?"
 
 #### Inventory ("Stock & Flow")
 
@@ -38,7 +38,7 @@ A workbench for testing one claim at a time — "SLV shorts are covering," "indu
 
 #### Data
 
-Provenance and health. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. This panel is held to a strict rule: any change to what the app stores or fetches must land a matching Data-tab update in the same change — enforced by the test suite, not by memory.
+Provenance and health. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. Every source that recurs on its own now does so at its own real upstream cadence — daily for exchange-inventory data, weekly/monthly for slower macro sources — rather than one shared polling interval, and that same freshness readout follows the data itself: every tab's sub-panels carry their own compact "how stale is this, refresh now" badge, not just the Data tab. This panel is held to a strict rule: any change to what the app stores or fetches must land a matching Data-tab update in the same change — enforced by the test suite, not by memory.
 
 ### Where does the data come from, and why?
 
@@ -101,7 +101,9 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
 | PSLV holdings | Sprott direct API | Daily (slow tier) |
 | Spot prices (XAG / XAU) | metalcharts.org | Intraday (fast tier) |
 | LBMA fix (gold AM, silver daily) | GoldAPI.io (free tier) | Startup + manual re-run |
-| M2, Fed balance sheet + composition, CPI | FRED (M2SL, WALCL, WRESBAL, RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL, CPIAUCSL) | Monthly / Weekly |
+| M2, Fed balance sheet + composition, Treasury yields, foreign Treasury holdings by country, CPI | FRED (M2SL, WALCL, WRESBAL, RRPONTSYD, WSHOTSL, WSHOMCB, WLCFLPCL, CPIAUCSL, DGS*/DFII10/T10Y2Y, FORLTTREASPOS*) | Monthly / Weekly |
+| Federal outlays/receipts/deficit, topline + by department | fiscaldata.treasury.gov Monthly Treasury Statement | Startup + manual re-run |
+| Treasury auction bid-to-cover + buyer mix | Treasury Auctions Query API | Startup + manual re-run |
 | Macro event actuals (CPI, NFP) | ALFRED (FRED's point-in-time vintage API) | Per release |
 | Macro event consensus | ForexFactory free calendar feed | Cached weekly (current Sun–Sat week only) |
 | Event-window price reactions (XAG / XAU) | Yahoo Finance intraday (5-min bars) / daily close fallback | Per event |

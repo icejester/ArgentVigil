@@ -20,6 +20,7 @@ import {
 } from "recharts";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
+import ChartStaleness from "./chart_staleness";
 
 const CATEGORY_LABELS = {
   producer_merchant: "Producer/Merchant",
@@ -1316,6 +1317,7 @@ export default function SilverCoTTracker() {
             <summary className="collapsible-pane-title">
               <span>CoT Positioning &amp; Gold/Silver Ratio</span>
               <StalenessLabel cotAsOfDate={data.cot_as_of_date} />
+              <ChartStaleness sourceKey="cot_pipeline" />
             </summary>
             <div className="collapsible-pane-body">
               <CombinedChart
@@ -1339,6 +1341,7 @@ export default function SilverCoTTracker() {
               <span>Silver</span>
               <SpotPriceBadge metal="silver" />
               <MetalCurrentReadout metal="silver" compact />
+              <ChartStaleness sourceKey={["silver_leverage", "futures_curve_spread"]} />
             </summary>
             <div className="collapsible-pane-body">
               <MetalLeverageCurveVolumeChart
@@ -1356,6 +1359,7 @@ export default function SilverCoTTracker() {
               <span>Gold</span>
               <SpotPriceBadge metal="gold" />
               <MetalCurrentReadout metal="gold" compact />
+              <ChartStaleness sourceKey={["gold_leverage", "futures_curve_spread"]} />
             </summary>
             <div className="collapsible-pane-body">
               <MetalLeverageCurveVolumeChart
@@ -1369,7 +1373,10 @@ export default function SilverCoTTracker() {
           </details>
 
           <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">Who's Holding Long Positions</summary>
+            <summary className="collapsible-pane-title">
+              <span>Who's Holding Long Positions</span>
+              <ChartStaleness sourceKey="cot_pipeline" />
+            </summary>
             <div className="collapsible-pane-body">
               <CategoryCompositionPanel
                 since={customRangeIncomplete ? null : effectiveSince}

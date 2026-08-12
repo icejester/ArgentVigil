@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { nearestRowDate } from "./date_utils";
 import { VAULT_COLORS } from "./palette";
+import ChartStaleness from "./chart_staleness";
 import {
   ComposedChart,
   LineChart,
@@ -160,16 +161,6 @@ function mergeAuctionsByType(auctionRows) {
     row[r.security_type] = r.bid_to_cover_ratio;
   }
   return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
-}
-
-// M2SL is monthly with a ~4-6wk publication lag; WALCL is weekly with only a
-// few days' lag. Different thresholds reflect each series' own normal cadence.
-const M2_STALE_DAYS = 45;
-const WALCL_STALE_DAYS = 10;
-
-function daysSince(dateStr) {
-  if (!dateStr) return null;
-  return Math.floor((Date.now() - new Date(dateStr)) / 86400000);
 }
 
 function fmtTrillions(v) {
@@ -2008,27 +1999,6 @@ export default function MoneySupply() {
 
   const m2Latest = data?.m2?.length ? data.m2[data.m2.length - 1].date : null;
   const walclLatest = data?.walcl?.length ? data.walcl[data.walcl.length - 1].date : null;
-  const m2Stale = daysSince(m2Latest) > M2_STALE_DAYS;
-  const walclStale = daysSince(walclLatest) > WALCL_STALE_DAYS;
-  const m2LatestValue = data?.m2?.length ? data.m2[data.m2.length - 1].value_trillions : null;
-  // Last row with a real walcl_pct_m2 reading — not necessarily the very
-  // last row of `merged`, since that field goes null past whichever of
-  // M2/WALCL's own real coverage ends first (see mergeSeries' forward-fill
-  // cap).
-  const lastPctRow = [...merged].reverse().find((r) => r.walcl_pct_m2 != null);
-  // Every collapsible sub-panel's summary line should reflect the pinned
-  // date when one's set, and only fall back to "latest reasonable data"
-  // when nothing's pinned — a standing rule the user asked to apply across
-  // every section, not just the ones that already had per-pin logic. For
-  // M2/WALCL specifically: when pinned, use that chart's own snapped row
-  // (pinnedDateMerged) for both the M2 value and the WALCL-%-of-M2 value;
-  // when not pinned, keep the existing "latest real reading" fallbacks
-  // above (m2LatestValue/lastPctRow) rather than the merged array's literal
-  // last row, since M2/WALCL frequently have different real coverage ends.
-  const m2SummaryRow = pinnedDateMerged ? merged.find((r) => r.date === pinnedDateMerged) : null;
-  const m2SummaryValue = m2SummaryRow ? m2SummaryRow.m2 : m2LatestValue;
-  const m2SummaryPct = m2SummaryRow ? m2SummaryRow.walcl_pct_m2 : lastPctRow?.walcl_pct_m2;
-  const m2SummaryDate = m2SummaryRow ? m2SummaryRow.date : null;
 
   return (
     <div className="comex-panel">
@@ -2100,15 +2070,14 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={m2PanelOpen} onToggle={(e) => setM2PanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        M2 Money Stock / Fed Balance Sheet
-        {m2SummaryValue != null && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
-            {m2SummaryDate && `${m2SummaryDate} · `}
-            M2 {fmtTrillions(m2SummaryValue)}
-            {m2SummaryPct != null && ` · Fed Balance Sheet ${fmtPct(m2SummaryPct)} of M2`}
-            {!pinnedDate && (m2Stale || walclStale) && <span style={{ color: LOSS_COLOR }}> ⚠ stale</span>}
-          </span>
-        )}
+        <ChartStaleness
+          sourceKey="money_supply"
+          detail={[
+            <>M2: {m2Latest ?? "unknown"} (monthly)</>,
+            <>Balance sheet: {walclLatest ?? "unknown"} (weekly)</>,
+          ]}
+        />
+        <span>M2 Money Stock / Fed Balance Sheet</span>
       </summary>
       {m2PanelOpen && (
       <div className="collapsible-pane-body">
@@ -2117,14 +2086,6 @@ export default function MoneySupply() {
         thresholds, no predictions. Click a point on any chart in this panel to highlight that
         date (and its values) on all of them; click the 📌 pinned-date button above to clear it.
       </div>
-      {(m2Stale || walclStale) && (
-        <div className="comex-freshness comex-freshness--stale">
-          ⚠ Stale —{" "}
-          {m2Stale && `M2 last reported ${m2Latest}${m2LatestValue != null ? ` (${fmtTrillions(m2LatestValue)})` : ""} (FRED publishes monthly, ~4-6wk lag)`}
-          {m2Stale && walclStale && "; "}
-          {walclStale && `Fed Balance Sheet last reported ${walclLatest}${lastPctRow ? ` (${fmtPct(lastPctRow.walcl_pct_m2)} of M2)` : ""} (published weekly)`}
-        </div>
-      )}
 
       {loading && !data ? (
         <div className="comex-empty">Loading…</div>
@@ -2262,7 +2223,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={compositionPanelOpen} onToggle={(e) => setCompositionPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        Fed Balance Sheet Composition
+        <ChartStaleness sourceKey="money_supply" />
+        <span>Fed Balance Sheet Composition</span>
         {compositionPieRow?.assetsLiabilitiesRatio != null && (
           <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
             {pinnedDate && `${compositionPieRow.date} · `}
@@ -2545,7 +2507,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={outlaysPanelOpen} onToggle={(e) => setOutlaysPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        Federal Outlays{outlaysView === "byAgency" ? " by Department/Agency" : ""}
+        <ChartStaleness sourceKey={["treasury_outlays", "treasury_outlays_by_agency"]} />
+        <span>Federal Outlays{outlaysView === "byAgency" ? " by Department/Agency" : ""}</span>
         {outlaysView === "topline" && outlaysMerged.length > 0 && (
           <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
             {(() => {
@@ -2924,7 +2887,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={qeQtPanelOpen} onToggle={(e) => setQeQtPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        QE / QT
+        <ChartStaleness sourceKey="money_supply" />
+        <span>QE / QT</span>
         {(() => {
           const row = pinnedDate
             ? qeQtRows.find((r) => r.date === pinnedDateQeQt)
@@ -3060,7 +3024,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={yieldsPanelOpen} onToggle={(e) => setYieldsPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        Treasury Yields
+        <ChartStaleness sourceKey="money_supply" />
+        <span>Treasury Yields</span>
         {yieldsMerged.length > 0 && (
           <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
             {(() => {
@@ -3196,7 +3161,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={auctionsPanelOpen} onToggle={(e) => setAuctionsPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        Treasury Auctions
+        <ChartStaleness sourceKey="treasury_auctions" />
+        <span>Treasury Auctions</span>
         {auctionsMerged.length > 0 && (
           <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
             {(() => {
@@ -3401,7 +3367,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={ticPanelOpen} onToggle={(e) => setTicPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        Foreign Holdings of U.S. Treasuries
+        <ChartStaleness sourceKey="money_supply" />
+        <span>Foreign Holdings of U.S. Treasuries</span>
         {ticMerged.length > 0 && (
           <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
             {(() => {
@@ -3607,7 +3574,8 @@ export default function MoneySupply() {
 
       <details className="collapsible-pane" open={metalsPanelOpen} onToggle={(e) => setMetalsPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">
-        Dollars vs Silver vs Gold as Purchasing Power
+        <ChartStaleness sourceKey={["metals_prices", "money_supply"]} />
+        <span>Dollars vs Silver vs Gold as Purchasing Power</span>
         {(() => {
           const row = pinnedDate
             ? metalsMerged.find((r) => r.date === pinnedDateMetals)

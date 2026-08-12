@@ -155,18 +155,28 @@ RECOVERABLE_STOCK_HIGH_OZ = 17_000_000_000
 
 _client: httpx.AsyncClient | None = None
 
-# Tiered background refresh: fast tier = genuinely intraday data (spot prices);
-# slow tier = everything else main.py manages (moves at most daily upstream).
-# Fast tier defaults ON at 60s (spot prices are cheap and genuinely move
-# intraday); slow tier defaults OFF — startup does one fetch to populate the
-# DB either way, then slow tier's recurring loop stays idle until the user
-# opts in (or hits Force update). Interval/enabled state is in-memory only —
-# a restart re-triggers the one-time startup refresh anyway.
+# Tiered background refresh: fast tier = genuinely intraday data (spot
+# prices, the one source with a real shared tunable interval); slow tier =
+# every other trigger="interval" source, each now registered with its own
+# real interval_seconds reflecting its own upstream cadence (~25h for the
+# 14 daily exchange-inventory sources, weekly/monthly for the FRED/Treasury/
+# LBMA/Census sources — see each SourceDefinition's own comment) rather
+# than one shared _refresh_settings value. "slow_enabled" is now a single
+# master on/off switch for every interval-triggered source outside the
+# fast tier, not a shared interval to tune — there's no longer one number
+# that applies to all of them. Both default ON: fast tier because spot
+# prices are cheap and genuinely move intraday (unchanged); slow tier
+# because the user runs AV continuously and expects local data to track
+# upstream on its own, not go stale between manual force-refreshes.
+# fast_enabled/slow_enabled are seeded from ui_settings.refresh_enabled in
+# lifespan (persisted — a restart no longer silently reverts the user's
+# choice, unlike before this change, when this whole dict was in-memory
+# only). fast_interval_s stays a real tunable; there's no slow_interval_s
+# anymore, since each slow-tier source owns its own cadence now.
 _refresh_settings = {
     "fast_interval_s": 60,
-    "slow_interval_s": 1200,
     "fast_enabled": True,
-    "slow_enabled": False,
+    "slow_enabled": True,
 }
 _refresh_tasks: list[asyncio.Task] = []
 # Tracks which trigger="manual_only", fire_at_startup=True sources have
@@ -191,6 +201,9 @@ async def lifespan(app: FastAPI):
     global _client
     db.init_db()
     _interval_overrides.update(db.get_interval_overrides())
+    _persisted_refresh_enabled = db.get_refresh_enabled()
+    if _persisted_refresh_enabled is not None:
+        _refresh_settings["slow_enabled"] = _persisted_refresh_enabled
     _client = httpx.AsyncClient()
     asyncio.create_task(_backfill_if_needed())
     asyncio.create_task(_refresh_fast_tier())
@@ -2006,14 +2019,19 @@ async def refresh_settings_get():
 
 @app.post("/api/refresh/settings")
 async def refresh_settings_post(body: dict = Body(...)):
+    """slow_enabled is now the only persisted setting here — each slow-tier
+    source owns its own real interval_seconds (see each SourceDefinition's
+    cadence), so there's no longer a shared slow interval to accept. Persisted
+    to ui_settings.refresh_enabled so the choice survives a restart, unlike
+    fast_interval_s/fast_enabled, which stay in-memory-only (spot prices'
+    tunable interval was never the thing going stale between restarts)."""
     if "fast_interval_s" in body:
         _refresh_settings["fast_interval_s"] = max(5, int(body["fast_interval_s"]))
-    if "slow_interval_s" in body:
-        _refresh_settings["slow_interval_s"] = max(30, int(body["slow_interval_s"]))
     if "fast_enabled" in body:
         _refresh_settings["fast_enabled"] = bool(body["fast_enabled"])
     if "slow_enabled" in body:
         _refresh_settings["slow_enabled"] = bool(body["slow_enabled"])
+        db.set_refresh_enabled(_refresh_settings["slow_enabled"])
     return {"success": True, "data": _refresh_settings}
 
 
@@ -2291,6 +2309,13 @@ sources.register(SourceDefinition(
     cadence=CadenceSpec(trigger="interval", interval_seconds=_refresh_settings["fast_interval_s"], enabled_flag="fast_enabled"),
     rate_limit=RateLimitSpec(kind="undocumented", note="Reverse-engineered metalcharts.org endpoint, no published quota."),
 ))
+# All 14 of these move at most daily upstream (per each entry's own note
+# below, confirmed against CLAUDE.md's Standing rules) — one shared real
+# interval covers all of them correctly, since there's no cadence spread
+# to account for. 25h (a day + a safety margin) rather than exactly 24h,
+# so one briefly-late or transiently-failed upstream update doesn't cost
+# a full extra day before the next attempt.
+EXCHANGE_INVENTORY_INTERVAL_S = 90000  # 25 hours
 _SLOW_TIER_FETCH_FNS: dict[str, tuple[Callable[[], Awaitable[None]], list[str], str]] = {
     "comex_silver_history": (_fetch_and_persist_silver_history, ["inventory_aggregate"], "COMEX silver registered/eligible/total, daily."),
     "comex_gold_history": (_fetch_and_persist_gold_history, ["gold_inventory_aggregate"], "COMEX gold registered/eligible/total, daily."),
@@ -2311,46 +2336,58 @@ for _key, (_fn, _tables, _note) in _SLOW_TIER_FETCH_FNS.items():
     sources.register(SourceDefinition(
         key=_key, label=_key.replace("_", " ").title(),
         affinity_group="exchange_market", fetch_fn=_fn, tables=_tables,
-        cadence=CadenceSpec(trigger="interval", interval_seconds=_refresh_settings["slow_interval_s"], enabled_flag="slow_enabled"),
+        cadence=CadenceSpec(trigger="interval", interval_seconds=EXCHANGE_INVENTORY_INTERVAL_S, enabled_flag="slow_enabled"),
         rate_limit=RateLimitSpec(kind="undocumented", note=_note),
     ))
 del _key, _fn, _tables, _note
 
-# money_supply/metals_prices: previously registered trigger="startup" but,
-# before this pass, nothing in lifespan actually called them at boot — a
-# real, confirmed-live bug (only lbma_fix/census_trade had real
-# _xxx_startup() wrapper functions wired in; these two were reachable only
-# via their own GET routes or manual health-refresh). fire_at_startup=True
-# here is the actual fix — they now genuinely fetch once at every backend
-# restart, matching their intended label, at the cost of new load on
-# FRED/Yahoo Finance per restart (confirmed acceptable — restarts are
-# infrequent for a single-process local app).
+# money_supply/metals_prices/treasury_outlays/treasury_outlays_by_agency:
+# previously trigger="manual_only", fire_at_startup=True (fetch once per
+# backend restart, never again automatically) — a deliberate choice at the
+# time, but a real staleness gap for a continuously-run instance that
+# rarely restarts. Converted to trigger="interval" so each recurs on its
+# own real upstream cadence without the user needing to restart or hit
+# manual refresh: money_supply weekly (its fastest-moving series — WALCL,
+# Treasury Yields — update weekly; M2/CPI are monthly, but polling at the
+# fastest real series' cadence means nothing in this fetch is ever stale
+# by more than a week, without over-polling the monthly ones, which is
+# cheap regardless since this is one HTTP round-trip per series either
+# way), metals_prices daily (Yahoo daily closes), both Treasury outlays
+# sources monthly (matching MTS's real publication cadence — a shorter
+# interval would just re-fetch the same unchanged month). All four already
+# had a "no documented hard rate limit" note before this change, so the
+# added request volume from real recurrence carries no known rate-limit
+# risk (unlike lbma_fix/census_trade below, which need their own gating
+# preserved specifically because they DO have a real constraint).
+MONEY_SUPPLY_INTERVAL_S = 604800  # weekly
+METALS_PRICES_INTERVAL_S = 90000  # ~25h, same daily-plus-margin reasoning as the exchange-inventory sources
+TREASURY_OUTLAYS_INTERVAL_S = 2678400  # 31 days — Table 1 MTS publication is monthly
 sources.register(SourceDefinition(
     key="money_supply", label="FRED — Money Supply (M2, WALCL, Composition)",
     affinity_group="gov_regulatory", fetch_fn=fred_money_supply_refresh,
     tables=["fred_observations"], requires_env=["FRED_API_KEY"],
-    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    cadence=CadenceSpec(trigger="interval", interval_seconds=MONEY_SUPPLY_INTERVAL_S, fire_at_startup=True, enabled_flag="slow_enabled"),
     rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern."),
 ))
 sources.register(SourceDefinition(
     key="metals_prices", label="Yahoo Finance — Daily Metal Closes",
     affinity_group="exchange_market", fetch_fn=metals_prices_refresh,
     tables=["settlement_price"],
-    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    cadence=CadenceSpec(trigger="interval", interval_seconds=METALS_PRICES_INTERVAL_S, fire_at_startup=True, enabled_flag="slow_enabled"),
     rate_limit=RateLimitSpec(kind="undocumented", note="No published quota; conservative-by-design per CLAUDE.md's Yahoo Finance dev note."),
 ))
 sources.register(SourceDefinition(
     key="treasury_outlays", label="U.S. Treasury — Monthly Treasury Statement",
     affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_outlays_startup,
     tables=["treasury_outlays"],
-    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    cadence=CadenceSpec(trigger="interval", interval_seconds=TREASURY_OUTLAYS_INTERVAL_S, fire_at_startup=True, enabled_flag="slow_enabled"),
     rate_limit=RateLimitSpec(kind="undocumented", note="fiscaldata.treasury.gov's public API has no documented hard rate limit; no API key required."),
 ))
 sources.register(SourceDefinition(
     key="treasury_outlays_by_agency", label="U.S. Treasury — MTS Outlays by Department/Agency",
     affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_outlays_by_agency_startup,
     tables=["treasury_outlays_by_agency"],
-    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    cadence=CadenceSpec(trigger="interval", interval_seconds=TREASURY_OUTLAYS_INTERVAL_S, fire_at_startup=True, enabled_flag="slow_enabled"),
     rate_limit=RateLimitSpec(kind="undocumented", note="Same host/no-key posture as treasury_outlays. Bounded to the most recent 36 months per run (see fetch fn docstring) — one HTTP request per real month, since Table 5's parent/child hierarchy can't be filtered server-side the way Table 1's flat MTH rows can."),
 ))
 # Unlike treasury_outlays/treasury_outlays_by_agency's manual_only+
@@ -2386,11 +2423,24 @@ sources.register(SourceDefinition(
     rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=COT_MIN_REFRESH_DAYS), note="CFTC publishes a new report ~weekly."),
     self_recording=True,
 ))
+# lbma_fix: reverted to manual_only, NOT fire_at_startup — disabled
+# entirely as of 2026-08-12, after the recurring-interval version (shipped
+# earlier in the per-source-cadence pass) burned through GoldAPI's free-
+# tier 500 req/month quota. The per-fetch cost was undercounted at the
+# time: _fetch_and_persist_lbma_fix's "today has no fix posted yet"
+# fallback can double each symbol's request count (up to 4 req/cycle, not
+# the assumed 2), and this data has no frontend consumer at all right now
+# (LbmaFixBadge, the sole UI reader, was deleted in an earlier pass) — so
+# continuous polling was spending quota nobody could see the benefit of.
+# Reachable only via the Data tab's "Re-run now" button until a real
+# consumer exists again; not even a startup fire, so a restart doesn't
+# spend quota either. Re-evaluate a recurring cadence (and its real
+# request cost) if/when this data gets a frontend surface again.
 sources.register(SourceDefinition(
     key="lbma_fix", label="GoldAPI.io — LBMA Fix",
     affinity_group="exchange_market", fetch_fn=_fetch_and_persist_lbma_fix_startup,
     tables=["settlement_price"], requires_env=["GAPI_API_KEY"],
-    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+    cadence=CadenceSpec(trigger="manual_only"),
     rate_limit=RateLimitSpec(kind="numeric_quota", quota_per_period="500/month"),
 ))
 # census_trade gates on LAST ATTEMPT time (Census's ~2-month publication
@@ -2398,12 +2448,22 @@ sources.register(SourceDefinition(
 # _refresh_census_trade's own docstring for the full reasoning).
 # self_recording=True for the same reason as cot_pipeline: its own skip
 # branch already records "skipped", which health_refresh must not
-# overwrite with a blanket "success".
+# overwrite with a blanket "success". Converted from manual_only to a real
+# weekly trigger="interval" so a continuously-run instance actually rechecks
+# periodically rather than only once per restart — the real 25-day floor
+# is still enforced by _refresh_census_trade's own min_gap check inside its
+# fetch_fn (unchanged, still reads CENSUS_TRADE_MIN_REFRESH_DAYS directly,
+# not derived from this CadenceSpec), so a weekly scheduler tick just means
+# roughly 3 of every 4 ticks record a cheap "skipped" attempt rather than a
+# real fetch — min_gap/gate_on stay on the spec purely so expected_interval_s
+# and the Data tab's rate-limit display still reflect the true 25-day cadence,
+# even though _schedule_loop itself only reads interval_seconds to decide
+# firing.
 sources.register(SourceDefinition(
     key="census_trade", label="U.S. Census Bureau — International Trade",
     affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_census_trade_startup,
     tables=["census_trade"], requires_env=["CENSUS_API_KEY"],
-    cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True, min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
+    cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
     rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), note="Census releases monthly, ~2-month publication lag."),
     self_recording=True,
 ))

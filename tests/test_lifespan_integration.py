@@ -123,26 +123,56 @@ async def test_fast_tier_source_fires_and_records_health(booted_app):
     assert health["last_attempt_status"] in ("success", "error")
 
 
-async def test_startup_only_sources_fire_exactly_once(booted_app):
-    """money_supply/metals_prices/lbma_fix/census_trade are all
-    trigger='manual_only', fire_at_startup=True — _schedule_loop tracks
-    them in _startup_fired so they fire exactly once at boot and never
-    again automatically. Confirms the _startup_fired bookkeeping (a real,
-    previously-buggy area per CLAUDE.md's fire_at_startup history) doesn't
-    double-fire within a single boot + short scheduler run."""
+async def test_fire_at_startup_sources_fire_within_one_tick(booted_app):
+    """money_supply/metals_prices/census_trade all carry fire_at_startup=True
+    — as of the per-source-cadence pass, all three are trigger='interval'
+    (not 'manual_only'), each with its own real recurring cadence
+    (weekly/daily/weekly respectively), so they are no longer tracked via
+    _startup_fired (that bookkeeping is manual_only-specific — see
+    _schedule_loop's is_startup_only_fire branch). fire_at_startup still
+    guarantees an immediate first fire via _schedule_loop's last_fired
+    pre-seeding (source.cadence.fire_at_startup seeds last_fired far enough
+    in the past to be immediately due), so the real assertion here is a
+    recorded source_health row within one tick, same proof-of-wiring shape
+    as test_fast_tier_fires_and_records_health above.
+
+    lbma_fix is deliberately excluded from this group as of 2026-08-12 —
+    reverted to plain trigger='manual_only' with no fire_at_startup after
+    its recurring interval burned through GoldAPI's free-tier quota for
+    data that has no frontend consumer at all right now. It should NOT
+    fire at startup; see test_lbma_fix_does_not_fire_automatically below
+    for the actual assertion covering that."""
     _app, tmp_db = booted_app
-    for key in ("money_supply", "metals_prices", "lbma_fix", "census_trade"):
-        assert key in main_module._startup_fired, f"{key} never fired at startup"
+    for key in ("money_supply", "metals_prices", "census_trade"):
+        health = tmp_db.get_source_health(key)
+        assert health is not None, f"{key} never fired at startup"
+        assert health["last_attempt_status"] in ("success", "error", "skipped")
+
+
+async def test_lbma_fix_does_not_fire_automatically(booted_app):
+    """lbma_fix is trigger='manual_only' with no fire_at_startup (reverted
+    2026-08-12 after its recurring-interval version burned through
+    GoldAPI.io's free-tier 500 req/month quota for data with no frontend
+    consumer — see the SourceDefinition's own comment in main.py). It must
+    NOT fire on boot or on any scheduler tick — only a real
+    POST /api/health/refresh/lbma_fix call should ever reach it now."""
+    _app, tmp_db = booted_app
+    assert tmp_db.get_source_health("lbma_fix") is None, (
+        "lbma_fix fired automatically — it should be reachable only via "
+        "manual refresh until it has a real frontend consumer again."
+    )
 
 
 async def test_always_on_source_is_not_gated_by_enabled_flag(booted_app):
     """catcor_snapshot is trigger='always_on' — must fire regardless of
-    slow_enabled/fast_enabled state. slow_enabled defaults False; if
-    catcor_snapshot were accidentally gated on it (the exact bug
-    always_on's dedicated trigger value exists to make structurally
-    impossible), due_snapshots() would simply find nothing to capture
-    (no seeded events yet) — so this asserts the tick loop reached it at
-    all via source_health, not that it captured anything."""
+    slow_enabled/fast_enabled state (both default True as of the
+    per-source-cadence pass, but the point of always_on is that this
+    source's firing is unconditional either way). If catcor_snapshot were
+    accidentally gated on slow_enabled (the exact bug always_on's dedicated
+    trigger value exists to make structurally impossible), due_snapshots()
+    would simply find nothing to capture (no seeded events yet) — so this
+    asserts the tick loop reached it at all via source_health, not that it
+    captured anything."""
     _app, tmp_db = booted_app
     # catcor_snapshot has self_recording=False, so a tick that ran at all
     # (even a no-op "nothing due") still leaves no source_health row here

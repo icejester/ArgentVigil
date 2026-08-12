@@ -12,6 +12,8 @@ This is an orientation doc. The durable, exhaustive record (per-route behavior, 
 | `db.py` | All SQLite persistence (stdlib `sqlite3`, no ORM). Owns `runtime/argentvigil.db` — the one shared database. Importable without the venv (no fastapi/httpx). |
 | `sources.py` | Canonical data-source registry: one `SourceDefinition` per upstream (cadence, rate limit, table ownership, env requirements). The scheduler, health routes, and Data tab all read from it. |
 | `units.py` | Canonical unit constants (contract sizes, kg→oz). Stdlib-free; the only place these numbers live backend-side. |
+| `price_instruments.py` | Canonical price `instrument` identifiers — the closed set written to `spot_price`/`settlement_price`. Stdlib-free, same constraint as `units.py`. |
+| `yahoo_prices.py` | Canonical Yahoo Finance chart-API caller — one `fetch_yahoo_bars()` used by every Yahoo call site in `main.py`/`catcor.py`. |
 | `catcor.py` | CATCOR event calendar, price-tick backfills, reaction snapshot capture. |
 | `catcor_research.py` | Research tab: sessions, prompt assembly, model backends (Anthropic / amp-forge), promote/dismiss/discard lifecycle. |
 | `delivery_behavior.py` | Derived cross-check signals (reclassification vs. real inflow, FND/LTD date rules, CoT category composition). Computes over data other modules persist. |
