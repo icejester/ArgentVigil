@@ -7,7 +7,7 @@ from typing import Awaitable, Callable
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -18,6 +18,8 @@ from . import catcor_research
 from . import db
 from . import delivery_behavior
 from . import sources
+from . import stack
+from . import stack_db
 from .mc_token import authed_headers
 from .price_instruments import (
     FUTURES_FRONT_BY_METAL,
@@ -200,6 +202,7 @@ _interval_overrides: dict[str, int] = {}
 async def lifespan(app: FastAPI):
     global _client
     db.init_db()
+    stack_db.init_db()
     _interval_overrides.update(db.get_interval_overrides())
     _persisted_refresh_enabled = db.get_refresh_enabled()
     if _persisted_refresh_enabled is not None:
@@ -2035,7 +2038,7 @@ async def refresh_settings_post(body: dict = Body(...)):
     return {"success": True, "data": _refresh_settings}
 
 
-_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "data"}
+_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "data", "stack"}
 
 
 @app.get("/api/ui/pinned-section")
@@ -3058,6 +3061,121 @@ async def catcor_research_forge_sessions():
         "data": None,
         "detail": "amp-forge session visibility not yet available — forge-spec.md contract unconfirmed",
     }
+
+
+# --- Stack Tracker (specs/stackTracker-spec.md) ----------------------------
+# Personal CRUD inventory of physical holdings, backed entirely by
+# runtime/stack.db + runtime/stack_images/ — never argentvigil.db. Only the
+# GET .../db routes are upstream-shaped reads (there is no upstream here,
+# they're user-owned data reads); the mutating routes are plain user CRUD,
+# covered by tests/test_conventions.py's ALLOWED_NON_DB_API "/api/stack/"
+# entry rather than persist-on-fetch's /db convention, since that
+# convention is specifically about never letting the frontend see raw
+# upstream data — Stack Tracker has no upstream to guard against.
+
+
+@app.get("/api/stack/items/db")
+async def stack_items_db():
+    return {"success": True, "data": stack.list_items_with_valuation()}
+
+
+@app.get("/api/stack/items/{item_id}/db")
+async def stack_item_detail_db(item_id: int):
+    item = stack.get_item(item_id)
+    if item is None:
+        raise HTTPException(404, f"No stack item with id {item_id}")
+    item.update(stack.compute_valuation(item))
+    item["images"] = stack.list_images(item_id)
+    item["reference_links"] = stack.list_links(item_id)
+    return {"success": True, "data": item}
+
+
+@app.get("/api/stack/summary/db")
+async def stack_summary_db():
+    return {"success": True, "data": stack.portfolio_summary()}
+
+
+@app.get("/api/stack/series-summary/db")
+async def stack_series_summary_db():
+    return {"success": True, "data": stack.series_summary()}
+
+
+@app.get("/api/stack/date-summary/db")
+async def stack_date_summary_db():
+    return {"success": True, "data": stack.date_summary()}
+
+
+@app.get("/api/stack/timeseries/db")
+async def stack_timeseries_db():
+    return {"success": True, "data": stack.timeseries()}
+
+
+@app.post("/api/stack/items")
+async def stack_items_create(body: dict = Body(...)):
+    item_id = stack.create_item(body)
+    return {"success": True, "data": {"id": item_id}}
+
+
+@app.post("/api/stack/items/bulk")
+async def stack_items_create_bulk(body: dict = Body(...)):
+    ids = stack.create_bulk(body)
+    return {"success": True, "data": {"ids": ids, "lot_id": stack.get_item(ids[0])["lot_id"]}}
+
+
+@app.put("/api/stack/items/{item_id}")
+async def stack_items_update(item_id: int, body: dict = Body(...)):
+    stack.update_item(item_id, body)
+    return {"success": True, "data": None}
+
+
+@app.post("/api/stack/items/bulk-update")
+async def stack_items_bulk_update(body: dict = Body(...)):
+    """Group update — applies a focused field subset (series/mint_year/
+    metal/unit_weight_oz/grading fields) to a caller-selected set of item
+    ids, e.g. tagging all 12 rows from one order as '2013 Canadian Maple
+    Leaf' at once. See stack.bulk_update_items for why this only touches
+    the fields actually present in the request body, unlike the full-
+    replace PUT /items/{id} route above."""
+    item_ids = body.get("item_ids") or []
+    fields = body.get("fields") or {}
+    updated = stack.bulk_update_items(item_ids, fields)
+    return {"success": True, "data": {"updated": updated}}
+
+
+@app.delete("/api/stack/items/{item_id}")
+async def stack_items_delete(item_id: int):
+    stack.delete_item(item_id)
+    return {"success": True, "data": None}
+
+
+@app.post("/api/stack/items/{item_id}/photos")
+async def stack_photos_upload(item_id: int, file: UploadFile = File(...), caption: str | None = Form(None)):
+    photo = await stack.add_photo(item_id, file, caption)
+    return {"success": True, "data": photo}
+
+
+@app.delete("/api/stack/photos/{photo_id}")
+async def stack_photos_delete(photo_id: int):
+    stack.delete_photo(photo_id)
+    return {"success": True, "data": None}
+
+
+@app.post("/api/stack/items/{item_id}/links")
+async def stack_links_create(item_id: int, body: dict = Body(...)):
+    link_id = stack.add_link(item_id, body.get("url"), body.get("label"))
+    return {"success": True, "data": {"id": link_id}}
+
+
+@app.delete("/api/stack/links/{link_id}")
+async def stack_links_delete(link_id: int):
+    stack.delete_link(link_id)
+    return {"success": True, "data": None}
+
+
+# Photos served straight back by relative path — a LAN-only tool, no signed
+# URLs needed. Mounted before the frontend-dist catch-all below.
+os.makedirs(stack_db.IMAGES_ROOT, exist_ok=True)
+app.mount("/stack_images", StaticFiles(directory=stack_db.IMAGES_ROOT), name="stack_images")
 
 
 # Serve built frontend; keep last so API routes take priority

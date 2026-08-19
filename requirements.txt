@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 httpx
 python-dotenv
+python-multipart
 
 # Test tooling (see CLAUDE.md's ## Tests) — deliberately in this one file,
 # not a separate requirements-dev.txt: nothing here deploys anywhere that
