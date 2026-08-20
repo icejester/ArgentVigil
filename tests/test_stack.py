@@ -193,7 +193,60 @@ def test_bulk_update_series_accepts_freehand_text(tmp_stack_db):
 def test_bulk_update_rejects_fields_outside_the_allowed_subset(tmp_stack_db):
     ids = [stack.create_item(_base_fields())]
     with pytest.raises(Exception) as exc_info:
-        stack.bulk_update_items(ids, {"grading_service": "PCGS"})
+        stack.bulk_update_items(ids, {"count": 5})
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_bulk_update_rejects_lot_id(tmp_stack_db):
+    ids = [stack.create_item(_base_fields())]
+    with pytest.raises(Exception) as exc_info:
+        stack.bulk_update_items(ids, {"lot_id": "hand-forged"})
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_bulk_update_can_apply_grading_and_weight_fields(tmp_stack_db):
+    """The field-set expansion: grading/mint-mark/weight fields, previously
+    single-item-edit-only, are now bulk-updatable too."""
+    ids = [stack.create_item(_base_fields()), stack.create_item(_base_fields())]
+    updated = stack.bulk_update_items(ids, {
+        "grading_service": "PCGS",
+        "grade": "MS70",
+        "certification_number": "12345",
+        "mint_mark": "S",
+        "mintage": 50000,
+        "unit_weight_oz": 1.0,
+        "premium_paid": 3.5,
+    })
+    assert updated == 2
+    for item_id in ids:
+        item = stack.get_item(item_id)
+        assert item["grading_service"] == "PCGS"
+        assert item["grade"] == "MS70"
+        assert item["certification_number"] == "12345"
+        assert item["mint_mark"] == "S"
+        assert item["mintage"] == 50000
+        assert item["unit_weight_oz"] == 1.0
+        assert item["premium_paid"] == 3.5
+
+
+def test_bulk_update_rejects_invalid_metal(tmp_stack_db):
+    ids = [stack.create_item(_base_fields())]
+    with pytest.raises(Exception) as exc_info:
+        stack.bulk_update_items(ids, {"metal": "platinum"})
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_bulk_update_rejects_invalid_form(tmp_stack_db):
+    ids = [stack.create_item(_base_fields())]
+    with pytest.raises(Exception) as exc_info:
+        stack.bulk_update_items(ids, {"form": "ingot"})
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_bulk_update_rejects_invalid_grading_service(tmp_stack_db):
+    ids = [stack.create_item(_base_fields())]
+    with pytest.raises(Exception) as exc_info:
+        stack.bulk_update_items(ids, {"grading_service": "Not A Real Service"})
     assert getattr(exc_info.value, "status_code", None) == 400
 
 
@@ -956,7 +1009,7 @@ async def test_route_bulk_update_rejects_disallowed_field(stack_client):
     item_id = resp.json()["data"]["id"]
     resp = await stack_client.post(
         "/api/stack/items/bulk-update",
-        json={"item_ids": [item_id], "fields": {"grading_service": "PCGS"}},
+        json={"item_ids": [item_id], "fields": {"count": 5}},
     )
     assert resp.status_code == 400
 

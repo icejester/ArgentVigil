@@ -51,7 +51,13 @@ SERIES = [
 # wants to correct a whole lot's price at once (e.g. "these were actually
 # $X each, not what I originally entered"), not because it's usually
 # identical across a lot the way series/notes/mint_year are.
-BULK_UPDATE_FIELDS = ["series", "mint_year", "numismatic_notes", "purchase_price", "purchase_date"]
+BULK_UPDATE_FIELDS = [
+    "description", "metal", "form", "silver_weight_oz", "gold_weight_oz",
+    "unit_weight_oz", "purchase_date", "purchase_price", "premium_paid",
+    "mint_year", "series", "mint_mark", "mintage",
+    "grading_service", "grade", "certification_number", "numismatic_value",
+    "numismatic_value_as_of", "numismatic_notes",
+]
 
 MAX_PHOTOS_PER_ITEM = 5
 MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10MB
@@ -157,14 +163,15 @@ def update_item(item_id: int, fields: dict):
 
 
 def bulk_update_items(item_ids: list[int], fields: dict) -> int:
-    """Applies a focused subset of fields (BULK_UPDATE_FIELDS — series,
-    mint_year, numismatic_notes, purchase_price, purchase_date) to every
-    row in item_ids, e.g. "these 12 rows from the 1/29 order are all 2013
-    Canadian Maple Leafs" or "I mis-typed this whole order's date, fix
-    all 12 rows at once." Deliberately excludes count — per the user's
-    own framing, quantity-per-row is inherent to how the rows were
-    created (single vs. bulk-entry) and isn't a "what these items share"
-    fact the way date/price/series/notes are.
+    """Applies a subset of fields (BULK_UPDATE_FIELDS — every stack_items
+    column except count and lot_id) to every row in item_ids, e.g. "these
+    12 rows from the 1/29 order are all 2013 Canadian Maple Leafs, PCGS
+    MS70" or "I mis-typed this whole order's date, fix all 12 rows at
+    once." Deliberately excludes count — per the user's own framing,
+    quantity-per-row is inherent to how the rows were created (single vs.
+    bulk-entry) and isn't a "what these items share" fact the way
+    date/price/series/grading/etc. are. Also excludes lot_id, which is
+    system-managed (assigned by create_bulk, never user-editable).
 
     Only keys actually present with a non-None value in `fields` are
     applied — an omitted/None field is left untouched on every target row,
@@ -179,6 +186,17 @@ def bulk_update_items(item_ids: list[int], fields: dict) -> int:
         raise HTTPException(400, "no fields to apply — every field was empty/omitted")
     if not item_ids:
         raise HTTPException(400, "item_ids must be non-empty")
+
+    # metal/form/grading_service carry the same validation as
+    # create_item/update_item (_validate_item_fields) — now that bulk
+    # update can touch them, a bad value shouldn't be able to silently
+    # corrupt every selected row the way an unvalidated field would.
+    if "metal" in to_apply and to_apply["metal"] not in METALS:
+        raise HTTPException(400, f"metal must be one of {sorted(METALS)}")
+    if "form" in to_apply and to_apply["form"] not in FORMS:
+        raise HTTPException(400, f"form must be one of {sorted(FORMS)}")
+    if "grading_service" in to_apply and to_apply["grading_service"] not in GRADING_SERVICES:
+        raise HTTPException(400, f"grading_service must be one of {GRADING_SERVICES} or empty")
 
     missing = [i for i in item_ids if get_item(i) is None]
     if missing:

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import {
-  ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area, LineChart, Line,
+  ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
 } from "recharts";
 import { VAULT_COLORS } from "./palette";
@@ -22,6 +22,11 @@ import { VAULT_COLORS } from "./palette";
 // front-and-center in the Add flow.
 
 const METALS = ["silver", "gold"];
+// bimetallic is a valid backend value but deliberately not offered in the
+// simplified Add form's metal picker — only surfaced in the full-page
+// item editor, which covers every stack_items column.
+const METALS_FULL = ["silver", "gold", "bimetallic"];
+const FORMS = ["coin", "bar", "round", "other"];
 const SERIES = [
   "American Eagle",
   "Canadian Maple Leaf",
@@ -329,10 +334,6 @@ function SummaryStrip({ summary }) {
         <div>{fmtUsd(summary.total_spent)}</div>
       </div>
       <div>
-        <div className="comex-panel-note">Total current value</div>
-        <div>{fmtUsd(summary.total_current_value)}</div>
-      </div>
-      <div>
         <div className="comex-panel-note">Unrealized gain/loss</div>
         <div>
           {fmtUsd(summary.total_unrealized_gain)}
@@ -340,6 +341,10 @@ function SummaryStrip({ summary }) {
             ? ` (${summary.total_unrealized_gain_pct.toFixed(1)}%)`
             : ""}
         </div>
+      </div>
+      <div>
+        <div className="comex-panel-note">Current value</div>
+        <div>{fmtUsd(summary.total_current_value)}</div>
       </div>
       <div>
         <div className="comex-panel-note">Held</div>
@@ -548,8 +553,49 @@ function timeseriesFromItems(items) {
   return rows;
 }
 
+// Cumulative oz over time, stacked by series — a client-side computation
+// (no backend route; items already carry series/total_weight_oz/
+// purchase_date in full) since this is a genuinely different shape from
+// stack.timeseries()'s per-metal cumulative rows: one running total per
+// series-key rather than one per metal. Returns { rows, seriesKeys } —
+// rows is one object per real purchase_date with every series-key's
+// running cumulative oz as of that date (present on every row, even 0,
+// so Recharts' stacked Area always has a value to stack), seriesKeys is
+// the stable list of series names found, sorted by CURRENT total (largest
+// band first) so the stack order stays meaningful rather than
+// alphabetical or insertion-order.
+function ozGrowthBySeries(items) {
+  const dated = items.filter((i) => i.purchase_date && i.total_weight_oz);
+  const byDate = new Map();
+  for (const item of dated) {
+    if (!byDate.has(item.purchase_date)) byDate.set(item.purchase_date, []);
+    byDate.get(item.purchase_date).push(item);
+  }
+  const dates = [...byDate.keys()].sort();
+  const cumulative = new Map(); // series key -> running oz
+  const rows = [];
+  for (const date of dates) {
+    for (const item of byDate.get(date)) {
+      const key = item.series || item.description;
+      cumulative.set(key, (cumulative.get(key) || 0) + item.total_weight_oz);
+    }
+    const row = { date };
+    for (const [key, value] of cumulative) row[key] = value;
+    rows.push(row);
+  }
+  // Backfill 0 for any series-key that didn't exist yet as of an earlier
+  // row — a stacked Area needs every key present on every row, not just
+  // from the date it first appears.
+  const seriesKeys = [...cumulative.keys()].sort((a, b) => (cumulative.get(b) || 0) - (cumulative.get(a) || 0));
+  for (const row of rows) {
+    for (const key of seriesKeys) if (!(key in row)) row[key] = 0;
+  }
+  return { rows, seriesKeys };
+}
+
 function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClickedSeries }) {
   const [pinnedDate, setPinnedDate] = useState(null);
+  const [hiddenOzSeries, setHiddenOzSeries] = useState(() => new Set());
 
   const livePieData = seriesGroups
     .filter((g) => g.total_weight_oz)
@@ -562,19 +608,41 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
   const colorByName = new Map(livePieData.map((g, i) => [g.name, VAULT_COLORS[i % VAULT_COLORS.length]]));
   const pieData = pieSource.map((g) => ({ ...g, color: colorByName.get(g.name) || "#94a3b8" }));
 
-  // Selecting a series in the legend re-scopes the two charts below to
-  // that series' own items — per the user's explicit "I'd see the graphs
-  // below change as if they were focused only on the rows with series
-  // American Eagle" request.
+  // Selecting a series in the pie's legend re-scopes the two charts below
+  // to that series' own items — per the user's explicit "I'd see the
+  // graphs below change as if they were focused only on the rows with
+  // series American Eagle" request.
   const activeTimeseries = clickedSeries
     ? timeseriesFromItems(items.filter((i) => (i.series || i.description) === clickedSeries))
     : timeseries;
+  const activeItems = clickedSeries
+    ? items.filter((i) => (i.series || i.description) === clickedSeries)
+    : items;
 
-  const ozGrowthData = activeTimeseries.map((r) => ({
-    date: r.date,
-    silver_oz: r.cumulative_silver_oz,
-    gold_oz: r.cumulative_gold_oz,
-  }));
+  // Own stacked-by-series growth chart — separate from the pie's
+  // clickedSeries "solo one series" filter above. hiddenOzSeries is a
+  // checkbox-style multi-select (toggle any number of bands off/on),
+  // deliberately a different interaction than the pie legend's
+  // single-select highlight, per the user's explicit call.
+  const { rows: ozGrowthData, seriesKeys: ozSeriesKeys } = ozGrowthBySeries(activeItems);
+  const visibleOzSeriesKeys = ozSeriesKeys.filter((k) => !hiddenOzSeries.has(k));
+  const ozColorByKey = new Map(ozSeriesKeys.map((k, i) => [k, VAULT_COLORS[i % VAULT_COLORS.length]]));
+  // "Timeline should be min/max acquisition date": a category axis's
+  // domain is inherently the exact set of x-values present in its data
+  // (Recharts has no separate "domain" concept to override for
+  // type="category" the way a numeric/time axis does), and ozGrowthData
+  // is already sorted ascending by real purchase_date with no synthetic
+  // padding rows — so the axis already spans exactly [earliest purchase,
+  // latest purchase] by construction, with nothing further to set.
+
+  function toggleOzSeries(key) {
+    setHiddenOzSeries((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
   function handleOzChartClick(state) {
     const label = state?.activeLabel;
@@ -664,7 +732,7 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
             <div className="comex-empty">No dated purchases yet.</div>
           ) : (
             <ResponsiveContainer width="100%" height={280}>
-              <LineChart
+              <AreaChart
                 data={ozGrowthData}
                 margin={{ top: 8, right: 16, bottom: 4, left: 4 }}
                 onClick={handleOzChartClick}
@@ -675,29 +743,40 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
                 <YAxis stroke="#5a6278" fontSize={11} width={60} />
                 <Tooltip content={<OzGrowthTooltip />} />
                 {pinnedDate && <ReferenceLine x={pinnedDate} stroke="#8a94a6" strokeDasharray="3 3" />}
-                <Line
-                  type="monotone" dataKey="silver_oz" name="Silver oz"
-                  stroke="#c8d0de" strokeWidth={2} dot={false} isAnimationActive={false}
-                />
-                <Line
-                  type="monotone" dataKey="gold_oz" name="Gold oz"
-                  stroke="#c9a227" strokeWidth={2} dot={false} isAnimationActive={false}
-                />
-              </LineChart>
+                {visibleOzSeriesKeys.map((key) => (
+                  <Area
+                    key={key}
+                    type="monotone"
+                    dataKey={key}
+                    name={key}
+                    stackId="oz"
+                    stroke={ozColorByKey.get(key)}
+                    fill={ozColorByKey.get(key)}
+                    fillOpacity={0.55}
+                    strokeWidth={1.5}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </AreaChart>
             </ResponsiveContainer>
           )}
           <div className="comex-legend-list comex-legend-list--horizontal">
-            <div className="comex-legend-item">
-              <span className="comex-legend-swatch" style={{ background: "#c8d0de" }} />
-              <span>Silver oz</span>
-            </div>
-            <div className="comex-legend-item">
-              <span className="comex-legend-swatch" style={{ background: "#c9a227" }} />
-              <span>Gold oz</span>
-            </div>
+            {ozSeriesKeys.map((key) => (
+              <button
+                key={key}
+                type="button"
+                className={`comex-legend-item legend-btn-row${hiddenOzSeries.has(key) ? " legend-btn--off" : ""}`}
+                style={{ "--legend-color": ozColorByKey.get(key) }}
+                onClick={() => toggleOzSeries(key)}
+              >
+                <span className="comex-legend-swatch" style={{ background: ozColorByKey.get(key) }} />
+                <span>{key}</span>
+              </button>
+            ))}
           </div>
           <div className="comex-panel-note">
-            Cumulative oz held as of each purchase date. Click a point to pin that date — the pie chart
+            Cumulative oz held as of each purchase date, stacked by series — click a legend entry to
+            show/hide that series' band. Click anywhere on the chart to pin that date — the pie chart
             recomputes to show your series composition as it stood then, not the current total.
           </div>
         </div>
@@ -814,12 +893,11 @@ function GroupList({ groups, error, onOpenGroup }) {
         <div className="comex-empty">No items yet — add one to get started.</div>
       ) : (
         <div className="comex-table-wrap comex-table-wrap--capped">
-          <table className="comex-table">
+          <table className="comex-table comex-table--zebra">
             <thead>
               <tr>
                 <SortTh label="Group" sortKeyName="label" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
                 <SortTh label="Total oz" sortKeyName="total_weight_oz" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
-                <SortTh label="Spent" sortKeyName="total_spent" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
                 <SortTh label="Melt value" sortKeyName="total_melt_value" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
               </tr>
             </thead>
@@ -828,7 +906,6 @@ function GroupList({ groups, error, onOpenGroup }) {
                 <tr key={g.label} onClick={() => onOpenGroup(g.item_ids)} style={{ cursor: "pointer" }}>
                   <td>{g.label}</td>
                   <td className="right">{fmtOzBare(g.total_weight_oz)}</td>
-                  <td className="right">{fmtUsd(g.total_spent)}</td>
                   <td className="right">{fmtUsd(g.total_melt_value)}</td>
                 </tr>
               ))}
@@ -898,7 +975,7 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
             />
           )}
           <div className="comex-table-wrap comex-table-wrap--capped">
-            <table className="comex-table">
+            <table className="comex-table comex-table--zebra">
               <thead>
                 <tr>
                   <th><input type="checkbox" checked={allSelected} onChange={toggleAll} /></th>
@@ -947,12 +1024,32 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
 // choice: leaving a field blank means "don't touch this on any selected
 // row," so a bulk update can't accidentally blank out data on rows that
 // already had something different set.
+// Blank form covering the full BULK_UPDATE_FIELDS set (every stack_items
+// column except count/lot_id — see backend/stack.py) — expanded from an
+// original narrower field set at the user's explicit "I should be able
+// to bulk update any one (or all) of the nested fields of the coin"
+// request. Every field starts blank; only fields actually filled in get
+// sent, so an untouched field is never overwritten with an empty value.
 function BulkUpdateForm({ itemIds, onDone, onCancel }) {
   const [series, setSeries] = useState("");
-  const [mintYear, setMintYear] = useState("");
-  const [notes, setNotes] = useState("");
-  const [purchasePrice, setPurchasePrice] = useState("");
+  const [description, setDescription] = useState("");
+  const [metal, setMetal] = useState("");
+  const [form, setForm] = useState("");
+  const [unitWeight, setUnitWeight] = useState("");
+  const [silverWeight, setSilverWeight] = useState("");
+  const [goldWeight, setGoldWeight] = useState("");
   const [purchaseDate, setPurchaseDate] = useState("");
+  const [purchasePrice, setPurchasePrice] = useState("");
+  const [premiumPaid, setPremiumPaid] = useState("");
+  const [mintYear, setMintYear] = useState("");
+  const [mintMark, setMintMark] = useState("");
+  const [mintage, setMintage] = useState("");
+  const [gradingService, setGradingService] = useState("");
+  const [grade, setGrade] = useState("");
+  const [certNumber, setCertNumber] = useState("");
+  const [numismaticValue, setNumismaticValue] = useState("");
+  const [numismaticValueAsOf, setNumismaticValueAsOf] = useState("");
+  const [notes, setNotes] = useState("");
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
 
@@ -962,10 +1059,24 @@ function BulkUpdateForm({ itemIds, onDone, onCancel }) {
     setError(null);
     const fields = {};
     if (series) fields.series = series;
-    if (mintYear) fields.mint_year = parseInt(mintYear, 10);
-    if (notes) fields.numismatic_notes = notes;
-    if (purchasePrice) fields.purchase_price = parseFloat(purchasePrice);
+    if (description) fields.description = description;
+    if (metal) fields.metal = metal;
+    if (form) fields.form = form;
+    if (unitWeight) fields.unit_weight_oz = parseFloat(unitWeight);
+    if (silverWeight) fields.silver_weight_oz = parseFloat(silverWeight);
+    if (goldWeight) fields.gold_weight_oz = parseFloat(goldWeight);
     if (purchaseDate) fields.purchase_date = purchaseDate;
+    if (purchasePrice) fields.purchase_price = parseFloat(purchasePrice);
+    if (premiumPaid) fields.premium_paid = parseFloat(premiumPaid);
+    if (mintYear) fields.mint_year = parseInt(mintYear, 10);
+    if (mintMark) fields.mint_mark = mintMark;
+    if (mintage) fields.mintage = parseInt(mintage, 10);
+    if (gradingService) fields.grading_service = gradingService;
+    if (grade) fields.grade = grade;
+    if (certNumber) fields.certification_number = certNumber;
+    if (numismaticValue) fields.numismatic_value = parseFloat(numismaticValue);
+    if (numismaticValueAsOf) fields.numismatic_value_as_of = numismaticValueAsOf;
+    if (notes) fields.numismatic_notes = notes;
     try {
       await postJSON("/api/stack/items/bulk-update", { item_ids: itemIds, fields });
       onDone();
@@ -983,11 +1094,36 @@ function BulkUpdateForm({ itemIds, onDone, onCancel }) {
         Only fields you fill in below get applied — leave a field blank to leave it untouched on every
         selected row. Quantity isn't editable here since it's determined by how the rows were created.
       </div>
+
       <div className="research-input-row">
         <SeriesInput value={series} onChange={setSeries} blankLabel="Series — leave unchanged" />
         <input
-          className="research-input" type="number" placeholder="Mint year — leave blank to skip"
-          value={mintYear} onChange={(e) => setMintYear(e.target.value)}
+          className="research-input" placeholder="Description — leave blank to skip"
+          value={description} onChange={(e) => setDescription(e.target.value)}
+        />
+      </div>
+      <div className="research-input-row">
+        <select value={metal} onChange={(e) => setMetal(e.target.value)}>
+          <option value="">Metal — leave unchanged</option>
+          {METALS_FULL.map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <select value={form} onChange={(e) => setForm(e.target.value)}>
+          <option value="">Form — leave unchanged</option>
+          {FORMS.map((f) => <option key={f} value={f}>{f}</option>)}
+        </select>
+      </div>
+      <div className="research-input-row">
+        <input
+          className="research-input" type="number" step="0.0001" placeholder="oz per unit — leave blank to skip"
+          value={unitWeight} onChange={(e) => setUnitWeight(e.target.value)}
+        />
+        <input
+          className="research-input" type="number" step="0.0001" placeholder="Silver oz (explicit) — leave blank to skip"
+          value={silverWeight} onChange={(e) => setSilverWeight(e.target.value)}
+        />
+        <input
+          className="research-input" type="number" step="0.0001" placeholder="Gold oz (explicit) — leave blank to skip"
+          value={goldWeight} onChange={(e) => setGoldWeight(e.target.value)}
         />
       </div>
       <div className="research-input-row">
@@ -999,6 +1135,53 @@ function BulkUpdateForm({ itemIds, onDone, onCancel }) {
           className="research-input" type="number" step="0.01" placeholder="Price paid ($) — leave blank to skip"
           value={purchasePrice} onChange={(e) => setPurchasePrice(e.target.value)}
         />
+        <input
+          className="research-input" type="number" step="0.01" placeholder="Premium paid ($) — leave blank to skip"
+          value={premiumPaid} onChange={(e) => setPremiumPaid(e.target.value)}
+        />
+      </div>
+
+      <div className="comex-panel-note" style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.06em", margin: "8px 0 4px" }}>
+        Numismatic
+      </div>
+      <div className="research-input-row">
+        <input
+          className="research-input" type="number" placeholder="Mint year — leave blank to skip"
+          value={mintYear} onChange={(e) => setMintYear(e.target.value)}
+        />
+        <input
+          className="research-input" placeholder="Mint mark — leave blank to skip"
+          value={mintMark} onChange={(e) => setMintMark(e.target.value)}
+        />
+        <input
+          className="research-input" type="number" placeholder="Mintage — leave blank to skip"
+          value={mintage} onChange={(e) => setMintage(e.target.value)}
+        />
+      </div>
+      <div className="research-input-row">
+        <select value={gradingService} onChange={(e) => setGradingService(e.target.value)}>
+          <option value="">Grading service — leave unchanged</option>
+          {GRADING_SERVICES.map((g) => <option key={g} value={g}>{g}</option>)}
+        </select>
+        <input
+          className="research-input" placeholder="Grade — leave blank to skip"
+          value={grade} onChange={(e) => setGrade(e.target.value)}
+        />
+        <input
+          className="research-input" placeholder="Cert # — leave blank to skip"
+          value={certNumber} onChange={(e) => setCertNumber(e.target.value)}
+        />
+      </div>
+      <div className="research-input-row">
+        <input
+          className="research-input" type="number" step="0.01"
+          placeholder="Numismatic value ($) — leave blank to skip"
+          value={numismaticValue} onChange={(e) => setNumismaticValue(e.target.value)}
+        />
+        <input
+          className="research-input" type="date" placeholder="Value as of — leave blank to skip"
+          value={numismaticValueAsOf} onChange={(e) => setNumismaticValueAsOf(e.target.value)}
+        />
       </div>
       <div className="research-input-row">
         <input
@@ -1006,6 +1189,7 @@ function BulkUpdateForm({ itemIds, onDone, onCancel }) {
           value={notes} onChange={(e) => setNotes(e.target.value)}
         />
       </div>
+
       {error && <div className="comex-panel-note">{error}</div>}
       <div className="research-input-row">
         <button type="submit" disabled={saving}>{saving ? "Applying…" : `Apply to ${itemIds.length} item${itemIds.length === 1 ? "" : "s"}`}</button>
@@ -1141,15 +1325,38 @@ function AddForm({ onDone, onCancel }) {
 
 // --- Detail / edit view ------------------------------------------------
 
+// Full-page item editor — one comprehensive form covering every
+// stack_items column (replaces the earlier split of a minimal main form
+// + a separate "Advanced" numismatic sub-form, per the user's explicit
+// "I want to be able to see and edit all the fields used" request).
+// Organized into labeled sections for readability, not a single flat
+// wall of inputs — Basics / Weight & Value / Numismatic — but it's all
+// one <form onSubmit={handleSave}>, one Save action. Photos and
+// Reference Links keep their own independent-action sub-forms as
+// siblings (HTML forbids nesting <form> elements, and each already has
+// its own upload/add-link action distinct from the main Save).
+function FormField({ label, children }) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, color: "#5a6278" }}>
+      {label}
+      {children}
+    </label>
+  );
+}
+
 function ItemDetail({ itemId, onBack }) {
   const [item, setItem] = useState(null);
   const [description, setDescription] = useState("");
   const [series, setSeries] = useState("");
   const [metal, setMetal] = useState("silver");
+  const [form, setForm] = useState("coin");
   const [unitWeight, setUnitWeight] = useState("");
+  const [silverWeight, setSilverWeight] = useState("");
+  const [goldWeight, setGoldWeight] = useState("");
   const [count, setCount] = useState("1");
   const [purchaseDate, setPurchaseDate] = useState("");
   const [purchasePrice, setPurchasePrice] = useState("");
+  const [premiumPaid, setPremiumPaid] = useState("");
   const [mintYear, setMintYear] = useState("");
   const [mintMark, setMintMark] = useState("");
   const [mintage, setMintage] = useState("");
@@ -1172,10 +1379,14 @@ function ItemDetail({ itemId, onBack }) {
         setDescription(data.description || "");
         setSeries(data.series || "");
         setMetal(data.metal || "silver");
+        setForm(data.form || "coin");
         setUnitWeight(data.unit_weight_oz !== null && data.unit_weight_oz !== undefined ? String(data.unit_weight_oz) : "");
+        setSilverWeight(data.silver_weight_oz !== null && data.silver_weight_oz !== undefined ? String(data.silver_weight_oz) : "");
+        setGoldWeight(data.gold_weight_oz !== null && data.gold_weight_oz !== undefined ? String(data.gold_weight_oz) : "");
         setCount(String(data.count ?? 1));
         setPurchaseDate(data.purchase_date || "");
         setPurchasePrice(data.purchase_price !== null && data.purchase_price !== undefined ? String(data.purchase_price) : "");
+        setPremiumPaid(data.premium_paid !== null && data.premium_paid !== undefined ? String(data.premium_paid) : "");
         setMintYear(data.mint_year !== null && data.mint_year !== undefined ? String(data.mint_year) : "");
         setMintMark(data.mint_mark || "");
         setMintage(data.mintage !== null && data.mintage !== undefined ? String(data.mintage) : "");
@@ -1200,11 +1411,14 @@ function ItemDetail({ itemId, onBack }) {
         description: description || series || "Unlabeled item",
         series: series || null,
         metal,
-        form: item.form || "coin",
+        form,
         unit_weight_oz: unitWeight ? parseFloat(unitWeight) : null,
+        silver_weight_oz: silverWeight ? parseFloat(silverWeight) : null,
+        gold_weight_oz: goldWeight ? parseFloat(goldWeight) : null,
         count: count ? parseInt(count, 10) : 1,
         purchase_date: purchaseDate || null,
         purchase_price: purchasePrice ? parseFloat(purchasePrice) : null,
+        premium_paid: premiumPaid ? parseFloat(premiumPaid) : null,
         mint_year: mintYear ? parseInt(mintYear, 10) : null,
         mint_mark: mintMark || null,
         mintage: mintage ? parseInt(mintage, 10) : null,
@@ -1214,13 +1428,6 @@ function ItemDetail({ itemId, onBack }) {
         numismatic_value: numismaticValue ? parseFloat(numismaticValue) : null,
         numismatic_value_as_of: numismaticValueAsOf || null,
         numismatic_notes: numismaticNotes || null,
-        // premium_paid/silver_weight_oz/gold_weight_oz have no editable
-        // input anywhere in this simplified UI (dormant richer-model
-        // fields — see the tab's regression note) — preserve whatever's
-        // already on the row rather than silently wiping them.
-        premium_paid: item.premium_paid,
-        silver_weight_oz: item.silver_weight_oz,
-        gold_weight_oz: item.gold_weight_oz,
       });
       refresh();
     } catch (err) {
@@ -1337,147 +1544,153 @@ function ItemDetail({ itemId, onBack }) {
       </div>
 
       <form onSubmit={handleSave}>
+        <div className="comex-panel-note" style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.06em", margin: "12px 0 4px" }}>
+          Basics
+        </div>
         <div className="research-input-row">
           <SeriesInput value={series} onChange={setSeries} blankLabel="No series" />
         </div>
         <div className="research-input-row">
-          <input
-            className="research-input" placeholder="Description"
-            value={description} onChange={(e) => setDescription(e.target.value)}
-          />
+          <FormField label="Description">
+            <input className="research-input" value={description} onChange={(e) => setDescription(e.target.value)} />
+          </FormField>
         </div>
         <div className="research-input-row">
-          <select value={metal} onChange={(e) => setMetal(e.target.value)}>
-            {METALS.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
-          <input
-            className="research-input" type="number" step="0.0001" placeholder="oz per unit"
-            value={unitWeight} onChange={(e) => setUnitWeight(e.target.value)}
-          />
-          <input
-            className="research-input" type="number" min="1" placeholder="Quantity"
-            value={count} onChange={(e) => setCount(e.target.value)}
-          />
+          <FormField label="Metal">
+            <select value={metal} onChange={(e) => setMetal(e.target.value)}>
+              {METALS_FULL.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </FormField>
+          <FormField label="Form">
+            <select value={form} onChange={(e) => setForm(e.target.value)}>
+              {FORMS.map((f) => <option key={f} value={f}>{f}</option>)}
+            </select>
+          </FormField>
+          <FormField label="Quantity">
+            <input className="research-input" type="number" min="1" value={count} onChange={(e) => setCount(e.target.value)} />
+          </FormField>
         </div>
         <div className="research-input-row">
-          <input
-            className="research-input" type="date"
-            value={purchaseDate} onChange={(e) => setPurchaseDate(e.target.value)}
-          />
-          <input
-            className="research-input" type="number" step="0.01" placeholder="Price paid ($, total)"
-            value={purchasePrice} onChange={(e) => setPurchasePrice(e.target.value)}
-          />
+          <FormField label="Purchase date">
+            <input className="research-input" type="date" value={purchaseDate} onChange={(e) => setPurchaseDate(e.target.value)} />
+          </FormField>
+          <FormField label="Price paid ($, total for this row)">
+            <input className="research-input" type="number" step="0.01" value={purchasePrice} onChange={(e) => setPurchasePrice(e.target.value)} />
+          </FormField>
+          <FormField label="Premium paid ($)">
+            <input className="research-input" type="number" step="0.01" value={premiumPaid} onChange={(e) => setPremiumPaid(e.target.value)} />
+          </FormField>
         </div>
+
+        <div className="comex-panel-note" style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.06em", margin: "16px 0 4px" }}>
+          Weight
+        </div>
+        <div className="research-input-row">
+          <FormField label="oz per unit (primary weight model)">
+            <input className="research-input" type="number" step="0.0001" value={unitWeight} onChange={(e) => setUnitWeight(e.target.value)} />
+          </FormField>
+          <FormField label="Silver oz (explicit per-item, overrides oz/unit if set)">
+            <input className="research-input" type="number" step="0.0001" value={silverWeight} onChange={(e) => setSilverWeight(e.target.value)} />
+          </FormField>
+          <FormField label="Gold oz (explicit per-item, overrides oz/unit if set)">
+            <input className="research-input" type="number" step="0.0001" value={goldWeight} onChange={(e) => setGoldWeight(e.target.value)} />
+          </FormField>
+        </div>
+
+        <div className="comex-panel-note" style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.06em", margin: "16px 0 4px" }}>
+          Numismatic
+        </div>
+        <div className="research-input-row">
+          <FormField label="Mint year">
+            <input className="research-input" type="number" value={mintYear} onChange={(e) => setMintYear(e.target.value)} />
+          </FormField>
+          <FormField label="Mint mark">
+            <input className="research-input" value={mintMark} onChange={(e) => setMintMark(e.target.value)} />
+          </FormField>
+          <FormField label="Mintage">
+            <input className="research-input" type="number" value={mintage} onChange={(e) => setMintage(e.target.value)} />
+          </FormField>
+        </div>
+        <div className="research-input-row">
+          <FormField label="Grading service">
+            <select value={gradingService} onChange={(e) => setGradingService(e.target.value)}>
+              <option value="">No grading service</option>
+              {GRADING_SERVICES.map((g) => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </FormField>
+          <FormField label="Grade, e.g. MS70">
+            <input className="research-input" value={grade} onChange={(e) => setGrade(e.target.value)} />
+          </FormField>
+          <FormField label="Certification number">
+            <input className="research-input" value={certNumber} onChange={(e) => setCertNumber(e.target.value)} />
+          </FormField>
+        </div>
+        <div className="research-input-row">
+          <FormField label="Numismatic value ($) — hand-entered, never estimated by AV">
+            <input className="research-input" type="number" step="0.01" value={numismaticValue} onChange={(e) => setNumismaticValue(e.target.value)} />
+          </FormField>
+          <FormField label="Value as of">
+            <input className="research-input" type="date" value={numismaticValueAsOf} onChange={(e) => setNumismaticValueAsOf(e.target.value)} />
+          </FormField>
+        </div>
+        <div className="research-input-row">
+          <FormField label="Notes">
+            <input className="research-input" value={numismaticNotes} onChange={(e) => setNumismaticNotes(e.target.value)} />
+          </FormField>
+        </div>
+
         {error && <div className="comex-panel-note">{error}</div>}
-        <div className="research-input-row">
+        <div className="research-input-row" style={{ margin: "16px 0" }}>
           <button type="submit" disabled={saving}>{saving ? "Saving…" : "Save changes"}</button>
         </div>
       </form>
 
-      <details className="collapsible-pane">
-        <summary className="collapsible-pane-title">Advanced (numismatic details, photos, links)</summary>
+      <details className="collapsible-pane" open>
+        <summary className="collapsible-pane-title">Photos ({item.images.length}/5)</summary>
         <div className="collapsible-pane-body">
-          <form onSubmit={handleSave}>
-            <div className="research-input-row">
-              <input
-                className="research-input" type="number" placeholder="Mint year"
-                value={mintYear} onChange={(e) => setMintYear(e.target.value)}
-              />
-              <input
-                className="research-input" placeholder="Mint mark"
-                value={mintMark} onChange={(e) => setMintMark(e.target.value)}
-              />
-              <input
-                className="research-input" type="number" placeholder="Mintage"
-                value={mintage} onChange={(e) => setMintage(e.target.value)}
-              />
-            </div>
-            <div className="research-input-row">
-              <select value={gradingService} onChange={(e) => setGradingService(e.target.value)}>
-                <option value="">No grading service</option>
-                {GRADING_SERVICES.map((g) => <option key={g} value={g}>{g}</option>)}
-              </select>
-              <input
-                className="research-input" placeholder="Grade, e.g. MS70"
-                value={grade} onChange={(e) => setGrade(e.target.value)}
-              />
-              <input
-                className="research-input" placeholder="Certification number"
-                value={certNumber} onChange={(e) => setCertNumber(e.target.value)}
-              />
-            </div>
-            <div className="research-input-row">
-              <input
-                className="research-input" type="number" step="0.01"
-                placeholder="Numismatic value ($) — hand-entered, never estimated by AV"
-                value={numismaticValue} onChange={(e) => setNumismaticValue(e.target.value)}
-              />
-              <input
-                className="research-input" type="date" placeholder="Value as of"
-                value={numismaticValueAsOf} onChange={(e) => setNumismaticValueAsOf(e.target.value)}
-              />
-            </div>
-            <div className="research-input-row">
-              <input
-                className="research-input" placeholder="Notes"
-                value={numismaticNotes} onChange={(e) => setNumismaticNotes(e.target.value)}
-              />
-            </div>
-            {error && <div className="comex-panel-note">{error}</div>}
-            <div className="research-input-row">
-              <button type="submit" disabled={saving}>{saving ? "Saving…" : "Save numismatic details"}</button>
-            </div>
+          <div className="research-input-row">
+            <input type="file" accept="image/*" multiple onChange={handlePhotoUpload} disabled={item.images.length >= 5} />
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {item.images.map((img) => (
+              <div key={img.id} style={{ position: "relative" }}>
+                <img
+                  src={`/stack_images/${img.file_path}`}
+                  alt={img.caption || "stack item photo"}
+                  style={{ width: 96, height: 96, objectFit: "cover", cursor: "pointer" }}
+                  onClick={() => setLightbox(img)}
+                />
+                <button type="button" onClick={() => handleDeletePhoto(img.id)} style={{ position: "absolute", top: 0, right: 0 }}>
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </details>
+
+      <details className="collapsible-pane">
+        <summary className="collapsible-pane-title">Reference links ({item.reference_links.length})</summary>
+        <div className="collapsible-pane-body">
+          <ul>
+            {item.reference_links.map((link) => (
+              <li key={link.id}>
+                <a href={link.url} target="_blank" rel="noreferrer">{link.label || link.url}</a>{" "}
+                <button type="button" onClick={() => handleDeleteLink(link.id)}>Remove</button>
+              </li>
+            ))}
+          </ul>
+          <form onSubmit={handleAddLink} className="research-input-row">
+            <input
+              className="research-input" placeholder="URL (Numista listing, PCGS pop report, ...)"
+              value={linkUrl} onChange={(e) => setLinkUrl(e.target.value)}
+            />
+            <input
+              className="research-input" placeholder="Label"
+              value={linkLabel} onChange={(e) => setLinkLabel(e.target.value)}
+            />
+            <button type="submit">Add link</button>
           </form>
-
-          <details className="collapsible-pane" open>
-            <summary className="collapsible-pane-title">Photos ({item.images.length}/5)</summary>
-            <div className="collapsible-pane-body">
-              <div className="research-input-row">
-                <input type="file" accept="image/*" multiple onChange={handlePhotoUpload} disabled={item.images.length >= 5} />
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {item.images.map((img) => (
-                  <div key={img.id} style={{ position: "relative" }}>
-                    <img
-                      src={`/stack_images/${img.file_path}`}
-                      alt={img.caption || "stack item photo"}
-                      style={{ width: 96, height: 96, objectFit: "cover", cursor: "pointer" }}
-                      onClick={() => setLightbox(img)}
-                    />
-                    <button type="button" onClick={() => handleDeletePhoto(img.id)} style={{ position: "absolute", top: 0, right: 0 }}>
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </details>
-
-          <details className="collapsible-pane">
-            <summary className="collapsible-pane-title">Reference links ({item.reference_links.length})</summary>
-            <div className="collapsible-pane-body">
-              <ul>
-                {item.reference_links.map((link) => (
-                  <li key={link.id}>
-                    <a href={link.url} target="_blank" rel="noreferrer">{link.label || link.url}</a>{" "}
-                    <button type="button" onClick={() => handleDeleteLink(link.id)}>Remove</button>
-                  </li>
-                ))}
-              </ul>
-              <form onSubmit={handleAddLink} className="research-input-row">
-                <input
-                  className="research-input" placeholder="URL (Numista listing, PCGS pop report, ...)"
-                  value={linkUrl} onChange={(e) => setLinkUrl(e.target.value)}
-                />
-                <input
-                  className="research-input" placeholder="Label"
-                  value={linkLabel} onChange={(e) => setLinkLabel(e.target.value)}
-                />
-                <button type="submit">Add link</button>
-              </form>
-            </div>
-          </details>
         </div>
       </details>
 
