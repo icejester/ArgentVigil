@@ -85,6 +85,7 @@ ALLOWED_NON_DB_API = {
     "/api/ui/pinned-section": "pinned-tab state read/write — app state, no upstream",
     "/api/silver/market-balance": "reads seed_data JSON server-side — no upstream fetch",
     "/api/catcor/research/": "Research workflow (sessions/personas/preview) — on-demand chat, no market upstream",
+    "/api/stack/": "Stack Tracker CRUD (specs/stackTracker-spec.md) — user-owned data, no upstream fetch at all",
 }
 
 # Limitation, documented: this scans string-literal fetch() URLs only.

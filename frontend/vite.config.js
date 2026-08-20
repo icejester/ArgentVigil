@@ -12,6 +12,13 @@ export default defineConfig({
         target: "http://localhost:8000",
         changeOrigin: true,
       },
+      // Stack Tracker's photo storage — a StaticFiles mount, not an /api
+      // route, so it needs its own proxy entry (see backend/main.py's
+      // /stack_images mount).
+      "/stack_images": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
     },
   },
   publicDir: path.resolve(__dirname, "../pipeline/cache"),

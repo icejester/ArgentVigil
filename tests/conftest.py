@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend import db as db_module  # noqa: E402
+from backend import stack_db as stack_db_module  # noqa: E402
 
 
 @pytest.fixture()
@@ -37,12 +38,49 @@ def tmp_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def tmp_stack_db(tmp_path, monkeypatch):
+    """Stack Tracker's own throwaway SQLite file — separate from tmp_db by
+    design, mirroring stack.db's real physical separation from
+    argentvigil.db (specs/stackTracker-spec.md section 1)."""
+    monkeypatch.setattr(stack_db_module, "DB_PATH", str(tmp_path / "stack_test.db"))
+    stack_db_module.init_db()
+    return stack_db_module
+
+
+@pytest.fixture()
+def tmp_stack_images(tmp_path, monkeypatch):
+    """Throwaway photo-storage root so uploaded test files never touch the
+    real runtime/stack_images/."""
+    images_root = str(tmp_path / "stack_images_test")
+    import os
+
+    os.makedirs(images_root, exist_ok=True)
+    monkeypatch.setattr(stack_db_module, "IMAGES_ROOT", images_root)
+    return images_root
+
+
+@pytest.fixture()
 async def client(tmp_db):
     """The real app driven through httpx.ASGITransport — the same httpx the
     app itself uses, rather than starlette's deprecated TestClient shim
     (which warns on import). Lifespan deliberately never runs: no upstream
     fetches fire, no scheduler loops start, and routes see the tmp DB via
     the tmp_db fixture's monkeypatch."""
+    import httpx
+
+    from backend.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        yield c
+
+
+@pytest.fixture()
+async def stack_client(tmp_db, tmp_stack_db, tmp_stack_images):
+    """Same as client, but also redirects Stack Tracker's separate DB/image
+    storage — for route-level tests that exercise /api/stack/* endpoints,
+    which read argentvigil.db's spot prices (tmp_db) as well as stack.db
+    (tmp_stack_db)."""
     import httpx
 
     from backend.main import app

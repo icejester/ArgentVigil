@@ -590,6 +590,19 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 
 /* Vault table */
 .comex-table-wrap { overflow-x: auto; }
+/* Stack Tracker's list views (flat/date/series) cap to ~10 visible rows and
+   scroll vertically past that, per the user's explicit request — the
+   header row stays pinned via position: sticky so column labels/sort
+   arrows stay visible while scrolling. 34px/row is an estimate matching
+   .comex-table td's real padding+line-height; the max-height is a visual
+   cap, not an exact 10-row guarantee for wrapped/taller content. */
+.comex-table-wrap--capped { max-height: 364px; overflow-y: auto; }
+.comex-table-wrap--capped thead th { position: sticky; top: 0; background: #0f1117; z-index: 1; }
+/* Stack Tracker's list/group tables — alternating row background for
+   readability across many rows, scoped to this modifier (not the shared
+   .comex-table) so other tabs' tables are unaffected. */
+.comex-table--zebra tbody tr:nth-child(even) td { background: #161b26; }
+.comex-table--zebra tbody tr:hover td { background: #1c2231; }
 .comex-table {
   width: 100%; border-collapse: collapse; font-size: 12px; min-width: 620px;
 }
