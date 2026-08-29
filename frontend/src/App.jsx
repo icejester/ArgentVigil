@@ -7,6 +7,7 @@ import CatcorPanel from "./catcor_panel";
 import DataPanel, { computeStatus } from "./data_panel";
 import ResearchPanel from "./research_panel";
 import StackTracker from "./stack_tracker";
+import SanctionsPanel from "./sanctions_panel";
 import { HealthProvider, useHealthRows } from "./health_context";
 
 const SECTIONS = [
@@ -17,6 +18,7 @@ const SECTIONS = [
   { key: "research", label: "Research" },
   { key: "data", label: "Data" },
   { key: "stack", label: "Stack" },
+  { key: "sanctions", label: "OFAC" },
 ];
 
 // Small passive-visibility dot (Story #7) — red if any tracked source is
@@ -302,6 +304,13 @@ export default function App() {
         }
       >
         <StackTracker />
+      </div>
+      <div
+        className={
+          "app-shell" + (activeSection === "sanctions" ? "" : " section-hidden")
+        }
+      >
+        <SanctionsPanel />
       </div>
     </HealthProvider>
   );

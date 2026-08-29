@@ -428,7 +428,7 @@
   {
     "key": "pslv",
     "label": "Sprott (PSLV)",
-    "origin": "Sprott direct API",
+    "origin": "Sprott direct API. The response is a flat array covering ALL of Sprott's physical bullion trusts, not just PSLV — confirmed live 2026-08-28 that every entry's own \"id\" field (which used to distinguish PSLV via id=4998) is now always 0, a real Sprott-side API change that silently broke the old id-based filter (every fetch since then 502'd). No query param, header, or metadata endpoint identifies a fund in this payload; the fix (and Sprott's own bullion-calculator page, confirmed by inspecting its source) instead reads PSLV by a fixed array position: index 0=PHYS (gold), 1=PSLV (silver), 2=SPPP (platinum/palladium), 3=CEF (gold+silver), 4=SPUT (uranium), 5=COP (copper); indices 6-11 are the matching {last,tradeDate,tradeTime} quote objects in the same order. _fetch_and_persist_pslv guards this fragile fixed-index read with a sanity check on totalOunces1 (must fall in PSLV's plausible real range, ~100M-400M oz) so a future Sprott reorder fails loudly instead of silently mislabeling a different fund's data as PSLV.",
     "sourceKeys": [
       "pslv"
     ],
@@ -594,6 +594,112 @@
           ]
         ],
         "note": "Upsert (INSERT ... ON CONFLICT), not append-only \u2014 Census revises trade data annually every April, unlike CFTC's immutable-once-published reports (see international-trade-spec.md Decision 5). Each fetch checks a 5-month window per (metal, flow) to land 3 real months, since Census's real publication lag is confirmed live at ~2 months (both the current calendar month and the immediately-prior one return HTTP 204 until released) \u2014 a self-heal against both that lag and a late revision landing between gate-interval runs. The ~25-day rate-limit gate itself is keyed on wall-clock time since the last fetch attempt (source_health.last_attempt_at), not on the persisted data's own age \u2014 gating on data age (mirroring cot_pipeline's CFTC pattern) would never actually trigger given the 2-month lag, a real design correction made during implementation. GET /api/census-trade/db additionally returns implied_qty_oz per row \u2014 value_general_usd \u00f7 that month's XAG_CLOSE/XAU_CLOSE month-end close, computed at read time in db.get_census_trade and never stored (CLAUDE.md's computed-at-read-time convention). An estimate, not a reported weight (Census reports none for these HS codes \u2014 see qty above): NULL whenever the month's spot close is missing, rendered as 'oz (est.)' in the Trade Flow panel."
+      }
+    ]
+  },
+  {
+    "key": "ofac_sanctions",
+    "label": "OFAC \u2014 Sanctions List Service (SDN + Consolidated, Advanced XML)",
+    "origin": "U.S. Treasury OFAC Sanctions List Service, official bulk XML export \u2014 free, no auth, no API key. Confirmed live: no published rate limit, but a User-Agent header IS required (a bare request without one gets a 403). Pulls the ADVANCED XML variants specifically \u2014 sdn_advanced.xml (~126MB, ~19,300 entities) and cons_advanced.xml (~4.5MB, ~480 entities, genuinely NOT redundant with the SDN file \u2014 388 of its profiles don't appear there at all) \u2014 every day, across every OFAC program (Iran, Russia, Venezuela, North Korea, narcotics, cyber, everything \u2014 no program filter at fetch time, per sanctionsTimeline-spec.md's explicit scope decision). NOT the plain sdn.xml/consolidated.xml files this feature originally used: those have no per-entity designation date anywhere in their schema, confirmed live, which the Advanced variants' SanctionsEntry/EntryEvent/Date DOES carry (a real correction made after the plain-file version shipped with designation_date permanently NULL) \u2014 the same Advanced files also carry every alias, address, and ID/registration document per entity, captured in the three child tables below (a 2026-08-26 follow-up). Only the DIFF against the prior pull is persisted for the parent designation row (new designations, delistings) \u2014 not a daily snapshot dump; the three entity-detail child tables are instead fully replaced per entity on every fetch (see their own notes below for why). Diffing runs on OFAC's own stable ofac_uid (Profile/@ID under the Advanced schema), never name matching (OFAC entries carry many aliases/transliterations that get reformatted between publications without the underlying entity changing). Frontend surface: a standalone \"OFAC\" nav tab (frontend/src/sanctions_panel.jsx) \u2014 a searchable/sortable/paginated table, with each entity name linking to a detail view (aliases/addresses/ID documents). An earlier version displayed this as vertical markers overlaid on the Money Supply tab's charts; that was removed at the user's request as visual noise, and the tab was built instead \u2014 not routed through CATCOR's Research Pane workflow either way (a designation isn't a claim requiring judgment \u2014 Treasury already decided it happened).",
+    "sourceKeys": [
+      "ofac_sanctions"
+    ],
+    "curl": "curl -A \"ArgentVigil/1.0\" \"https://sanctionslistservice.ofac.treas.gov/api/download/sdn_advanced.xml\"\ncurl -A \"ArgentVigil/1.0\" \"https://sanctionslistservice.ofac.treas.gov/api/download/cons_advanced.xml\"\n# both 302-redirect to a short-lived signed S3 URL; a plain curl -L or httpx's default follow_redirects handles this transparently. Advanced XML's root element namespace is .../exports/ADVANCED_XML, NOT the plain files' .../exports/XML \u2014 a real bug caught mid-build when the wrong namespace silently matched zero elements rather than erroring.",
+    "tables": [
+      {
+        "name": "ofac_designations",
+        "fields": [
+          [
+            "id",
+            "PK, autoincrement"
+          ],
+          [
+            "ofac_uid",
+            "OFAC's own internal entity identifier (Profile/@ID under the Advanced XML parse) \u2014 the diff/join key, unique. Never re-derived from name matching."
+          ],
+          [
+            "entity_name",
+            "Primary published name, assembled from the primary Alias's DocumentedName/DocumentedNamePart/NamePartValue chain (falls back to the first Alias present if none is marked Primary, confirmed live this happens on some real entries)."
+          ],
+          [
+            "entity_type",
+            "individual / entity / vessel / aircraft \u2014 resolved via PartySubTypeID (1/2 map directly to vessel/aircraft; 3/4, both labeled 'Unknown' in PartySubTypeValues, resolve via that subtype's own PartyTypeID attribute \u2014 a real bug caught mid-build: an early version defaulted 3/4 to 'entity' unconditionally, silently misclassifying every real Individual). Captured now even though the frontend renders one marker type for all types at launch (sanctionsTimeline-spec.md Story #3) \u2014 a future marker-type breakout is a display-time filter against data already here, not new ingestion work."
+          ],
+          [
+            "program_tags",
+            "JSON array of OFAC program strings (e.g. IRAN, RUSSIA-EO14024, SDGT) \u2014 an entity can carry more than one. Sourced from SanctionsMeasure elements with SanctionsTypeID=1 ('Program'), whose own Comment element carries the program name directly (confirmed live, e.g. <Comment>CUBA</Comment>) \u2014 NOT a separate ID-linked table the way the plain files' <program> elements are. Stored as TEXT, encoded/decoded at the db.py boundary."
+          ],
+          [
+            "list_source",
+            "'SDN' or 'Consolidated' \u2014 confirmed live these are genuinely separate lists, not a superset/subset naming quirk."
+          ],
+          [
+            "designation_date",
+            "A real per-entity date, sourced from SanctionsEntry/EntryEvent/Date filtered to EntryEventTypeID=1 ('Created' per EntryEventTypeValues \u2014 confirmed live the only EntryEventType value that exists in this data). Confirmed live on real entries back to 1981-01-07. The EARLIEST such date across all of a profile's SanctionsEntry rows is kept, if it has more than one (multiple lists). Still nullable in principle and never backfilled from a fallback when genuinely absent, per nulls-over-zeros \u2014 but the common case is now a real date, correcting this feature's original ship (which used the plain, non-Advanced XML files and had no per-entity date source at all)."
+          ],
+          [
+            "legal_basis",
+            "2026-08-27 follow-up. A real, mostly-populated (confirmed live: 91.5% of a full fetch, 18,031/19,707) human-readable legal authority string (e.g. 'Executive Order 14024 (Russia)'), sourced from that SAME EntryEvent's own LegalBasisID (resolved via LegalBasisValues), tracked alongside designation_date on the same earliest-EntryEvent-wins basis. NULL when the source resolves to the dictionary's own 'Unknown' placeholder, never the literal string. Confirmed live that OFAC's own LegalBasis->SanctionsProgram link is broken (every LegalBasis element's SanctionsProgramID points at 'Unknown' regardless of real subject) \u2014 this field is per-designation context, not a working per-program reference; no per-program detail page exists in this data."
+          ],
+          [
+            "vessel_flag",
+            "Nullable, populated only when entity_type = vessel (flag state). Sourced from Feature/FeatureVersion matched by FeatureTypeID=3; the value is either inline text or a DetailReferenceID pointer needing a lookup (see vessel_type)."
+          ],
+          [
+            "vessel_type",
+            "Nullable, populated only when entity_type = vessel (e.g. Tug, Tanker). FeatureTypeID=2; confirmed live some real values arrive as a DetailReferenceID pointer rather than inline text (e.g. DetailReferenceID=705 resolves to 'Tug' via the ReferenceValueSets/DetailReferenceValues lookup), not always a plain string."
+          ],
+          [
+            "first_seen_snapshot_date",
+            "Date this entity first appeared in AV's own daily pull \u2014 the fallback chart-placement anchor for the rare row without a real designation_date; GET /api/ofac/db's chart_date field (COALESCE(designation_date, first_seen_snapshot_date)) is what the frontend actually reads."
+          ],
+          [
+            "last_seen_snapshot_date",
+            "Most recent daily pull the entity was still present in. Bumped on every re-seen entity, alongside a one-time backfill of designation_date/entity_name/program_tags/vessel_flag/vessel_type whenever the persisted value is NULL/empty and today's pull has a real one \u2014 this converges older rows to real data without becoming ongoing content-diffing (an already-real field is never overwritten)."
+          ],
+          [
+            "delisted_date",
+            "Nullable \u2014 set when an entity present in a prior pull is absent from the current one. A state change on the existing row, never a new row, never a deletion. Cleared again if the same uid is later re-listed."
+          ],
+          [
+            "created_at / updated_at",
+            "Standard bookkeeping."
+          ]
+        ],
+        "note": "First-ever run has no prior snapshot to diff against, so it registers the ENTIRE current list (~19,700 entities confirmed live) as 'new' \u2014 an expected one-time bootstrap event, not a data bug or an actual single-day sanctions wave. Unlike this feature's original plain-XML version, real designation_date values now spread this bootstrap pull across genuine history (confirmed live: 1,470 distinct real dates spanning 1981\u20132026) rather than collapsing onto one date."
+      },
+      {
+        "name": "ofac_aliases",
+        "fields": [
+          ["id", "PK, autoincrement"],
+          ["ofac_uid", "FK to ofac_designations.ofac_uid (not enforced \u2014 this codebase's sqlite3 connections don't turn on PRAGMA foreign_keys, same as every other table here)."],
+          ["name", "One alias name \u2014 confirmed live an entity can carry several (A.K.A./F.K.A./N.K.A. plus the primary 'Name' entry); this table holds ALL of them, not just the one ofac_designations.entity_name picks."],
+          ["is_primary", "1 for the alias ofac_designations.entity_name was assembled from, 0 otherwise."],
+          ["alias_type", "AliasTypeValues' own label \u2014 confirmed live only 4 values exist in this data: A.K.A., F.K.A., N.K.A., Name."]
+        ],
+        "note": "REPLACE-ALL on every fetch, not append-only \u2014 every daily fetch deletes and re-inserts every row for every ofac_uid present in that day's pull (db.replace_ofac_entity_detail), since this represents OFAC's current claim about an entity's known names, not a history of when an alias was added."
+      },
+      {
+        "name": "ofac_addresses",
+        "fields": [
+          ["id", "PK, autoincrement"],
+          ["ofac_uid", "FK to ofac_designations.ofac_uid (not enforced)."],
+          ["address1 / address2 / address3", "Street-level address parts \u2014 confirmed live these arrive as typed LocationPart elements (LocPartTypeID -> ADDRESS1/ADDRESS2/ADDRESS3, a ReferenceValueSets lookup), not fixed XML field names. NULL, not empty string, for any part the real address doesn't have \u2014 confirmed live most real addresses are partial (country-only is common)."],
+          ["city / state_province / postal_code", "Same typed-LocationPart sourcing as above (CITY/STATE-PROVINCE/POSTAL CODE)."],
+          ["country", "Resolved from the Location's own LocationCountry/@CountryID via the CountryValues lookup \u2014 not a raw ID."]
+        ],
+        "note": "Confirmed live 2026-08-26 that address data lives in a genuinely SEPARATE top-level XML section (Locations), reached from a Profile via Feature/FeatureVersion/VersionLocation (FeatureTypeID=25) rather than nested under the party the way vessel Feature detail is \u2014 a real correction made during implementation after an initial guess at the join element name (FeatureVersionReference) turned out to be wrong; the real element is VersionLocation. REPLACE-ALL on every fetch, same policy as ofac_aliases."
+      },
+      {
+        "name": "ofac_id_documents",
+        "fields": [
+          ["id", "PK, autoincrement"],
+          ["ofac_uid", "FK to ofac_designations.ofac_uid (not enforced)."],
+          ["id_type", "IDRegDocTypeValues' own label \u2014 e.g. Passport, SSN, Cedula No., Driver's License No., R.F.C., D.N.I."],
+          ["id_number", "The document's own registration number (IDRegistrationNo)."],
+          ["issuing_country", "Resolved from the document's own IssuedBy-CountryID via the same CountryValues lookup addresses use."]
+        ],
+        "note": "Confirmed live 2026-08-26 (correcting a wrong assumption made during planning) that the PRIMARY join for ID documents is direct \u2014 IDRegDocument carries its own IdentityID attribute pointing straight at a Profile's Identity/@ID (22,667 real documents in a full SDN pull use this path) \u2014 NOT primarily via Location the way addresses are, though a smaller, real Location-mediated path also exists (183 instances) and is captured the same way since every IDRegDocument carries IdentityID regardless of which path references it. REPLACE-ALL on every fetch, same policy as ofac_aliases/ofac_addresses."
       }
     ]
   },

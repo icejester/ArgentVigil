@@ -34,7 +34,16 @@
       "Bash(curl -s -o /dev/null -w \"app: %{http_code}\\\\n\" http://localhost:5173/)",
       "Bash(curl -s http://localhost:8000/api/stack/items/db)",
       "Bash(python3 -c \"import json,sys; print\\(len\\(json.load\\(sys.stdin\\)['data']\\), 'items'\\)\")",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(curl -sL -A \"ArgentVigil/1.0 \\(sanctions-timeline research\\)\" \"https://sanctionslistservice.ofac.treas.gov/api/download/consolidated.xml\" -o /tmp/consolidated_sample.xml --max-time 60 -w \"HTTP:%{http_code} SIZE:%{size_download}\\\\n\")",
+      "Bash(head -c 3000 /tmp/consolidated_sample.xml)",
+      "Read(//private/tmp/**)",
+      "Bash(sort -u -t'>' -k1)",
+      "Bash(awk -F'>' '{print $1}')",
+      "Bash(curl -sL -A \"ArgentVigil/1.0 \\(sanctions-timeline research\\)\" \"https://sanctionslistservice.ofac.treas.gov/api/download/sdn.xml\" -o /tmp/sdn_sample.xml --max-time 120 -w \"HTTP:%{http_code} SIZE:%{size_download}\\\\n\")",
+      "Bash(python3 -)",
+      "Bash(npx vite *)",
+      "Bash(rm -f /tmp/sdn_adv3.xml)"
     ]
   }
 }
