@@ -1,4 +1,4 @@
-# ArgentVigil v2.12.0
+# ArgentVigil v2.16.2
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -39,6 +39,10 @@ A workbench for testing one claim at a time — "SLV shorts are covering," "indu
 #### Data
 
 Provenance and health. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. Every source that recurs on its own now does so at its own real upstream cadence — daily for exchange-inventory data, weekly/monthly for slower macro sources — rather than one shared polling interval, and that same freshness readout follows the data itself: every tab's sub-panels carry their own compact "how stale is this, refresh now" badge, not just the Data tab. This panel is held to a strict rule: any change to what the app stores or fetches must land a matching Data-tab update in the same change — enforced by the test suite, not by memory.
+
+#### OFAC
+
+A monitoring view over OFAC's full SDN and Consolidated Sanctions List — every current designation, across every program, with real per-entity designation dates going back to 1981. Search matches across every field at once; group by program, entity type, or list source to see counts before drilling in; sort by any column. Each designation also carries its real legal authority (e.g. "Executive Order 14024 (Russia)") wherever OFAC's own data provides one. Not a correlation tool against the metals/debasement data (that idea was tried as a chart overlay and dropped as noise); just a straight list for keeping an eye on what's currently sanctioned. Every entity's aliases, addresses, and ID/registration documents (passport numbers, SWIFT/BIC codes, and more, wherever OFAC publishes them) are captured server-side.
 
 ### Where does the data come from, and why?
 
@@ -108,6 +112,7 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
 | Macro event consensus | ForexFactory free calendar feed | Cached weekly (current Sun–Sat week only) |
 | Event-window price reactions (XAG / XAU) | Yahoo Finance intraday (5-min bars) / daily close fallback | Per event |
 | International trade flow, HS 7106 (silver) / 7108 (gold) | U.S. Census Bureau International Trade API | Monthly, ~25-day gated |
+| OFAC sanctions designations (SDN + Consolidated, all programs, real designation dates) | Treasury OFAC Sanctions List Service (bulk Advanced XML) | Daily (slow tier) |
 | Annual supply/demand balance | Silver Institute World Silver Survey (manually transcribed) | Annual |
 | Research tab chat backend | Anthropic Messages API / amp-forge LAN service | On-demand |
 | COMEX rulebook (Ch. 112/113 — Last Trade Day rule) | CME Group, static reference PDFs | One-time reference |

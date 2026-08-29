@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from bisect import bisect_right
@@ -189,6 +190,138 @@ CREATE TABLE IF NOT EXISTS census_trade (
     qty_unit TEXT,
     fetched_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (metal, flow, hs_code, cty_code, year, month)
+);
+
+-- OFAC Sanctions List Service — full SDN + Consolidated Sanctions List,
+-- diffed daily against Treasury's own stable ofac_uid (sanctionsTimeline-
+-- spec.md Story #1). NOT a daily snapshot dump — only the DIFF result
+-- (new designations, delistings) is persisted; a uid seen again on a later
+-- pull just bumps last_seen_snapshot_date (plus a one-time backfill of any
+-- previously-NULL field — see diff_and_persist_ofac_designations).
+--
+-- designation_date: real per-entity dates ARE available, but only from the
+-- ADVANCED file variants (sdn_advanced.xml/cons_advanced.xml), not the
+-- plain sdn.xml/consolidated.xml this feature originally shipped with —
+-- confirmed live 2026-08-25 that the plain files genuinely have no
+-- per-entity designation date anywhere (only a document-level Publish_Date
+-- and unrelated per-entity dates like date of birth), which is why this
+-- comment used to say designation_date stays permanently NULL. That
+-- conclusion was corrected 2026-08-26 after actually inspecting the
+-- Advanced files: SanctionsEntry/EntryEvent/Date (EntryEventTypeID=1 =
+-- "Created") carries a real, per-entity date confirmed on real entries
+-- back to at least 1984 — see main.py's _parse_ofac_advanced_xml for the
+-- parse/join. Still nullable in principle (an entity could theoretically
+-- have no Created EntryEvent) and still never backfilled from
+-- first_seen_snapshot_date or a document-level date when genuinely absent,
+-- per the standing nulls-over-zeros convention — but the common case now
+-- is a real date, not NULL. first_seen_snapshot_date remains the fallback
+-- chart-placement anchor for the rare row without one.
+--
+-- program_tags is a JSON array (an entity can carry more than one program)
+-- stored as TEXT — no existing JSON-array column convention elsewhere in
+-- this schema to match, so json.dumps/json.loads at the db.py boundary is
+-- used, same "derived/encoded at the boundary, plain Python on either
+-- side" shape as every other helper in this file.
+CREATE TABLE IF NOT EXISTS ofac_designations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ofac_uid TEXT NOT NULL UNIQUE,
+    entity_name TEXT NOT NULL,
+    entity_type TEXT,
+    program_tags TEXT,
+    list_source TEXT NOT NULL,
+    designation_date TEXT,
+    legal_basis TEXT,
+    vessel_flag TEXT,
+    vessel_type TEXT,
+    first_seen_snapshot_date TEXT NOT NULL,
+    last_seen_snapshot_date TEXT NOT NULL,
+    delisted_date TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Entity detail child tables (OFAC entity-detail follow-up, 2026-08-26) —
+-- one-to-many off ofac_designations.ofac_uid, capturing data the Advanced
+-- XML already publishes per entity that the original ofac_designations
+-- parse didn't extract (only the primary alias became entity_name, and
+-- addresses/ID documents weren't touched at all). REPLACE-ALL ON EVERY
+-- FETCH, not append-only, not diffed row-by-row: these represent "OFAC's
+-- current claim about this entity" the same way entity_name/program_tags
+-- do, not a history of when an alias was added — every daily fetch deletes
+-- and re-inserts all three tables' rows for every ofac_uid present in that
+-- day's pull (see db.replace_ofac_entity_detail). No FOREIGN KEY constraint
+-- enforcement (this codebase's sqlite3 connections don't turn on
+-- PRAGMA foreign_keys — same as every other table here), the REFERENCES
+-- clause is documentation of intent only.
+--
+-- ofac_aliases: confirmed live (2026-08-26) that OFAC's own Advanced XML
+-- carries every alias per entity (Profile/Identity/Alias, each with its own
+-- DocumentedName), not just the one this app already picks as entity_name
+-- (the Primary="true" alias, or the first one present) — see main.py's
+-- _ofac_parse_aliases. alias_type is AliasTypeValues' own label (A.K.A. /
+-- F.K.A. / N.K.A. / "Name" for the primary), confirmed live these 4 are the
+-- only values that exist in this data.
+CREATE TABLE IF NOT EXISTS ofac_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ofac_uid TEXT NOT NULL,
+    name TEXT NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    alias_type TEXT,
+    FOREIGN KEY (ofac_uid) REFERENCES ofac_designations(ofac_uid)
+);
+
+-- ofac_addresses: confirmed live that address data lives in a SEPARATE
+-- top-level Locations section (not nested under DistinctParty the way
+-- vessel Feature detail is), reached via a Profile's own Feature/
+-- FeatureVersion/FeatureVersionReference chain (FeatureTypeID=25,
+-- "Location" — the same feature type this app's vessel-flag parsing
+-- already walks past for other FeatureTypeIDs). Each Location's address
+-- parts are typed (LocPartTypeID -> ADDRESS1/ADDRESS2/ADDRESS3/CITY/
+-- STATE-PROVINCE/POSTAL CODE, a ReferenceValueSets lookup) rather than
+-- fixed XML field names, and country is a separate CountryID ->
+-- CountryValues join — see main.py's _ofac_parse_locations. Any part an
+-- entity's real address doesn't have (most addresses are partial —
+-- country-only is common) is NULL, per nulls-over-zeros, never an empty
+-- string standing in for "not present."
+CREATE TABLE IF NOT EXISTS ofac_addresses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ofac_uid TEXT NOT NULL,
+    address1 TEXT,
+    address2 TEXT,
+    address3 TEXT,
+    city TEXT,
+    state_province TEXT,
+    postal_code TEXT,
+    country TEXT,
+    FOREIGN KEY (ofac_uid) REFERENCES ofac_designations(ofac_uid)
+);
+
+-- ofac_id_documents: confirmed live (2026-08-26, a real correction to an
+-- initial wrong assumption during planning) that ID documents are NOT
+-- reached primarily via Location at all — IDRegDocument is its own
+-- top-level section (22,667 real elements in a full SDN Advanced pull,
+-- vs. only 183 IDRegDocumentReference elements living inside Locations),
+-- and each IDRegDocument carries its own IdentityID attribute, a DIRECT
+-- join back to Profile/Identity/@ID (confirmed live: IDRegDocument
+-- IdentityID=6746 resolves to a real Identity 6746 under Profile
+-- FixedRef=15002, entity FLORES APODACA). The Location-mediated path (183
+-- instances) is real but a small minority, likely address-attached
+-- documents rather than person-attached ones — main.py's
+-- _ofac_parse_id_documents captures BOTH paths (IdentityID-direct as the
+-- primary join, plus any Location-mediated references not already covered)
+-- rather than assuming only one exists, since guessing wrong here would
+-- silently drop real documents with no visible error, the same class of
+-- bug as this feature's earlier namespace/entity_type misses. id_type is
+-- IDRegDocTypeValues' own label (Passport, SSN, Cedula No., Driver's
+-- License No., etc.); issuing_country resolves IssuedBy-CountryID via the
+-- same CountryValues join addresses use.
+CREATE TABLE IF NOT EXISTS ofac_id_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ofac_uid TEXT NOT NULL,
+    id_type TEXT,
+    id_number TEXT,
+    issuing_country TEXT,
+    FOREIGN KEY (ofac_uid) REFERENCES ofac_designations(ofac_uid)
 );
 
 -- Monthly Treasury Statement topline (fed-spend-spec.md Story #1) —
@@ -537,6 +670,22 @@ def init_db():
         # get_pinned_section()'s None-means-unset convention below.
         try:
             conn.execute("ALTER TABLE ui_settings ADD COLUMN refresh_enabled INTEGER")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # ofac_designations: legal_basis, added for the OFAC tab's
+        # search/group-by UI pass (2026-08-27) — a real, mostly-populated
+        # (confirmed live: ~92% resolve to something real, not the
+        # dictionary's own "Unknown" placeholder) human-readable legal
+        # authority string per designation (e.g. "Executive Order 14024
+        # (Russia)"), sourced from the same EntryEvent designation_date
+        # already comes from. NOT the same thing as a per-program
+        # description page — OFAC's own LegalBasis->SanctionsProgram link is
+        # confirmed broken in their data (every LegalBasis row points at
+        # SanctionsProgramID=1, "Unknown," regardless of its real subject),
+        # so this is the closest real substitute: per-designation context,
+        # not a standalone program reference.
+        try:
+            conn.execute("ALTER TABLE ofac_designations ADD COLUMN legal_basis TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -1082,6 +1231,278 @@ def get_census_trade(metal: str, flow: str | None = None, hs_code: str | None = 
         else:
             row["implied_qty_oz"] = None
     return result
+
+
+def diff_and_persist_ofac_designations(current_entries: list[dict], snapshot_date: str) -> dict:
+    """The real ingestion logic for sanctionsTimeline-spec.md Story #1 —
+    diffs today's freshly-parsed full OFAC pull against what's already
+    persisted, using ofac_uid as the stable join key (never name matching,
+    per the spec — OFAC entries carry many aliases/transliterations and get
+    reformatted without the underlying entity changing).
+
+    current_entries: list of dicts shaped like
+        {"ofac_uid", "entity_name", "entity_type", "program_tags" (list),
+         "list_source", "designation_date" (a real date since the switch to
+         parsing sdn_advanced.xml/cons_advanced.xml — see main.py's
+         _parse_ofac_advanced_xml — though still nullable in principle),
+         "legal_basis" (a real, mostly-populated human-readable legal
+         authority string, e.g. "Executive Order 14024 (Russia)" — same
+         EntryEvent designation_date comes from; None when the source
+         resolves to its own "Unknown" placeholder, per nulls-over-zeros),
+         "vessel_flag", "vessel_type"}
+    snapshot_date: today's date (YYYY-MM-DD), used as first/last_seen for
+    genuinely new rows and as the delisted_date for anything dropped.
+
+    Three disjoint outcomes, computed via set arithmetic on ofac_uid rather
+    than a per-row SQL NOT IN (cheap in Python even at ~19k+ entities,
+    avoids repeating a large NOT IN scan):
+      - uid not currently persisted (or persisted but already delisted) ->
+        new row inserted, first_seen = last_seen = snapshot_date,
+        delisted_date cleared (covers the "relisted after a delisting"
+        case too — the spec is silent on this, but treating a uid's
+        reappearance as equivalent to a fresh new listing is the more
+        honest read than leaving a stale delisted_date on a currently-
+        listed entity).
+      - uid currently persisted and NOT delisted, still present today ->
+        last_seen_snapshot_date bumps to snapshot_date (existence-diffing,
+        per spec — OFAC republishes its whole list every pull, not a
+        delta). designation_date IS additionally backfilled here if the
+        persisted row's value is NULL and today's pull has a real one —
+        this is NOT the content-diffing the spec warns against (which was
+        about not overwriting a real value with a different, possibly-
+        stale one on every re-seen entity); it's filling in data this
+        table was missing entirely under the original plain-XML parse,
+        a one-time-per-row backfill that converges to "every row has its
+        real date" rather than staying permanently NULL just because the
+        row happened to already exist before the richer source was wired
+        up. entity_name/program_tags/legal_basis/vessel_flag/vessel_type are
+        also backfilled the same way (persisted NULL/empty -> a real value
+        from today's pull), never the reverse.
+      - uid currently persisted, NOT delisted, absent from today's pull ->
+        delisted: delisted_date set to snapshot_date on the EXISTING row
+        (a state change, never a new row, never a deletion)."""
+    with get_conn() as conn:
+        persisted_rows = conn.execute(
+            "SELECT ofac_uid, designation_date, entity_name, program_tags, legal_basis, vessel_flag, vessel_type "
+            "FROM ofac_designations WHERE delisted_date IS NULL"
+        ).fetchall()
+        persisted_by_uid = {r["ofac_uid"]: dict(r) for r in persisted_rows}
+        persisted_uids = set(persisted_by_uid.keys())
+
+        current_by_uid = {e["ofac_uid"]: e for e in current_entries}
+        current_uids = set(current_by_uid.keys())
+
+        new_uids = current_uids - persisted_uids
+        seen_again_uids = current_uids & persisted_uids
+        delisted_uids = persisted_uids - current_uids
+
+        new_rows = [
+            {
+                "ofac_uid": uid,
+                "entity_name": current_by_uid[uid]["entity_name"],
+                "entity_type": current_by_uid[uid].get("entity_type"),
+                "program_tags": json.dumps(current_by_uid[uid].get("program_tags") or []),
+                "list_source": current_by_uid[uid]["list_source"],
+                "designation_date": current_by_uid[uid].get("designation_date"),
+                "legal_basis": current_by_uid[uid].get("legal_basis"),
+                "vessel_flag": current_by_uid[uid].get("vessel_flag"),
+                "vessel_type": current_by_uid[uid].get("vessel_type"),
+                "first_seen_snapshot_date": snapshot_date,
+                "last_seen_snapshot_date": snapshot_date,
+            }
+            for uid in new_uids
+        ]
+        if new_rows:
+            conn.executemany(
+                """INSERT INTO ofac_designations
+                       (ofac_uid, entity_name, entity_type, program_tags, list_source,
+                        designation_date, legal_basis, vessel_flag, vessel_type,
+                        first_seen_snapshot_date, last_seen_snapshot_date, delisted_date)
+                   VALUES (:ofac_uid, :entity_name, :entity_type, :program_tags, :list_source,
+                           :designation_date, :legal_basis, :vessel_flag, :vessel_type,
+                           :first_seen_snapshot_date, :last_seen_snapshot_date, NULL)
+                   ON CONFLICT (ofac_uid) DO UPDATE SET
+                       last_seen_snapshot_date = excluded.last_seen_snapshot_date,
+                       delisted_date = NULL,
+                       updated_at = datetime('now')""",
+                new_rows,
+            )
+
+        if seen_again_uids:
+            backfill_rows = []
+            for uid in seen_again_uids:
+                persisted = persisted_by_uid[uid]
+                current = current_by_uid[uid]
+                current_program_tags_json = json.dumps(current.get("program_tags") or [])
+                backfill_rows.append({
+                    "ofac_uid": uid,
+                    "snapshot_date": snapshot_date,
+                    "designation_date": persisted["designation_date"] or current.get("designation_date"),
+                    "entity_name": persisted["entity_name"] or current.get("entity_name"),
+                    "program_tags": persisted["program_tags"] if persisted["program_tags"] and persisted["program_tags"] != "[]" else current_program_tags_json,
+                    "legal_basis": persisted["legal_basis"] or current.get("legal_basis"),
+                    "vessel_flag": persisted["vessel_flag"] or current.get("vessel_flag"),
+                    "vessel_type": persisted["vessel_type"] or current.get("vessel_type"),
+                })
+            conn.executemany(
+                """UPDATE ofac_designations
+                   SET last_seen_snapshot_date = :snapshot_date,
+                       designation_date = :designation_date,
+                       entity_name = :entity_name,
+                       program_tags = :program_tags,
+                       legal_basis = :legal_basis,
+                       vessel_flag = :vessel_flag,
+                       vessel_type = :vessel_type,
+                       updated_at = datetime('now')
+                   WHERE ofac_uid = :ofac_uid""",
+                backfill_rows,
+            )
+
+        if delisted_uids:
+            conn.executemany(
+                """UPDATE ofac_designations
+                   SET delisted_date = :snapshot_date, updated_at = datetime('now')
+                   WHERE ofac_uid = :ofac_uid""",
+                [{"snapshot_date": snapshot_date, "ofac_uid": uid} for uid in delisted_uids],
+            )
+
+    return {"new": len(new_uids), "delisted": len(delisted_uids), "unchanged": len(seen_again_uids)}
+
+
+def get_ofac_designations(
+    since: str | None = None,
+    until: str | None = None,
+    program: str | None = None,
+    list_source: str | None = None,
+) -> list[dict]:
+    """Filtered read for GET /api/ofac/db. since/until compare against
+    designation_date when a real one exists, falling back to
+    first_seen_snapshot_date otherwise (the same COALESCE the response's
+    own computed chart_date field uses — see below) — real designation
+    dates are now the common case (Advanced-file parse, see main.py's
+    _parse_ofac_advanced_xml), with first_seen_snapshot_date as the honest
+    fallback anchor for the rare row without one. program filters against
+    the JSON-encoded program_tags via a LIKE substring match (a full JSON
+    array-contains query isn't worth a dependency for a handful of rows per
+    request); this can over-match a program code that's a substring of
+    another (e.g. "CUBA" inside a hypothetical "CUBA2"), acceptable for a
+    display-time filter with no security/compliance weight, per the spec's
+    own explicit non-goals."""
+    date_expr = "COALESCE(designation_date, first_seen_snapshot_date)"
+    query = f"SELECT *, {date_expr} AS chart_date FROM ofac_designations WHERE 1=1"
+    params: list = []
+    if since is not None:
+        query += f" AND {date_expr} >= ?"
+        params.append(since)
+    if until is not None:
+        query += f" AND {date_expr} <= ?"
+        params.append(until)
+    if program is not None:
+        query += " AND program_tags LIKE ?"
+        params.append(f'%"{program}"%')
+    if list_source is not None:
+        query += " AND list_source = ?"
+        params.append(list_source)
+    query += f" ORDER BY {date_expr}"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        result = [dict(r) for r in rows]
+    for row in result:
+        raw = row.get("program_tags")
+        row["program_tags"] = json.loads(raw) if raw else []
+    return result
+
+
+def get_ofac_designation(ofac_uid: str) -> dict | None:
+    """Single-row read for the entity-detail route — same chart_date
+    convenience field as get_ofac_designations, but for exactly one uid."""
+    date_expr = "COALESCE(designation_date, first_seen_snapshot_date)"
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT *, {date_expr} AS chart_date FROM ofac_designations WHERE ofac_uid = ?",
+            (ofac_uid,),
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    raw = result.get("program_tags")
+    result["program_tags"] = json.loads(raw) if raw else []
+    return result
+
+
+def get_ofac_aliases(ofac_uid: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT name, is_primary, alias_type FROM ofac_aliases WHERE ofac_uid = ? "
+            "ORDER BY is_primary DESC, name",
+            (ofac_uid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ofac_addresses(ofac_uid: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT address1, address2, address3, city, state_province, postal_code, country "
+            "FROM ofac_addresses WHERE ofac_uid = ?",
+            (ofac_uid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ofac_id_documents(ofac_uid: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id_type, id_number, issuing_country FROM ofac_id_documents WHERE ofac_uid = ?",
+            (ofac_uid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def replace_ofac_entity_detail(aliases: list[dict], addresses: list[dict], id_documents: list[dict]):
+    """Replace-all write for the three OFAC entity-detail child tables —
+    see ofac_aliases'/ofac_addresses'/ofac_id_documents' own DDL comments
+    for why this is a full delete-then-reinsert per fetch rather than a
+    row-by-row diff: these represent OFAC's current claim about an entity,
+    same as entity_name/program_tags on the parent row, not a history to
+    preserve. Called once per full ingestion cycle (not per new/seen-again/
+    delisted bucket — a currently-listed entity's detail should always
+    reflect today's fetch regardless of which existence bucket it landed
+    in), covering every ofac_uid present in the day's fresh pull.
+
+    aliases: [{"ofac_uid", "name", "is_primary" (bool), "alias_type"}]
+    addresses: [{"ofac_uid", "address1", "address2", "address3", "city",
+                 "state_province", "postal_code", "country"}]
+    id_documents: [{"ofac_uid", "id_type", "id_number", "issuing_country"}]
+    """
+    uids = sorted({r["ofac_uid"] for r in aliases} | {r["ofac_uid"] for r in addresses} | {r["ofac_uid"] for r in id_documents})
+    if not uids:
+        return
+    with get_conn() as conn:
+        placeholders = ",".join("?" for _ in uids)
+        conn.execute(f"DELETE FROM ofac_aliases WHERE ofac_uid IN ({placeholders})", uids)
+        conn.execute(f"DELETE FROM ofac_addresses WHERE ofac_uid IN ({placeholders})", uids)
+        conn.execute(f"DELETE FROM ofac_id_documents WHERE ofac_uid IN ({placeholders})", uids)
+
+        if aliases:
+            conn.executemany(
+                """INSERT INTO ofac_aliases (ofac_uid, name, is_primary, alias_type)
+                   VALUES (:ofac_uid, :name, :is_primary, :alias_type)""",
+                [{**a, "is_primary": int(bool(a.get("is_primary")))} for a in aliases],
+            )
+        if addresses:
+            conn.executemany(
+                """INSERT INTO ofac_addresses
+                       (ofac_uid, address1, address2, address3, city, state_province, postal_code, country)
+                   VALUES (:ofac_uid, :address1, :address2, :address3, :city, :state_province, :postal_code, :country)""",
+                addresses,
+            )
+        if id_documents:
+            conn.executemany(
+                """INSERT INTO ofac_id_documents (ofac_uid, id_type, id_number, issuing_country)
+                   VALUES (:ofac_uid, :id_type, :id_number, :issuing_country)""",
+                id_documents,
+            )
 
 
 def upsert_treasury_outlays_rows(rows: list[dict]):

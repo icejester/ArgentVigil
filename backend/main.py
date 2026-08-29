@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable
@@ -1035,10 +1036,38 @@ async def _fetch_and_persist_pslv() -> dict:
         timeout=10,
     )
     resp.raise_for_status()
-    entries = [e for e in resp.json() if isinstance(e, dict) and e.get("id") == 4998]
-    if not entries:
-        raise HTTPException(502, "PSLV entry not found in Sprott response")
-    row = entries[0]
+    payload = resp.json()
+    # Confirmed live 2026-08-28: Sprott's own response no longer carries a
+    # usable per-fund identifier — every entry's "id" field is now 0 (this
+    # used to be a real, distinct value; id=4998 was PSLV's). This was a
+    # real bug, not a transient outage: the old id-based filter silently
+    # matched zero entries, so every fetch since Sprott's own change 502'd.
+    # There is no query param, header, or metadata endpoint that identifies
+    # a fund in this payload — confirmed by inspecting Sprott's own bullion
+    # calculator page source, which resolves PSLV the exact same way this
+    # fix does: a hardcoded FIXED ARRAY POSITION, not any field in the data
+    # itself. Sprott's real fund lineup, in the order their own page reads
+    # it (data[0..5] are the financial-metrics entries; data[6..11] are the
+    # matching {last, tradeDate, tradeTime} quote objects in the same
+    # order): 0=PHYS (gold), 1=PSLV (silver), 2=SPPP (platinum/palladium),
+    # 3=CEF (gold+silver), 4=SPUT (uranium), 5=COP (copper).
+    PSLV_INDEX = 1
+    financial_entries = [e for e in payload if isinstance(e, dict) and "nav" in e]
+    if len(financial_entries) <= PSLV_INDEX:
+        raise HTTPException(502, f"Sprott response has {len(financial_entries)} fund entries, expected at least {PSLV_INDEX + 1} — PSLV's fixed position may have shifted")
+    row = financial_entries[PSLV_INDEX]
+    # Sanity guard: PSLV's real scale is on the order of 100M-400M oz of
+    # silver — if Sprott ever reorders this array again, a wrong index
+    # would otherwise silently persist a DIFFERENT fund's data under the
+    # "PSLV" label with no visible error. Fail loudly instead.
+    total_oz = row.get("totalOunces1")
+    if not (total_oz and 100_000_000 <= total_oz <= 400_000_000):
+        raise HTTPException(
+            502,
+            f"Sprott response's index-{PSLV_INDEX} entry has totalOunces1={total_oz!r}, "
+            "outside PSLV's plausible real range (100M-400M oz) — Sprott's fund ordering "
+            "may have changed again; refusing to persist a possibly-wrong fund as PSLV.",
+        )
     result = {
         "fund": "PSLV",
         "custodian": "Royal Canadian Mint",
@@ -1686,6 +1715,689 @@ async def census_trade_db(
     return {"success": True, "data": rows}
 
 
+OFAC_BASE = "https://sanctionslistservice.ofac.treas.gov/api/download"
+# Confirmed live 2026-08-25/26: no auth/key required, but a User-Agent
+# header IS required (a bare request without one gets a 403) — official
+# Treasury infrastructure, not a paywalled API. httpx follows the 302 ->
+# signed S3 URL by default (AsyncClient's default follow_redirects
+# behavior), no special handling needed for that hop.
+_OFAC_USER_AGENT = "ArgentVigil/1.0 (silver/gold positioning monitor; sanctions timeline feature)"
+
+# Real designation dates require the ADVANCED file variants (sdn_advanced.xml
+# / cons_advanced.xml), not the plain sdn.xml/consolidated.xml this feature
+# originally shipped with. Confirmed live 2026-08-26, correcting an earlier
+# wrong conclusion: the plain files genuinely have no per-entity designation
+# date anywhere in their schema (only a document-level Publish_Date), but
+# the Advanced variants carry a real one via SanctionsEntry/EntryEvent/Date
+# (EntryEventTypeID=1 = "Created" — the entity's real addition date, going
+# back decades in real data, e.g. 1984/1986 dates confirmed on real live
+# entries) joined to DistinctParty by ProfileID/FixedRef. This is a
+# genuinely different, much more normalized schema (~126MB sdn_advanced.xml
+# vs ~29MB sdn.xml) — party identity, sanctions-list-membership/dates, and
+# ID-lookup dictionaries are three separate top-level sections joined by
+# ID, not one flat <sdnEntry> per party. Confirmed live that sdn_advanced.xml
+# is NOT just "SDN with more detail" — it contains SanctionsEntry rows for
+# ListID 1550 (SDN), 91512 (Consolidated), 91507 (Sectoral Sanctions), and
+# 91243 (Non-SDN Palestinian Legislative Council) all in one file. Also
+# confirmed live that cons_advanced.xml is NOT redundant with it despite
+# that overlap — 388 of cons_advanced.xml's 481 distinct ProfileIDs do not
+# appear in sdn_advanced.xml at all (list-membership rows that only exist
+# in one file or the other), so both are still fetched and merged.
+# Confirmed live 2026-08-26: the Advanced XML files use a DIFFERENT
+# namespace than the plain sdn.xml/consolidated.xml this feature originally
+# parsed (".../exports/XML") — a real bug caught in verification before
+# this ever touched production data: every _ofac_tag(...) lookup below
+# silently matched zero elements against the real file (ElementTree's tag
+# matching is namespace-strict, and root.iter()/find() with the wrong
+# namespace return nothing, not an error), so a first cut of this rework
+# "succeeded" with 0 entries parsed. The real root element's namespace is
+# ".../exports/ADVANCED_XML", confirmed directly against a live-fetched
+# sdn_advanced.xml's own root tag.
+_OFAC_XML_NS = "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/ADVANCED_XML"
+
+
+async def _fetch_ofac_xml(filename: str) -> bytes:
+    # Confirmed live 2026-08-25: httpx.AsyncClient() defaults to
+    # follow_redirects=False (unlike requests), and this app's shared
+    # _client (main.py's lifespan) doesn't override that globally — a real
+    # bug caught live as a "302 Found" exception on the very first startup
+    # fetch, since OFAC's download endpoint always 302s to a short-lived
+    # signed S3 URL. follow_redirects=True is passed per-call here rather
+    # than mutating _client's shared config for every other source's calls.
+    resp = await _client.get(
+        f"{OFAC_BASE}/{filename}",
+        headers={"User-Agent": _OFAC_USER_AGENT},
+        timeout=120,  # sdn_advanced.xml is ~126MB, confirmed live — plain sdn.xml's 60s timeout isn't enough margin
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _ofac_tag(name: str) -> str:
+    return f"{{{_OFAC_XML_NS}}}{name}"
+
+
+# PartySubTypeValues -> PartyType, confirmed live against real
+# sdn_advanced.xml: PartySubType ID=1/2 ARE their own unambiguous labels
+# ("Vessel"/"Aircraft" per PartySubTypeValues' own text), but PartySubType
+# ID=3/4 are both labeled "Unknown" there — the real Individual/Entity
+# distinction only exists one level up, via that PartySubType's own
+# PartyTypeID attribute (PartySubType ID="3" PartyTypeID="2" -> Entity,
+# PartySubType ID="4" PartyTypeID="1" -> Individual, confirmed live against
+# PartyTypeValues' own ID=1 "Individual"/ID=2 "Entity" labels). Resolving
+# entity_type therefore needs BOTH lookup dicts, not just the PartySubType
+# ID alone, unlike the vessel/aircraft case where PartySubType ID alone is
+# already unambiguous.
+_OFAC_PARTY_SUBTYPE_TO_ENTITY_TYPE = {"1": "vessel", "2": "aircraft"}
+_OFAC_PARTY_TYPE_ID_TO_ENTITY_TYPE = {"1": "individual", "2": "entity"}
+
+
+def _ofac_parse_reference_dicts(root):
+    """Builds the small ID->label lookup dicts this schema needs:
+    - detail_reference: DetailReference ID -> text (vessel type/flag values
+      that arrive as a DetailReferenceID pointer rather than inline text,
+      confirmed live e.g. DetailReference 705 = "Tug").
+    - subtype_to_party_type: PartySubType ID -> its own PartyTypeID
+      attribute, needed to resolve entity_type for Individual/Entity rows
+      (see _OFAC_PARTY_SUBTYPE_TO_ENTITY_TYPE's own comment for why
+      PartySubType ID alone isn't enough for those two, unlike Vessel/
+      Aircraft).
+    - country_values: Country ID -> name (CountryValues), used to resolve
+      both address country and ID-document issuing country.
+    - locpart_types: LocPartType ID -> label (ADDRESS1/ADDRESS2/ADDRESS3/
+      CITY/STATE-PROVINCE/POSTAL CODE — confirmed live against
+      LocPartTypeValues), needed to parse Locations' typed address parts.
+    - id_doc_types: IDRegDocType ID -> label (Passport/SSN/Cedula No./etc,
+      IDRegDocTypeValues), needed to parse IDRegDocument elements.
+    - legal_basis_values: LegalBasis ID -> text (e.g. "Executive Order
+      14024 (Russia)"), needed to resolve an EntryEvent's own LegalBasisID
+      into the human-readable string persisted as ofac_designations.
+      legal_basis. Confirmed live 2026-08-27 that LegalBasis's own
+      SanctionsProgramID link back to SanctionsProgramValues is NOT usable
+      — every LegalBasis row in real data points at SanctionsProgramID=1
+      ("Unknown"), regardless of what program it's actually authority for
+      — so this is resolved per-designation via EntryEvent, not joined
+      through SanctionsProgram at all."""
+    detail_reference = {}
+    for el in root.iter(_ofac_tag("DetailReference")):
+        rid = el.get("ID")
+        if rid:
+            detail_reference[rid] = (el.text or "").strip()
+
+    subtype_to_party_type = {}
+    for el in root.iter(_ofac_tag("PartySubType")):
+        sid = el.get("ID")
+        party_type_id = el.get("PartyTypeID")
+        if sid and party_type_id:
+            subtype_to_party_type[sid] = party_type_id
+
+    country_values = {}
+    for el in root.iter(_ofac_tag("Country")):
+        cid = el.get("ID")
+        if cid and el.text:
+            country_values[cid] = el.text.strip()
+
+    locpart_types = {}
+    for el in root.iter(_ofac_tag("LocPartType")):
+        lid = el.get("ID")
+        if lid and el.text:
+            locpart_types[lid] = el.text.strip()
+
+    id_doc_types = {}
+    for el in root.iter(_ofac_tag("IDRegDocType")):
+        did = el.get("ID")
+        if did and el.text:
+            id_doc_types[did] = el.text.strip()
+
+    legal_basis_values = {}
+    for el in root.iter(_ofac_tag("LegalBasis")):
+        lbid = el.get("ID")
+        if lbid and el.text:
+            legal_basis_values[lbid] = el.text.strip()
+
+    return detail_reference, subtype_to_party_type, country_values, locpart_types, id_doc_types, legal_basis_values
+
+
+def _ofac_parse_distinct_parties(root, detail_reference: dict, subtype_to_party_type: dict) -> dict:
+    """Parses every <DistinctParty> into {profile_id: {entity_name,
+    entity_type, vessel_flag, vessel_type}}, keyed by Profile/@ID (same
+    value as FixedRef on the DistinctParty itself and as SanctionsEntry's
+    own ProfileID — confirmed live these three are the same number for a
+    given entity, e.g. MAR AZUL is FixedRef=4238/Profile ID=4238/
+    SanctionsEntry ProfileID=4238).
+
+    entity_type: PartySubTypeID=1/2 resolve directly to vessel/aircraft
+    (unambiguous on their own). PartySubTypeID=3/4 resolve via the
+    subtype_to_party_type lookup built in _ofac_parse_reference_dicts (a
+    real bug caught in testing: PartySubType 3 and 4 are BOTH labeled
+    "Unknown" in PartySubTypeValues, so blindly defaulting to "entity" for
+    both of them — an earlier version of this function did — silently
+    misclassified every real Individual as "entity" too; the correct
+    distinction only exists one level up, via that PartySubType's own
+    PartyTypeID attribute).
+
+    entity_name: primary DocumentedName's assembled NamePartValue text
+    (Alias Primary="true" -> DocumentedName -> DocumentedNamePart ->
+    NamePartValue; falls back to the first Alias present if no Alias is
+    marked Primary, which happens for some real entries).
+
+    vessel_flag/vessel_type: read from Feature/FeatureVersion, matched by
+    FeatureTypeID (3 = Vessel Flag, 2 = VESSEL TYPE, confirmed live
+    against FeatureTypeValues) — value comes from FeatureVersion's own
+    VersionDetail element, which is EITHER inline text (vessel_flag: "Cuba")
+    OR a DetailReferenceID pointer needing the detail_reference lookup
+    (vessel_type on the same real entry: DetailReferenceID=705 -> "Tug").
+    Only populated for entity_type == "vessel", per the plain-file version's
+    own convention."""
+    by_profile: dict[str, dict] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        if not profile_id:
+            continue
+
+        subtype_id = profile_el.get("PartySubTypeID")
+        entity_type = _OFAC_PARTY_SUBTYPE_TO_ENTITY_TYPE.get(subtype_id)
+        if entity_type is None:
+            party_type_id = subtype_to_party_type.get(subtype_id)
+            entity_type = _OFAC_PARTY_TYPE_ID_TO_ENTITY_TYPE.get(party_type_id)
+
+        entity_name = None
+        identity_el = profile_el.find(_ofac_tag("Identity"))
+        aliases = identity_el.findall(_ofac_tag("Alias")) if identity_el is not None else []
+        primary_alias = next((a for a in aliases if a.get("Primary") == "true"), None)
+        chosen_alias = primary_alias if primary_alias is not None else (aliases[0] if len(aliases) > 0 else None)
+        if chosen_alias is not None:
+            doc_name = chosen_alias.find(_ofac_tag("DocumentedName"))
+            if doc_name is not None:
+                parts = [
+                    (pv.text or "").strip()
+                    for pv in doc_name.iter(_ofac_tag("NamePartValue"))
+                    if pv.text
+                ]
+                if parts:
+                    entity_name = " ".join(parts)
+
+        vessel_flag = None
+        vessel_type = None
+        if entity_type == "vessel":
+            for feature in profile_el.iter(_ofac_tag("Feature")):
+                feature_type_id = feature.get("FeatureTypeID")
+                if feature_type_id not in ("2", "3"):
+                    continue
+                version = feature.find(_ofac_tag("FeatureVersion"))
+                if version is None:
+                    continue
+                detail = version.find(_ofac_tag("VersionDetail"))
+                if detail is None:
+                    continue
+                value = (detail.text or "").strip() or None
+                if value is None:
+                    ref_id = detail.get("DetailReferenceID")
+                    value = detail_reference.get(ref_id)
+                if feature_type_id == "3":
+                    vessel_flag = value
+                elif feature_type_id == "2":
+                    vessel_type = value
+
+        by_profile[profile_id] = {
+            "entity_name": entity_name or "(unnamed)",
+            "entity_type": entity_type,
+            "vessel_flag": vessel_flag,
+            "vessel_type": vessel_type,
+        }
+    return by_profile
+
+
+_OFAC_ALIAS_TYPE_LABELS = {
+    # AliasTypeValues ID -> label, confirmed live these 4 are the only
+    # values that exist in this data (2026-08-26 verification). "Name" (1403)
+    # is the primary/legal name entry, not really an "alias" in the colloquial
+    # sense, but it's the same Alias element shape so it's captured here too
+    # rather than special-cased out — the detail view can label it plainly.
+    "1400": "A.K.A.",
+    "1401": "F.K.A.",
+    "1402": "N.K.A.",
+    "1403": "Name",
+}
+
+
+def _ofac_parse_aliases(root) -> dict:
+    """Parses every <Alias> under every Profile's Identity into
+    {profile_id: [{"name", "is_primary", "alias_type"}, ...]} — ALL
+    aliases, not just the one _ofac_parse_distinct_parties picks for
+    entity_name (confirmed live an entity can carry many: A.K.A./F.K.A./
+    N.K.A. entries plus the primary Name). alias_type resolves via
+    _OFAC_ALIAS_TYPE_LABELS from the Alias element's own AliasTypeID
+    attribute; name is assembled the same way entity_name is (DocumentedName
+    -> DocumentedNamePart -> NamePartValue, space-joined)."""
+    by_profile: dict[str, list[dict]] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        if not profile_id:
+            continue
+        identity_el = profile_el.find(_ofac_tag("Identity"))
+        if identity_el is None:
+            continue
+        aliases = []
+        for alias_el in identity_el.findall(_ofac_tag("Alias")):
+            doc_name = alias_el.find(_ofac_tag("DocumentedName"))
+            if doc_name is None:
+                continue
+            parts = [
+                (pv.text or "").strip()
+                for pv in doc_name.iter(_ofac_tag("NamePartValue"))
+                if pv.text
+            ]
+            if not parts:
+                continue
+            aliases.append({
+                "name": " ".join(parts),
+                "is_primary": alias_el.get("Primary") == "true",
+                "alias_type": _OFAC_ALIAS_TYPE_LABELS.get(alias_el.get("AliasTypeID")),
+            })
+        if aliases:
+            by_profile[profile_id] = aliases
+    return by_profile
+
+
+# FeatureTypeID for a Location-carrying Feature, confirmed live against
+# FeatureTypeValues during vessel-detail research (id 25 = "Location").
+_OFAC_LOCATION_FEATURE_TYPE_ID = "25"
+
+
+def _ofac_parse_locations(root, country_values: dict, locpart_types: dict) -> dict:
+    """Parses the top-level <Locations> section into {location_id: {
+    "address1", "address2", "address3", "city", "state_province",
+    "postal_code", "country", "id_doc_ids": [...]}}.
+
+    Confirmed live (2026-08-26) this is a genuinely separate top-level
+    section from DistinctParties, not nested under a Profile — addresses
+    are reached from a Profile via Feature/FeatureVersion/
+    FeatureVersionReference (FeatureTypeID=25) pointing at a Location's own
+    @ID, resolved by the caller (_ofac_parse_addresses_by_profile) rather
+    than here, since this function's only job is building the flat
+    location_id -> address-fields map once.
+
+    Each LocationPart is typed via LocPartTypeID (resolved through
+    locpart_types -> ADDRESS1/ADDRESS2/ADDRESS3/CITY/STATE-PROVINCE/
+    POSTAL CODE) rather than having its own fixed tag name; country comes
+    from LocationCountry's own CountryID, resolved via country_values.
+    Confirmed live most real addresses are partial (country-only is
+    common) — any part not present stays None, per nulls-over-zeros, never
+    an empty string standing in for "not present."
+
+    id_doc_ids: any IDRegDocumentReference children of this Location,
+    confirmed live a real (if minority — 183 of 22,667 total ID documents
+    in a full SDN pull) attachment path, collected here so
+    _ofac_parse_id_documents can pick them up as a secondary source
+    alongside the primary IdentityID-direct join."""
+    locpart_label_to_field = {
+        "ADDRESS1": "address1",
+        "ADDRESS2": "address2",
+        "ADDRESS3": "address3",
+        "CITY": "city",
+        "STATE/PROVINCE": "state_province",
+        "POSTAL CODE": "postal_code",
+    }
+    by_location: dict[str, dict] = {}
+    for loc in root.iter(_ofac_tag("Location")):
+        location_id = loc.get("ID")
+        if not location_id:
+            continue
+        fields = {"address1": None, "address2": None, "address3": None, "city": None, "state_province": None, "postal_code": None, "country": None}
+        for part in loc.findall(_ofac_tag("LocationPart")):
+            label = locpart_types.get(part.get("LocPartTypeID"))
+            field = locpart_label_to_field.get(label)
+            if field is None:
+                continue
+            value_el = part.find(_ofac_tag("LocationPartValue"))
+            text = value_el.findtext(_ofac_tag("Value")) if value_el is not None else None
+            if text and text.strip():
+                fields[field] = text.strip()
+        country_el = loc.find(_ofac_tag("LocationCountry"))
+        if country_el is not None:
+            fields["country"] = country_values.get(country_el.get("CountryID"))
+        id_doc_ids = [
+            ref.get("IDRegDocumentID")
+            for ref in loc.findall(_ofac_tag("IDRegDocumentReference"))
+            if ref.get("IDRegDocumentID")
+        ]
+        fields["id_doc_ids"] = id_doc_ids
+        by_location[location_id] = fields
+    return by_location
+
+
+def _ofac_parse_addresses_by_profile(root, locations: dict) -> dict:
+    """Resolves each Profile's Location-typed Feature(s) into that
+    profile's own address rows, via Feature/FeatureVersion/VersionLocation
+    -> Location/@ID -> the locations map built by _ofac_parse_locations.
+
+    Confirmed live (2026-08-26, correcting a wrong guess made during initial
+    implementation) the real join element is <VersionLocation LocationID=".."/>
+    under FeatureVersion — NOT a FeatureVersionReference element (that name
+    does exist in this schema, but attached to Location pointing back at the
+    FeatureVersion that cited it, the reverse direction from what's needed
+    here; using it would have silently resolved zero addresses). Verified
+    end-to-end against a real entry: Feature ID=150025/FeatureTypeID=25,
+    FeatureVersion ID=200025, VersionLocation LocationID=25, which resolves
+    to a real Location 25 (Havana, Cuba). Returns {profile_id:
+    [address_fields, ...]} (an entity can have more than one address on
+    file)."""
+    by_profile: dict[str, list[dict]] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        if not profile_id:
+            continue
+        addresses = []
+        for feature in profile_el.iter(_ofac_tag("Feature")):
+            if feature.get("FeatureTypeID") != _OFAC_LOCATION_FEATURE_TYPE_ID:
+                continue
+            for version in feature.findall(_ofac_tag("FeatureVersion")):
+                version_location = version.find(_ofac_tag("VersionLocation"))
+                if version_location is None:
+                    continue
+                location_id = version_location.get("LocationID")
+                location = locations.get(location_id)
+                if location is not None:
+                    addresses.append({k: v for k, v in location.items() if k != "id_doc_ids"})
+        if addresses:
+            by_profile[profile_id] = addresses
+    return by_profile
+
+
+def _ofac_parse_id_documents(root, country_values: dict, id_doc_types: dict, locations: dict) -> dict:
+    """Parses every <IDRegDocument> into {profile_id: [{"id_type",
+    "id_number", "issuing_country"}, ...]}.
+
+    Confirmed live (2026-08-26) the PRIMARY join is direct: IDRegDocument
+    carries its own IdentityID attribute pointing straight at a Profile's
+    Identity/@ID (22,667 real documents in a full SDN pull use this path).
+    A secondary, minority path also exists — Location elements can carry an
+    IDRegDocumentReference (183 instances confirmed live) — collected via
+    the locations map's own id_doc_ids (see _ofac_parse_locations) and
+    resolved back to a profile through _ofac_parse_addresses_by_profile's
+    same Feature/FeatureVersion chain would require a second pass; since
+    the Location-mediated instances are a small minority and every
+    IDRegDocument already carries IdentityID regardless of which path
+    references it, joining on IdentityID alone captures both — a
+    Location-attached document still has a real IdentityID pointing to the
+    same identity, confirmed live (id 8264/8311/8438/etc. from Location
+    entries all resolved to real, non-null IdentityID values on inspection).
+    profile_id is resolved by mapping Identity/@ID back to its owning
+    Profile via identity_to_profile (built once here from the same
+    DistinctParty walk other parse functions use)."""
+    identity_to_profile: dict[str, str] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        identity_el = profile_el.find(_ofac_tag("Identity"))
+        if profile_id and identity_el is not None and identity_el.get("ID"):
+            identity_to_profile[identity_el.get("ID")] = profile_id
+
+    by_profile: dict[str, list[dict]] = {}
+    for doc in root.iter(_ofac_tag("IDRegDocument")):
+        identity_id = doc.get("IdentityID")
+        profile_id = identity_to_profile.get(identity_id)
+        if profile_id is None:
+            continue
+        id_number = doc.findtext(_ofac_tag("IDRegistrationNo"))
+        entry = {
+            "id_type": id_doc_types.get(doc.get("IDRegDocTypeID")),
+            "id_number": (id_number or "").strip() or None,
+            "issuing_country": country_values.get(doc.get("IssuedBy-CountryID")),
+        }
+        by_profile.setdefault(profile_id, []).append(entry)
+    return by_profile
+
+
+_OFAC_LIST_ID_TO_LABEL = {
+    "1550": "SDN",
+    "91512": "Consolidated",
+    "91507": "Consolidated",  # Sectoral Sanctions Identifications List
+    "91243": "Consolidated",  # Non-SDN Palestinian Legislative Council List
+    "92052": "Consolidated",
+    "91868": "Consolidated",
+    "91763": "Consolidated",
+}
+
+
+def _ofac_parse_sanctions_entries(root, legal_basis_values: dict) -> dict:
+    """Parses every <SanctionsEntry> into {profile_id: {designation_date,
+    legal_basis, program_tags, list_source}}.
+
+    designation_date: EntryEvent's own Date (Year/Month/Day), filtered to
+    EntryEventTypeID == "1" ("Created" per EntryEventTypeValues — confirmed
+    live this is the only EntryEventType value that exists in this data at
+    all) — the real per-entity designation date this whole rework exists
+    to surface, confirmed live going back to at least 1984 on real entries.
+    A profile can have more than one SanctionsEntry (multiple lists); this
+    keeps the EARLIEST real Created date across all of a profile's entries,
+    since "when was this entity first designated" is the honest read, not
+    whichever entry happened to parse last.
+
+    legal_basis: that SAME EntryEvent's own LegalBasisID attribute, resolved
+    via legal_basis_values into a real, mostly-populated human-readable
+    string (e.g. "Executive Order 14024 (Russia)" — confirmed live ~92% of
+    real EntryEvent LegalBasisID uses resolve to something real rather than
+    the dictionary's own "Unknown" placeholder, which is persisted as None
+    per nulls-over-zeros rather than the literal string). Tracked alongside
+    designation_date on the SAME earliest-EntryEvent-wins basis — they come
+    from the same element, so whichever EntryEvent supplies the kept
+    designation_date also supplies the kept legal_basis. Confirmed live
+    2026-08-27 this is NOT reachable via SanctionsProgram — LegalBasis's own
+    SanctionsProgramID link in OFAC's real data always points at
+    SanctionsProgramID=1 ("Unknown"), regardless of the legal basis's real
+    subject, so there is no working program-level detail page to surface;
+    this per-designation field is the closest real substitute.
+
+    program_tags: SanctionsMeasure elements with SanctionsTypeID == "1"
+    ("Program" per SanctionsTypeValues) carry the program name in their own
+    Comment element (confirmed live, e.g. <Comment>CUBA</Comment>) — this
+    schema does NOT link program tags via a separate ID table the way the
+    plain files' <program> elements do, so Comment text is the real program
+    name, not just documentation.
+
+    list_source: mapped from ListID via _OFAC_LIST_ID_TO_LABEL. A profile
+    appearing under more than one ListID (real, confirmed live) keeps
+    whichever list_source was seen first — same one-value-per-profile
+    simplification this table's schema already assumes (list_source is a
+    single TEXT column, not an array)."""
+    by_profile: dict[str, dict] = {}
+    for entry in root.iter(_ofac_tag("SanctionsEntry")):
+        profile_id = entry.get("ProfileID")
+        if not profile_id:
+            continue
+        list_id = entry.get("ListID")
+        list_source = _OFAC_LIST_ID_TO_LABEL.get(list_id, "Consolidated")
+
+        designation_date = None
+        legal_basis = None
+        for event in entry.iter(_ofac_tag("EntryEvent")):
+            if event.get("EntryEventTypeID") != "1":
+                continue
+            date_el = event.find(_ofac_tag("Date"))
+            if date_el is None:
+                continue
+            year = date_el.findtext(_ofac_tag("Year"))
+            month = date_el.findtext(_ofac_tag("Month"))
+            day = date_el.findtext(_ofac_tag("Day"))
+            if not (year and month and day):
+                continue
+            candidate = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+            if designation_date is None or candidate < designation_date:
+                designation_date = candidate
+                event_legal_basis = legal_basis_values.get(event.get("LegalBasisID"))
+                legal_basis = event_legal_basis if event_legal_basis and event_legal_basis != "Unknown" else None
+
+        program_tags = []
+        for measure in entry.iter(_ofac_tag("SanctionsMeasure")):
+            if measure.get("SanctionsTypeID") != "1":
+                continue
+            comment = measure.find(_ofac_tag("Comment"))
+            if comment is not None and comment.text and comment.text.strip():
+                program_tags.append(comment.text.strip())
+
+        existing = by_profile.get(profile_id)
+        if existing is None:
+            by_profile[profile_id] = {
+                "designation_date": designation_date,
+                "legal_basis": legal_basis,
+                "program_tags": program_tags,
+                "list_source": list_source,
+            }
+        else:
+            if designation_date and (existing["designation_date"] is None or designation_date < existing["designation_date"]):
+                existing["designation_date"] = designation_date
+                existing["legal_basis"] = legal_basis
+            existing["program_tags"] = list(dict.fromkeys(existing["program_tags"] + program_tags))
+    return by_profile
+
+
+def _parse_ofac_advanced_xml(xml_bytes: bytes) -> dict:
+    """Parses one OFAC Advanced XML document (sdn_advanced.xml or
+    cons_advanced.xml — same schema) into AV's own row shapes, joining
+    every section (reference dictionaries, DistinctParty identity/vessel
+    detail, aliases, Locations/addresses, IDRegDocuments, SanctionsEntry
+    dates/programs/list) by ProfileID/FixedRef (or, for ID documents,
+    IdentityID resolved back to ProfileID — see _ofac_parse_id_documents).
+    Supersedes the original plain sdnList (sdn.xml/consolidated.xml) parse
+    — see this module's own OFAC_BASE comment for why the plain files were
+    replaced (no per-entity designation date exists in that schema at all).
+    A profile with no SanctionsEntry at all (shouldn't happen in real data,
+    but not assumed) is skipped — an entity with no list-membership record
+    isn't a real designation to persist (this also means its aliases/
+    addresses/id documents are dropped along with it, consistent with the
+    parent table's own scope).
+
+    Returns {"entries": [...], "aliases": [...], "addresses": [...],
+    "id_documents": [...]} — the latter three as flat lists (each dict
+    already carrying its own "ofac_uid" key) ready for
+    db.replace_ofac_entity_detail, rather than nested under each entry, so
+    the caller can merge two files' worth of detail the same simple way it
+    already merges entries (a dict-by-uid update, or here a plain list
+    extend since child rows have no single-value-per-uid constraint to
+    collide on)."""
+    root = ET.fromstring(xml_bytes)
+    detail_reference, subtype_to_party_type, country_values, locpart_types, id_doc_types, legal_basis_values = _ofac_parse_reference_dicts(root)
+    parties = _ofac_parse_distinct_parties(root, detail_reference, subtype_to_party_type)
+    sanctions = _ofac_parse_sanctions_entries(root, legal_basis_values)
+    aliases_by_profile = _ofac_parse_aliases(root)
+    locations = _ofac_parse_locations(root, country_values, locpart_types)
+    addresses_by_profile = _ofac_parse_addresses_by_profile(root, locations)
+    id_documents_by_profile = _ofac_parse_id_documents(root, country_values, id_doc_types, locations)
+
+    entries = []
+    aliases = []
+    addresses = []
+    id_documents = []
+    for profile_id, sanction_info in sanctions.items():
+        party_info = parties.get(profile_id)
+        if party_info is None:
+            continue
+        entries.append({
+            "ofac_uid": profile_id,
+            "entity_name": party_info["entity_name"],
+            "entity_type": party_info["entity_type"],
+            "program_tags": sanction_info["program_tags"],
+            "list_source": sanction_info["list_source"],
+            "designation_date": sanction_info["designation_date"],
+            "legal_basis": sanction_info["legal_basis"],
+            "vessel_flag": party_info["vessel_flag"],
+            "vessel_type": party_info["vessel_type"],
+        })
+        for a in aliases_by_profile.get(profile_id, []):
+            aliases.append({"ofac_uid": profile_id, **a})
+        for addr in addresses_by_profile.get(profile_id, []):
+            addresses.append({"ofac_uid": profile_id, **addr})
+        for doc in id_documents_by_profile.get(profile_id, []):
+            id_documents.append({"ofac_uid": profile_id, **doc})
+
+    return {"entries": entries, "aliases": aliases, "addresses": addresses, "id_documents": id_documents}
+
+
+async def _fetch_and_persist_ofac_designations() -> dict:
+    sdn_bytes = await _fetch_ofac_xml("sdn_advanced.xml")
+    cons_bytes = await _fetch_ofac_xml("cons_advanced.xml")
+    # Confirmed live 2026-08-26: cons_advanced.xml's ProfileIDs are NOT a
+    # subset of sdn_advanced.xml's (388 of 481 are exclusive to it) — both
+    # are parsed and merged, later-wins on a duplicate ofac_uid (shouldn't
+    # happen in practice since a given profile_id is scoped to one file's
+    # own numbering in real data, but dict-merge is the simple, safe
+    # behavior if it ever does). Detail lists (aliases/addresses/
+    # id_documents) are plain-extended rather than dict-merged — a
+    # duplicate uid appearing in both files would just mean its detail rows
+    # get replaced twice in db.replace_ofac_entity_detail's own delete-then-
+    # reinsert (harmless, since that function already de-dupes by uid via a
+    # set before deleting).
+    sdn_parsed = _parse_ofac_advanced_xml(sdn_bytes)
+    cons_parsed = _parse_ofac_advanced_xml(cons_bytes)
+
+    by_uid = {e["ofac_uid"]: e for e in sdn_parsed["entries"]}
+    by_uid.update({e["ofac_uid"]: e for e in cons_parsed["entries"]})
+    entries = list(by_uid.values())
+
+    result = db.diff_and_persist_ofac_designations(entries, date.today().isoformat())
+    db.replace_ofac_entity_detail(
+        aliases=sdn_parsed["aliases"] + cons_parsed["aliases"],
+        addresses=sdn_parsed["addresses"] + cons_parsed["addresses"],
+        id_documents=sdn_parsed["id_documents"] + cons_parsed["id_documents"],
+    )
+    return result
+
+
+async def _fetch_and_persist_ofac_designations_startup():
+    """ofac_sanctions' fetch_fn. No env var required (OFAC's bulk download
+    needs no key) — this wrapper exists purely for naming consistency with
+    every other registered source's _startup-suffixed fetch_fn, not because
+    there's a credential gate to check. self_recording=False (unlike
+    census_trade/cot_pipeline) — no internal gate/skip logic that would
+    conflict with _schedule_loop's/_refresh_slow_tier's own generic
+    success/failure recording, so this deliberately does NOT call
+    db.record_fetch_attempt itself; it just logs and re-raises on failure
+    so the caller's own try/except records the real outcome."""
+    result = await _fetch_and_persist_ofac_designations()
+    print(f"[ofac_sanctions] new={result['new']} delisted={result['delisted']} unchanged={result['unchanged']}")
+
+
+@app.get("/api/ofac/db")
+async def ofac_designations_db(
+    since: str = Query(None),
+    until: str = Query(None),
+    program: str = Query(None),
+    list_source: str = Query(None),
+):
+    rows = db.get_ofac_designations(since=since, until=until, program=program, list_source=list_source)
+    return {"success": True, "data": rows}
+
+
+@app.get("/api/ofac/{ofac_uid}/db")
+async def ofac_designation_detail_db(ofac_uid: str):
+    designation = db.get_ofac_designation(ofac_uid)
+    if designation is None:
+        raise HTTPException(404, f"No OFAC designation found for uid {ofac_uid}")
+    return {
+        "success": True,
+        "data": {
+            **designation,
+            "aliases": db.get_ofac_aliases(ofac_uid),
+            "addresses": db.get_ofac_addresses(ofac_uid),
+            "id_documents": db.get_ofac_id_documents(ofac_uid),
+        },
+    }
+
+
 async def _fetch_and_persist_treasury_outlays() -> int:
     """fed-spend-spec.md Story #1. No API key required. Two independent
     MTS tables fetched and merged by (year, month): Table 1 for
@@ -2038,7 +2750,7 @@ async def refresh_settings_post(body: dict = Body(...)):
     return {"success": True, "data": _refresh_settings}
 
 
-_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "data", "stack"}
+_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "data", "stack", "sanctions"}
 
 
 @app.get("/api/ui/pinned-section")
@@ -2469,6 +3181,24 @@ sources.register(SourceDefinition(
     cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
     rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), note="Census releases monthly, ~2-month publication lag."),
     self_recording=True,
+))
+# ofac_sanctions (sanctionsTimeline-spec.md, plus the 2026-08-26 entity-
+# detail follow-up): daily full-list pull, diffed locally against ofac_uid
+# — no rate limit, no key, so unlike census_trade this needs no min_gap/
+# gate_on self-throttling, just a plain daily interval like the exchange-
+# inventory sources. OFAC_INTERVAL_S reuses the same "24h + margin"
+# reasoning as EXCHANGE_INVENTORY_INTERVAL_S (one missed/late tick
+# shouldn't cost a full extra day) rather than a bare 86400. Display is a
+# standalone "OFAC" nav tab (frontend/src/sanctions_panel.jsx) — the
+# original Money Supply chart-overlay display was built, then removed at
+# the user's request as noise; see CLAUDE.md's Tab: OFAC section.
+OFAC_INTERVAL_S = 90000  # ~25 hours
+sources.register(SourceDefinition(
+    key="ofac_sanctions", label="OFAC — Sanctions List Service (SDN + Consolidated)",
+    affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_ofac_designations_startup,
+    tables=["ofac_designations", "ofac_aliases", "ofac_addresses", "ofac_id_documents"],
+    cadence=CadenceSpec(trigger="interval", interval_seconds=OFAC_INTERVAL_S, fire_at_startup=True, enabled_flag="slow_enabled"),
+    rate_limit=RateLimitSpec(kind="undocumented", note="Official Treasury bulk XML download, no published rate limit, no auth/key required. User-Agent header required (403 without one). ~126MB SDN Advanced file + a smaller Consolidated Advanced file fetched and parsed daily; only the diff (new designations, delistings) is persisted for the parent table, while the three entity-detail child tables (aliases/addresses/ID documents) are fully replaced per entity on every fetch."),
 ))
 # catcor_startup: previously fired by a hand-written asyncio.create_task(...)
 # call in lifespan, outside the scheduler entirely — a real, separate

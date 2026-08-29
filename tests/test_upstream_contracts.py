@@ -10,6 +10,7 @@ from datetime import date
 import httpx
 import pytest
 import respx
+from fastapi import HTTPException
 from helpers import make_fake_date, yahoo_chart_payload
 
 from backend import main as main_module
@@ -473,3 +474,88 @@ async def test_treasury_outlays_by_agency_skips_already_persisted_months(tmp_db,
     assert n == 0
     rows = tmp_db.get_treasury_outlays_by_agency()
     assert rows[0]["outlay_usd"] == pytest.approx(111.0)  # untouched, not overwritten with 999
+
+
+# --- PSLV: Sprott's fixed-array-position identification (2026-08-28 fix) --
+# Confirmed live 2026-08-28: Sprott's response no longer carries a usable
+# per-fund "id" (every entry's id is now 0 — a real Sprott-side API change
+# that silently broke the old id==4998 filter, so every fetch 502'd with
+# "PSLV entry not found"). The fix reads PSLV by fixed array position
+# (index 1), matching Sprott's own bullion-calculator page source, guarded
+# by a sanity check on totalOunces1's plausible real range.
+
+PSLV_URL = "https://sprott.com/api/FinancialData/v1/BullionCalculatorData"
+
+
+def _sprott_fund_entry(nav: float, total_oz: int, units: int = 100_000_000) -> dict:
+    return {
+        "id": 0,  # confirmed live: always 0 now, not a usable identifier
+        "dateTimeStamp": "2026-08-28T00:00:00Z",
+        "nav": nav,
+        "pdCalc": -2.0,
+        "units": units,
+        "totalNav": nav * units,
+        "totalMarketValue": nav * units * 0.99,
+        "totalOunces1": total_oz,
+        "totalOunces2": 0,
+    }
+
+
+def _sprott_payload(pslv_oz: int = 215_405_617) -> list:
+    # 6 fund entries in Sprott's own real order (PHYS, PSLV, SPPP, CEF,
+    # SPUT, COP), followed by 6 matching quote objects — same shape as a
+    # real live response confirmed 2026-08-28.
+    funds = [
+        _sprott_fund_entry(34.5, 3_747_944),   # 0: PHYS (gold)
+        _sprott_fund_entry(22.64, pslv_oz),    # 1: PSLV (silver)
+        _sprott_fund_entry(15.56, 213_820),    # 2: SPPP
+        _sprott_fund_entry(46.76, 1_108_092),  # 3: CEF
+        _sprott_fund_entry(21.56, 81_697_348), # 4: SPUT
+        _sprott_fund_entry(13.30, 14_808),     # 5: COP
+    ]
+    quotes = [{"last": "1.00", "tradeDate": "08/28/2026", "tradeTime": "16:00"} for _ in range(6)]
+    return funds + quotes
+
+
+async def test_pslv_reads_index_1_not_id_field(tmp_db, upstream_client):
+    with respx.mock:
+        respx.get(PSLV_URL).mock(return_value=httpx.Response(200, json=_sprott_payload()))
+        result = await main_module._fetch_and_persist_pslv()
+
+    assert result["fund"] == "PSLV"
+    assert result["total_oz"] == 215_405_617
+    assert result["nav_per_unit"] == 22.64
+
+    row = tmp_db.get_latest_pslv()
+    assert row["total_oz"] == 215_405_617
+
+
+async def test_pslv_rejects_implausible_ounce_count(tmp_db, upstream_client):
+    """The sanity guard added alongside the fixed-index fix — if Sprott's
+    array order ever shifts again, index 1 landing on a fund with an
+    implausible ounce count for PSLV (e.g. gold-scale, single-digit
+    millions) must fail loudly rather than silently persist the wrong
+    fund's data under the PSLV label."""
+    with respx.mock:
+        respx.get(PSLV_URL).mock(return_value=httpx.Response(200, json=_sprott_payload(pslv_oz=3_000_000)))
+        with pytest.raises(HTTPException) as exc_info:
+            await main_module._fetch_and_persist_pslv()
+
+    assert exc_info.value.status_code == 502
+    assert tmp_db.get_latest_pslv() is None  # nothing persisted on rejection
+
+
+async def test_pslv_502s_on_id_based_response_shape(tmp_db, upstream_client):
+    """Regression test for the real bug this fix addresses: a response
+    shaped like Sprott's OLD real behavior (a genuine id=4998 for PSLV)
+    would, under the new fixed-index read, still resolve correctly as long
+    as PSLV is really at index 1 — this test instead confirms the failure
+    mode when there simply aren't enough real fund entries at all (e.g. a
+    malformed/truncated response), which must still 502 cleanly rather
+    than raise an unhandled IndexError."""
+    with respx.mock:
+        respx.get(PSLV_URL).mock(return_value=httpx.Response(200, json=[_sprott_fund_entry(34.5, 3_747_944)]))
+        with pytest.raises(HTTPException) as exc_info:
+            await main_module._fetch_and_persist_pslv()
+
+    assert exc_info.value.status_code == 502
