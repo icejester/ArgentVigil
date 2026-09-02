@@ -4,20 +4,28 @@ import SilverCoTTracker from "./silver_cot_tracker";
 import ComexInventoryDashboard from "./comex_inventory";
 import MoneySupply from "./money_supply";
 import CatcorPanel from "./catcor_panel";
-import DataPanel, { computeStatus } from "./data_panel";
+import { computeStatus } from "./data_panel";
 import ResearchPanel from "./research_panel";
 import StackTracker from "./stack_tracker";
 import SanctionsPanel from "./sanctions_panel";
+import SettingsView from "./settings_panel";
 import { HealthProvider, useHealthRows } from "./health_context";
+import { PinnedDateProvider } from "./pinned_date_context";
 
+// Nav tab set. MUST stay in lockstep with backend main.py's
+// _VALID_NAV_SECTIONS allowlist — tests/test_conventions.py's
+// test_nav_sections_match_backend_allowlist fails the suite on drift
+// (the two-list bug CLAUDE.md documents from the Stack and OFAC builds).
+// "data" is intentionally absent: the Data tab's content moved into the
+// Settings view (gear icon, a sibling of activeSection), which is not a
+// pinnable default-landing tab.
 const SECTIONS = [
   { key: "cot", label: "Trading" },
-  { key: "moneySupply", label: "Money Supply" },
   { key: "inventory", label: "Inventory" },
+  { key: "moneySupply", label: "Money Supply" },
+  { key: "stack", label: "Stack" },
   { key: "catcor", label: "CATCOR" },
   { key: "research", label: "Research" },
-  { key: "data", label: "Data" },
-  { key: "stack", label: "Stack" },
   { key: "sanctions", label: "OFAC" },
 ];
 
@@ -170,6 +178,11 @@ function HeaderTicker() {
 export default function App() {
   const [activeSection, setActiveSection] = useState("cot");
   const [pinnedSection, setPinnedSection] = useState(null);
+  // Settings is a sibling view, not a nav section: an always-mounted,
+  // visibility-toggled panel (same pattern as the tabs) opened by the
+  // header gear icon. It fully covers the content area while open; any
+  // nav-button click closes it by switching activeSection.
+  const [showSettings, setShowSettings] = useState(false);
   // Cross-panel hotlink: CatcorPanel sets this when a promoted (Observed-
   // origin) catalyst's dot is clicked, so the Research tab opens straight
   // into that session's record instead of its own session list.
@@ -178,6 +191,15 @@ export default function App() {
   function openResearchSession(sessionId) {
     setOpenResearchSessionId(sessionId);
     setActiveSection("research");
+    setShowSettings(false);
+  }
+
+  // A tab panel is visible only when it's the active section AND Settings
+  // isn't covering the content area. `base` is the wrapper's own layout
+  // class ("app-shell" for most, "" for cot/research which don't use it).
+  function sectionClass(key, base) {
+    const visible = activeSection === key && !showSettings;
+    return (base ? base + " " : "") + (visible ? "" : "section-hidden");
   }
 
   // On first load, open whichever tab is pinned (if any) instead of always
@@ -210,12 +232,28 @@ export default function App() {
 
   return (
     <HealthProvider>
+     <PinnedDateProvider>
       <div className="app-shell">
         <div className="app-header app-header--split">
           <div>
             <div className="app-title">
               ArgentVigil
               <HeaderHealthDot />
+              <span
+                role="button"
+                tabIndex={0}
+                className={
+                  "header-settings-gear" +
+                  (showSettings ? " header-settings-gear--active" : "")
+                }
+                title={showSettings ? "Close settings" : "Settings — source health & configuration"}
+                onClick={() => setShowSettings((v) => !v)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") setShowSettings((v) => !v);
+                }}
+              >
+                ⚙️
+              </span>
             </div>
             <div className="app-subtitle">
               Silver Market Observability Platform
@@ -233,7 +271,10 @@ export default function App() {
                   "section-nav-button" +
                   (activeSection === s.key ? " section-nav-button--active" : "")
                 }
-                onClick={() => setActiveSection(s.key)}
+                onClick={() => {
+                  setActiveSection(s.key);
+                  setShowSettings(false);
+                }}
               >
                 {s.label}
                 <span
@@ -261,57 +302,39 @@ export default function App() {
         </div>
       </div>
 
-      <div className={activeSection === "cot" ? "" : "section-hidden"}>
+      {/* All panels stay mounted; visibility is toggled so switching tabs
+          (or opening Settings) never refires mount-time fetches/listeners.
+          Settings, when open, hides every tab panel regardless of which
+          one is active. */}
+      <div className={showSettings ? "" : "section-hidden"}>
+        <SettingsView onClose={() => setShowSettings(false)} />
+      </div>
+
+      <div className={sectionClass("cot", "")}>
         <SilverCoTTracker />
       </div>
-      <div
-        className={
-          "app-shell" + (activeSection === "moneySupply" ? "" : " section-hidden")
-        }
-      >
+      <div className={sectionClass("moneySupply", "app-shell")}>
         <MoneySupply />
       </div>
-      <div
-        className={
-          "app-shell" + (activeSection === "inventory" ? "" : " section-hidden")
-        }
-      >
+      <div className={sectionClass("inventory", "app-shell")}>
         <ComexInventoryDashboard />
       </div>
-      <div
-        className={
-          "app-shell" + (activeSection === "catcor" ? "" : " section-hidden")
-        }
-      >
+      <div className={sectionClass("catcor", "app-shell")}>
         <CatcorPanel onOpenResearchSession={openResearchSession} />
       </div>
-      <div className={activeSection === "research" ? "" : "section-hidden"}>
+      <div className={sectionClass("research", "")}>
         <ResearchPanel
           openSessionId={openResearchSessionId}
           onOpenedSession={() => setOpenResearchSessionId(null)}
         />
       </div>
-      <div
-        className={
-          "app-shell" + (activeSection === "data" ? "" : " section-hidden")
-        }
-      >
-        <DataPanel />
-      </div>
-      <div
-        className={
-          "app-shell" + (activeSection === "stack" ? "" : " section-hidden")
-        }
-      >
+      <div className={sectionClass("stack", "app-shell")}>
         <StackTracker />
       </div>
-      <div
-        className={
-          "app-shell" + (activeSection === "sanctions" ? "" : " section-hidden")
-        }
-      >
+      <div className={sectionClass("sanctions", "app-shell")}>
         <SanctionsPanel />
       </div>
+     </PinnedDateProvider>
     </HealthProvider>
   );
 }

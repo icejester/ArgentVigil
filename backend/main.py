@@ -602,9 +602,17 @@ async def _fetch_and_persist_silver_leverage() -> dict:
     oi_oz = oi * SILVER_CONTRACT_OZ if oi else None
     paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
     enriched = {**row, "paper_leverage": paper_leverage}
-    if vol:
+    # Persist volume ONLY under the real trading date the upstream reports.
+    # No str(date.today()) fallback: this endpoint's `date` lags the real
+    # calendar day (confirmed live), so stamping "today" onto a stale
+    # figure manufactures a date key for a value that isn't from that day
+    # — the "never manufacture a reading" convention applies to the key,
+    # not just the value. If `date` is missing, skip the write; a later
+    # cycle catches it once the source rolls forward.
+    upstream_date = row.get("date")
+    if vol and upstream_date:
         db.upsert_volume_oi_row({
-            "date": row.get("date", str(date.today())),
+            "date": upstream_date,
             "open_interest": None,
             "volume": vol,
             "paper_leverage": None,
@@ -722,9 +730,13 @@ async def _fetch_and_persist_gold_leverage() -> dict:
     oi_oz = oi * GOLD_CONTRACT_OZ if oi else None
     paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
     enriched = {**row, "paper_leverage": paper_leverage}
-    if vol:
+    # No str(date.today()) fallback — see _fetch_and_persist_silver_leverage's
+    # comment: stamping "today" onto this lagging feed manufactures a date
+    # key. Skip the write if `date` is absent; a later cycle picks it up.
+    upstream_date = row.get("date")
+    if vol and upstream_date:
         db.upsert_gold_volume_oi_row({
-            "date": row.get("date", str(date.today())),
+            "date": upstream_date,
             "open_interest": None,
             "volume": vol,
             "paper_leverage": None,
@@ -1180,6 +1192,27 @@ def _spot_entry_fields(entry) -> tuple[float | None, float | None]:
     return entry, None
 
 
+# COMEX metals trade on CME Globex Sunday 22:00 UTC through Friday 22:00
+# UTC (there's a daily 22:00-23:00 UTC maintenance halt too, but a stale
+# cache re-serve during that one hour is harmless — not worth encoding).
+# This is deliberately still an approximation, not a real holiday-aware
+# trading calendar (CLAUDE.md: "Weekend/business-day handling — three
+# deliberate variants"): it only fixes the coarse "all of Sat AND all of
+# Sun UTC" skip, which was suppressing real Sunday-evening ticks once
+# Globex reopened. A US market holiday (e.g. Thanksgiving) will still let
+# a stale re-serve through — accepted, same as the FND/LTD date math.
+def _metals_market_closed(now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    wd = now.weekday()  # Mon=0 .. Sun=6
+    if wd == 5:  # Saturday — closed all day
+        return True
+    if wd == 6:  # Sunday — closed until the 22:00 UTC Globex reopen
+        return now.hour < 22
+    if wd == 4:  # Friday — closes at 22:00 UTC
+        return now.hour >= 22
+    return False
+
+
 async def _fetch_and_persist_prices() -> dict:
     hdrs = await authed_headers(_client)
     resp = await _client.get(
@@ -1202,9 +1235,12 @@ async def _fetch_and_persist_prices() -> dict:
     # weekday with a cacheAge of months (metalcharts.org's own upstream feed
     # stuck, not a market closure) — skipping indefinitely in that case would
     # silently flatline the chart forever with no visible signal anything's
-    # wrong. So: skip only when it's currently a real weekend; on a weekday,
-    # persist anyway and let a stuck upstream surface directly in the chart.
-    if isinstance(data, dict) and data.get("isStale") and date.today().weekday() >= 5:
+    # wrong. So: skip only when the metals market is genuinely closed
+    # (_metals_market_closed — Globex hours, not just "is it Sat/Sun UTC",
+    # which was wrongly suppressing real Sunday-evening ticks after the
+    # 22:00 UTC reopen); on a weekday/trading session, persist anyway and
+    # let a stuck upstream surface directly in the chart.
+    if isinstance(data, dict) and data.get("isStale") and _metals_market_closed():
         return data
     payload = data.get("data", data) if isinstance(data, dict) else {}
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -2750,7 +2786,17 @@ async def refresh_settings_post(body: dict = Body(...)):
     return {"success": True, "data": _refresh_settings}
 
 
-_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "data", "stack", "sanctions"}
+_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "stack", "sanctions"}
+# NB: "data" was removed when the Data tab moved into the Settings view (a
+# sibling of activeSection, not a nav section) — Settings is deliberately
+# not a pinnable default-landing tab. This set MUST stay in lockstep with
+# frontend/src/App.jsx's SECTIONS array; tests/test_conventions.py's
+# test_nav_sections_match_backend_allowlist fails the suite on drift.
+
+# Env vars AV actually reads (Settings' read-only Configuration status
+# panel). Never exposes the value — presence only. `used_by` is derived
+# from each source's requires_env at request time, not hand-maintained.
+_CONFIG_ENV_VARS = ["FRED_API_KEY", "GAPI_API_KEY", "CENSUS_API_KEY", "ANTHROPIC_API_KEY", "AI_BACKEND"]
 
 
 @app.get("/api/ui/pinned-section")
@@ -2765,6 +2811,35 @@ async def ui_pinned_section_post(body: dict = Body(...)):
         raise HTTPException(400, f"section must be one of {sorted(_VALID_NAV_SECTIONS)} or null")
     db.set_pinned_section(section)
     return {"success": True, "data": {"pinned_section": section}}
+
+
+@app.get("/api/config/status")
+async def config_status():
+    """Read-only presence check for the env vars AV uses — Settings'
+    Configuration status panel. Reports set/not-set only, never the value.
+    AI_BACKEND is not a secret and its effective value is meaningful to
+    show, so it reports `value` too; every real key reports presence only.
+    `used_by` lists the source keys that declare the var in requires_env,
+    derived live from sources.SOURCE_REGISTRY rather than hand-duplicated."""
+    used_by: dict[str, list[str]] = {}
+    for src_key, src in sources.SOURCE_REGISTRY.items():
+        for env_var in src.requires_env:
+            used_by.setdefault(env_var, []).append(src_key)
+    rows = []
+    for var in _CONFIG_ENV_VARS:
+        raw = os.environ.get(var)
+        row = {
+            "key": var,
+            "set": bool(raw),
+            "used_by": sorted(used_by.get(var, [])),
+        }
+        if var == "AI_BACKEND":
+            # Non-secret; the effective backend (explicit or default) is
+            # the useful thing to surface, matching catcor_research.py's
+            # own `os.environ.get("AI_BACKEND", "forge")` default.
+            row["value"] = raw or "forge"
+        rows.append(row)
+    return {"success": True, "data": rows}
 
 
 @app.post("/api/refresh/force")
@@ -3031,6 +3106,19 @@ sources.register(SourceDefinition(
 # so one briefly-late or transiently-failed upstream update doesn't cost
 # a full extra day before the next attempt.
 EXCHANGE_INVENTORY_INTERVAL_S = 90000  # 25 hours
+# silver_leverage/gold_leverage are the two slow-tier sources whose only
+# still-trusted field is metalcharts.org's daily `volume` (open_interest
+# was dropped after the 2026-07 ~15%-vs-CFTC investigation). That volume-
+# oi endpoint's own `date` field lags the real calendar day irregularly
+# (confirmed live: Wed still serving Mon's figure) — at a 25h cadence,
+# most days-worth of real volume never lands because a cycle rarely
+# catches the moment the source rolls its `date` forward, then the next
+# cycle is a day later. A ~6h cadence gives ~4 chances/day to catch each
+# roll-forward without meaningfully more load (one small HTTP round-trip).
+# This does NOT fix a multi-day upstream lag — see get_volume_series'
+# docstring; this series stays best-effort, 6h just makes it less gappy.
+LEVERAGE_VOLUME_INTERVAL_S = 21600  # 6 hours
+_LEVERAGE_VOLUME_KEYS = {"silver_leverage", "gold_leverage"}
 _SLOW_TIER_FETCH_FNS: dict[str, tuple[Callable[[], Awaitable[None]], list[str], str]] = {
     "comex_silver_history": (_fetch_and_persist_silver_history, ["inventory_aggregate"], "COMEX silver registered/eligible/total, daily."),
     "comex_gold_history": (_fetch_and_persist_gold_history, ["gold_inventory_aggregate"], "COMEX gold registered/eligible/total, daily."),
@@ -3048,13 +3136,14 @@ _SLOW_TIER_FETCH_FNS: dict[str, tuple[Callable[[], Awaitable[None]], list[str], 
     "futures_curve_spread": (_fetch_and_persist_curve_spread, ["futures_curve_spread"], "COMEX front/next-month futures spread (Yahoo Finance), daily."),
 }
 for _key, (_fn, _tables, _note) in _SLOW_TIER_FETCH_FNS.items():
+    _interval = LEVERAGE_VOLUME_INTERVAL_S if _key in _LEVERAGE_VOLUME_KEYS else EXCHANGE_INVENTORY_INTERVAL_S
     sources.register(SourceDefinition(
         key=_key, label=_key.replace("_", " ").title(),
         affinity_group="exchange_market", fetch_fn=_fn, tables=_tables,
-        cadence=CadenceSpec(trigger="interval", interval_seconds=EXCHANGE_INVENTORY_INTERVAL_S, enabled_flag="slow_enabled"),
+        cadence=CadenceSpec(trigger="interval", interval_seconds=_interval, enabled_flag="slow_enabled"),
         rate_limit=RateLimitSpec(kind="undocumented", note=_note),
     ))
-del _key, _fn, _tables, _note
+del _key, _fn, _tables, _note, _interval
 
 # money_supply/metals_prices/treasury_outlays/treasury_outlays_by_agency:
 # previously trigger="manual_only", fire_at_startup=True (fetch once per

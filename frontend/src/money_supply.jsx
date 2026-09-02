@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { nearestRowDate } from "./date_utils";
 import { VAULT_COLORS } from "./palette";
 import ChartStaleness from "./chart_staleness";
+import { usePinnedDate } from "./pinned_date_context";
 import {
   ComposedChart,
   LineChart,
@@ -1472,7 +1473,15 @@ export default function MoneySupply() {
   // return comparison) and from hoveredCompositionDate/hoveredPieKey
   // (transient hover state, cleared on mouseleave). pinnedDate persists
   // until clicked again or a "clear" affordance is used.
-  const [pinnedDate, setPinnedDate] = useState(null);
+  //
+  // Shared GLOBALLY across Money Supply + Trading + Inventory via
+  // PinnedDateProvider (frontend/src/pinned_date_context.jsx) — a pin set
+  // on any of those tabs shows on all three, each chart snapping the
+  // shared value to its own nearest real row. setPinnedDate is aliased to
+  // togglePinnedDate so the existing "click a point to set" call sites get
+  // click-again-to-clear for free; the 📌 button clears the global pin.
+  const { pinnedDate, togglePinnedDate, clearPinnedDate } = usePinnedDate();
+  const setPinnedDate = togglePinnedDate;
   const [compositionView, setCompositionView] = useState("both"); // "both" | "assets" | "liabilities"
   const [hoveredCompositionDate, setHoveredCompositionDate] = useState(null);
   // Click (not hover) a legend row below the pie to show/hide its ELI5
@@ -2016,8 +2025,8 @@ export default function MoneySupply() {
           {pinnedDate && (
             <button
               className="comex-range-btn"
-              onClick={() => setPinnedDate(null)}
-              title="Click to remove the pinned date"
+              onClick={clearPinnedDate}
+              title="Click to remove the pinned date (shared across Trading, Money Supply & Inventory)"
             >
               📌 {pinnedDate}
             </button>
