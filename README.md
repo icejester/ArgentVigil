@@ -1,4 +1,4 @@
-# ArgentVigil v2.16.2
+# ArgentVigil v2.17.3
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -36,9 +36,9 @@ Did the catalyst actually move the metal? A macro-event calendar (FOMC, CPI, NFP
 
 A workbench for testing one claim at a time — "SLV shorts are covering," "industrial demand is quietly accelerating" — with a human driving every step. Each turn is assembled from explicitly chosen controls: which model answers, which persona frames it, which AV data blocks get pasted into the prompt (positioning, inventory, money supply, market balance — only what you check), and whether the session remembers prior turns. Nothing is auto-fetched by a model deciding it's relevant. A session ends in a disposition: **promote** (it becomes a tracked event on the CATCOR timeline, hotlinked back to its research record, and gets its price reactions captured like any calendar event), **dismiss** (logged as noise, with a required reason), or **discard**.
 
-#### Data
+#### Settings (⚙️ gear icon, not a tab)
 
-Provenance and health. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. Every source that recurs on its own now does so at its own real upstream cadence — daily for exchange-inventory data, weekly/monthly for slower macro sources — rather than one shared polling interval, and that same freshness readout follows the data itself: every tab's sub-panels carry their own compact "how stale is this, refresh now" badge, not just the Data tab. This panel is held to a strict rule: any change to what the app stores or fetches must land a matching Data-tab update in the same change — enforced by the test suite, not by memory.
+Provenance, health, and configuration. Opened from a gear icon in the header (next to the data-health dot), not the main nav bar. Every table AV persists, where its data comes from, per-field descriptions, fetch cadence and rate-limit posture, and live fetch health (ok / stale / error) per upstream source with a per-source "re-run now" control. Every source that recurs on its own does so at its own real upstream cadence — daily for exchange-inventory data, weekly/monthly for slower macro sources — rather than one shared polling interval, and that same freshness readout follows the data itself: every tab's sub-panels carry their own compact "how stale is this, refresh now" badge. A read-only Configuration-status panel shows which API keys AV can see in its environment (set / not set only — never the value). This is held to a strict rule: any change to what the app stores or fetches must land a matching Settings/Data update in the same change — enforced by the test suite, not by memory.
 
 #### OFAC
 

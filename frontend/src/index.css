@@ -706,6 +706,37 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   width: 10px; height: 10px; border-radius: 50%; display: inline-block;
   margin-left: 8px; vertical-align: middle;
 }
+.header-settings-gear {
+  margin-left: 10px; font-size: 15px; cursor: pointer; user-select: none;
+  vertical-align: middle; opacity: 0.65; transition: opacity 0.15s ease;
+}
+.header-settings-gear:hover,
+.header-settings-gear--active { opacity: 1; }
+
+/* Settings view (gear icon) — a sibling of the nav tabs, not a tab. */
+.settings-view-header {
+  display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px;
+}
+.settings-view-title { font-size: 20px; font-weight: 700; color: #e8ecf4; }
+.settings-view-close {
+  margin-left: auto; font-size: 13px; color: #8a94a6; cursor: pointer;
+  background: none; border: 1px solid #2e3547; border-radius: 4px;
+  padding: 4px 10px;
+}
+.settings-view-close:hover { color: #e8ecf4; border-color: #3e4860; }
+.config-status-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 8px; }
+.config-status-table th {
+  text-align: left; color: #6b778d; font-weight: 600; padding: 4px 8px;
+  border-bottom: 1px solid #1e2333;
+}
+.config-status-table td { padding: 6px 8px; border-bottom: 1px solid #141820; color: #c8d0de; }
+.config-status-pill {
+  display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px;
+  border-radius: 10px;
+}
+.config-status-pill--set { background: #16351f; color: #4caf76; }
+.config-status-pill--unset { background: #341a1c; color: #e0555c; }
+.config-status-usedby { color: #5a6278; font-size: 11px; }
 .comex-table td.data-reference-col,
 .comex-table th.data-reference-col { color: #5a6278; font-size: 11px; }
 

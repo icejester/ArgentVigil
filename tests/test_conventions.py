@@ -83,6 +83,7 @@ ALLOWED_NON_DB_API = {
     "/api/health/refresh/": "Data tab 'Re-run now' — user-initiated persist trigger",
     "/api/data-sources/": "interval-override POST (app state); its read is /db-suffixed",
     "/api/ui/pinned-section": "pinned-tab state read/write — app state, no upstream",
+    "/api/config/status": "Settings' Configuration status — os.environ presence check, no upstream, no value ever returned",
     "/api/silver/market-balance": "reads seed_data JSON server-side — no upstream fetch",
     "/api/catcor/research/": "Research workflow (sessions/personas/preview) — on-demand chat, no market upstream",
     "/api/stack/": "Stack Tracker CRUD (specs/stackTracker-spec.md) — user-owned data, no upstream fetch at all",
@@ -137,6 +138,41 @@ def test_readme_version_matches_claude_md():
         f"README.md is v{readme} but CLAUDE.md is v{claude} — the two docs "
         f"share one version number; bump both together on feature completion."
     )
+
+
+# --- Nav sections: App.jsx SECTIONS <-> main.py _VALID_NAV_SECTIONS ------
+
+# The mechanical guard CLAUDE.md's Stack and OFAC known-gaps sections both
+# asked for: these two lists are kept in lockstep by hand, and drifted
+# twice before (a tab added to one but not the other pins silently with no
+# error surfaced). Turn "they should match" into a suite failure.
+SECTIONS_BLOCK_RE = re.compile(r"const SECTIONS = \[(.*?)\];", re.DOTALL)
+SECTIONS_KEY_RE = re.compile(r'key:\s*"([^"]+)"')
+
+
+def _app_jsx_section_keys() -> set[str]:
+    src = (FRONTEND_SRC / "App.jsx").read_text()
+    block = SECTIONS_BLOCK_RE.search(src)
+    assert block, "App.jsx has no `const SECTIONS = [...]` array"
+    return set(SECTIONS_KEY_RE.findall(block.group(1)))
+
+
+def test_nav_sections_match_backend_allowlist():
+    frontend_keys = _app_jsx_section_keys()
+    backend_keys = set(backend.main._VALID_NAV_SECTIONS)
+    assert frontend_keys == backend_keys, (
+        f"App.jsx SECTIONS keys {sorted(frontend_keys)} != main.py "
+        f"_VALID_NAV_SECTIONS {sorted(backend_keys)} — these must stay in "
+        f"lockstep (a mismatch pins a tab silently with no surfaced error)."
+    )
+
+
+def test_data_is_not_a_pinnable_section():
+    """The Data tab moved into the Settings view (a sibling of
+    activeSection, not a nav section); Settings is deliberately not a
+    pinnable default-landing tab."""
+    assert "data" not in backend.main._VALID_NAV_SECTIONS
+    assert "data" not in _app_jsx_section_keys()
 
 
 # --- Registry invariants (backend/sources.py) ------------------------------

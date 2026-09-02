@@ -22,6 +22,7 @@ import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { nearestRowDate } from "./date_utils";
 import ChartStaleness from "./chart_staleness";
+import { usePinnedDate } from "./pinned_date_context";
 
 const REFRESH_MS = (parseInt(import.meta.env.VITE_AV_REFRESH_INTERVAL, 10) || 60) * 1000;
 
@@ -568,7 +569,7 @@ function CrossExchangeTooltipContent({ active, label, rows }) {
 
 function CrossExchangePanel({ comexHistory, shfeHistory, pslv, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
   if (!comexHistory && !shfeHistory) return (
-    <details className="collapsible-pane" open>
+    <details className="collapsible-pane">
       <summary className="collapsible-pane-title">Silver Inventory — Exchange Reserves</summary>
       <div className="collapsible-pane-body">
         <div className="comex-panel">
@@ -598,7 +599,7 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv, sfWindow, sfCusto
   const pinnedDateSnapped = nearestRowDate(filtered, pinnedDate);
 
   return (
-    <details className="collapsible-pane" open>
+    <details className="collapsible-pane">
       <summary className="collapsible-pane-title">
         <ChartStaleness sourceKey={["comex_silver_history", "shfe_silver_history", "pslv"]} />
         <span>Silver Inventory — Exchange Reserves</span>
@@ -1207,13 +1208,15 @@ export default function ComexInventoryDashboard() {
   const [sfCustomEnd, setSfCustomEnd] = useState("");
 
   // Cross-chart click-to-pin (2026-07-24, replacing the earlier hover-driven,
-  // server-refetching pin) — same convention as Money Supply/Paper Games:
-  // one shared pinnedDate string, any chart's onClick can set it, every
-  // chart snaps it to its own nearest real row via nearestRowDate and draws
-  // its own ReferenceLine. Pure client-side against each chart's own
-  // already-fetched data — no fetch-on-pin, unlike the old design (which
-  // re-fetched /api/{silver,gold}/db/depositories?date= on every hover).
-  const [pinnedDate, setPinnedDate] = useState(null);
+  // server-refetching pin). As of cleanup-spec.md Stage 1B this pin is
+  // shared GLOBALLY across Inventory + Trading + Money Supply via
+  // PinnedDateProvider (frontend/src/pinned_date_context.jsx) — a pin set
+  // on any of the three tabs shows on all three, each chart snapping the
+  // shared value to its own nearest real row via nearestRowDate (or the
+  // exact-match-only rule in VaultSnapshotPanel / ShfeWarehousePanel,
+  // unchanged). Pure client-side against each chart's own already-fetched
+  // data — no fetch-on-pin.
+  const { pinnedDate, togglePinnedDate, clearPinnedDate } = usePinnedDate();
   // comexMetal drives both VaultSnapshotPanel and DeliveryBehaviorPanel —
   // owned here (2026-07-24) and rendered as a selector in "COMEX — New
   // York"'s own header, since it's the shared parent of both panels. Used
@@ -1226,9 +1229,10 @@ export default function ComexInventoryDashboard() {
   // to the same metal at the same time.
   const [shfeMetal, setShfeMetal] = useState("XAG");
 
-  const handlePin = useCallback((date) => {
-    setPinnedDate((prev) => (prev === date ? null : date));
-  }, []);
+  // handlePin is kept as the name every chart below already passes as
+  // onPin; it now delegates to the shared context's toggle (same
+  // click-again-to-clear semantics it had locally).
+  const handlePin = togglePinnedDate;
 
   const fetchAll = useCallback(async () => {
     setFetchError(null);
@@ -1286,8 +1290,8 @@ export default function ComexInventoryDashboard() {
           {pinnedDate && (
             <button
               className="comex-range-btn"
-              onClick={() => setPinnedDate(null)}
-              title="Click to remove the pinned date"
+              onClick={clearPinnedDate}
+              title="Click to remove the pinned date (shared across Trading, Money Supply & Inventory)"
             >
               📌 {pinnedDate}
             </button>
@@ -1355,7 +1359,7 @@ export default function ComexInventoryDashboard() {
             onPin={handlePin}
           />
 
-          <details className="collapsible-pane">
+          <details className="collapsible-pane" open>
             <summary className="collapsible-pane-title">
               <ChartStaleness sourceKey={comexMetal === "XAU" ? "comex_gold_depositories" : "comex_silver_depositories"} />
               <span>COMEX — New York</span>

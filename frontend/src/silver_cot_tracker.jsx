@@ -21,6 +21,7 @@ import {
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
 import ChartStaleness from "./chart_staleness";
+import { usePinnedDate } from "./pinned_date_context";
 
 const CATEGORY_LABELS = {
   producer_merchant: "Producer/Merchant",
@@ -1201,15 +1202,17 @@ export default function SilverCoTTracker() {
   const [days, setDays] = useState(180);
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
-  // Shared across every chart in this panel, same mechanism as
-  // money_supply.jsx's own pinnedDate — any chart can originate a pin
-  // (click a point), every chart displays whatever's pinned via its own
-  // nearestRowDate snap (see that helper below) + ReferenceLine + pinned-
-  // tooltip box. Cleared via the 📌 button, not right-click — CLAUDE.md's
-  // Money Supply section documents right-click-to-clear being tried and
-  // dropped there (Safari intercepts contextmenu unreliably); same fix
-  // reused here rather than re-discovering it.
-  const [pinnedDate, setPinnedDate] = useState(null);
+  // Shared GLOBALLY across Trading + Money Supply + Inventory via
+  // PinnedDateProvider (frontend/src/pinned_date_context.jsx) — pinning a
+  // date on any of those three tabs pins it on all of them, each chart
+  // snapping the shared value to its own nearest real row (nearestRowDate,
+  // see below) + ReferenceLine + pinned-tooltip box. Any chart here can
+  // originate a pin (click a point → togglePinnedDate: same date again
+  // clears it); the 📌 button clears the global pin. Not right-click —
+  // CLAUDE.md's Money Supply section documents right-click-to-clear being
+  // tried and dropped (Safari intercepts contextmenu unreliably).
+  const { pinnedDate, togglePinnedDate, clearPinnedDate } = usePinnedDate();
+  const setPinnedDate = togglePinnedDate;
 
   useEffect(() => {
     fetch("/api/cot/db")
@@ -1261,8 +1264,8 @@ export default function SilverCoTTracker() {
             {pinnedDate && (
               <button
                 className="comex-range-btn"
-                onClick={() => setPinnedDate(null)}
-                title="Click to remove the pinned date"
+                onClick={clearPinnedDate}
+                title="Click to remove the pinned date (shared across Trading, Money Supply & Inventory)"
               >
                 📌 {pinnedDate}
               </button>

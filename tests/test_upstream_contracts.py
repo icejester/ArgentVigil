@@ -5,7 +5,7 @@ Census's 204-means-unpublished, GoldAPI's silent weekend carry-forward,
 Yahoo's 429 retry margin, and curve spread's two front/next ranking bugs."""
 
 import asyncio
-from datetime import date
+from datetime import date, datetime, timezone
 
 import httpx
 import pytest
@@ -39,12 +39,29 @@ def _prices_payload(is_stale: bool) -> dict:
     }
 
 
-# --- Spot prices: weekend persist-skip (Standing rules) -------------------
+# --- Spot prices: market-closed persist-skip (Standing rules) ------------
+
+# _fetch_and_persist_prices skips persisting a stale re-serve only when
+# the metals market is genuinely closed (_metals_market_closed, Globex
+# hours). Tests pin that closed-ness by monkeypatching a fixed UTC "now"
+# onto the helper rather than the real clock.
 
 
-async def test_stale_spot_feed_on_weekend_is_not_persisted(tmp_db, upstream_client, monkeypatch):
+def _freeze_market_clock(monkeypatch, now_utc: datetime):
+    real = main_module._metals_market_closed
+    monkeypatch.setattr(main_module, "_metals_market_closed", lambda now=None: real(now_utc))
+
+
+SAT_NOON = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)       # Saturday — closed
+MON_NOON = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)       # Monday — open
+SUN_EVENING = datetime(2026, 7, 19, 23, 0, tzinfo=timezone.utc)    # Sunday 23:00 UTC — Globex reopened
+SUN_MORNING = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)    # Sunday 10:00 UTC — still closed
+FRI_LATE = datetime(2026, 7, 17, 22, 30, tzinfo=timezone.utc)      # Friday 22:30 UTC — closed
+
+
+async def test_stale_spot_feed_when_market_closed_is_not_persisted(tmp_db, upstream_client, monkeypatch):
     monkeypatch.setattr(main_module, "authed_headers", _no_headers)
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 18)))  # Saturday
+    _freeze_market_clock(monkeypatch, SAT_NOON)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
         await main_module._fetch_and_persist_prices()
@@ -56,7 +73,7 @@ async def test_stale_spot_feed_on_weekday_is_persisted_anyway(tmp_db, upstream_c
     months (stuck upstream, not a market closure) — skipping would silently
     flatline the chart forever, so a stuck weekday feed must surface."""
     monkeypatch.setattr(main_module, "authed_headers", _no_headers)
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 20)))  # Monday
+    _freeze_market_clock(monkeypatch, MON_NOON)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
         await main_module._fetch_and_persist_prices()
@@ -65,15 +82,99 @@ async def test_stale_spot_feed_on_weekday_is_persisted_anyway(tmp_db, upstream_c
     assert latest["XAU"]["price"] == 3350.0
 
 
-async def test_fresh_spot_feed_on_weekend_is_persisted(tmp_db, upstream_client, monkeypatch):
-    """The skip needs BOTH conditions — a genuinely fresh weekend response
-    (isStale false) still persists."""
+async def test_stale_spot_feed_after_sunday_globex_reopen_is_persisted(tmp_db, upstream_client, monkeypatch):
+    """The bug this fix targets: COMEX Globex reopens Sunday 22:00 UTC, but
+    the old skip suppressed all of Sunday UTC — so real Sunday-evening
+    ticks never landed and the chart stayed empty. Post-fix, a Sunday
+    23:00 UTC response persists."""
     monkeypatch.setattr(main_module, "authed_headers", _no_headers)
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 18)))  # Saturday
+    _freeze_market_clock(monkeypatch, SUN_EVENING)
+    with respx.mock:
+        respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
+        await main_module._fetch_and_persist_prices()
+    assert tmp_db.get_latest_spot_prices()["XAG"]["price"] == 39.5
+
+
+async def test_stale_spot_feed_sunday_before_reopen_is_not_persisted(tmp_db, upstream_client, monkeypatch):
+    """Sunday before the 22:00 UTC reopen is still a real closure — a stale
+    re-serve then must not be persisted."""
+    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    _freeze_market_clock(monkeypatch, SUN_MORNING)
+    with respx.mock:
+        respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
+        await main_module._fetch_and_persist_prices()
+    assert tmp_db.get_latest_spot_prices() == {}
+
+
+async def test_fresh_spot_feed_when_market_closed_is_persisted(tmp_db, upstream_client, monkeypatch):
+    """The skip needs BOTH conditions — a genuinely fresh closed-market
+    response (isStale false) still persists."""
+    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    _freeze_market_clock(monkeypatch, SAT_NOON)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(False)))
         await main_module._fetch_and_persist_prices()
     assert tmp_db.get_latest_spot_prices()["XAG"]["price"] == 39.5
+
+
+def test_metals_market_closed_boundaries():
+    """Direct unit coverage of the Globex-hours approximation."""
+    assert main_module._metals_market_closed(SAT_NOON) is True
+    assert main_module._metals_market_closed(SUN_MORNING) is True
+    assert main_module._metals_market_closed(SUN_EVENING) is False
+    assert main_module._metals_market_closed(MON_NOON) is False
+    assert main_module._metals_market_closed(FRI_LATE) is True
+    # Friday mid-session and the 22:00 UTC boundary itself.
+    assert main_module._metals_market_closed(datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)) is False
+    assert main_module._metals_market_closed(datetime(2026, 7, 17, 22, 0, tzinfo=timezone.utc)) is True
+    assert main_module._metals_market_closed(datetime(2026, 7, 19, 22, 0, tzinfo=timezone.utc)) is False
+
+
+# --- volume-oi: no manufactured date key (2026-09 investigation) ---------
+
+VOLUME_OI_URL = f"{main_module.METALCHARTS}/api/comex/volume-oi"
+
+
+async def test_leverage_volume_persists_only_under_real_upstream_date(tmp_db, upstream_client, monkeypatch):
+    """The volume-oi endpoint's `date` lags the real calendar day — a row
+    must be keyed on whatever trading date the upstream actually reports,
+    never str(date.today()), so a stale figure never gets stamped with a
+    day it isn't from."""
+    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 9, 2)))  # Wed
+    with respx.mock:
+        respx.get(VOLUME_OI_URL).mock(return_value=httpx.Response(
+            200, json={"success": True, "symbol": "XAG",
+                       "data": {"date": "2026-08-31", "openInterest": 104394, "volume": 43881}}))
+        await main_module._fetch_and_persist_silver_leverage()
+    rows = tmp_db.get_volume_series("XAG")
+    assert [r["date"] for r in rows] == ["2026-08-31"]  # the upstream date, not 2026-09-02
+    assert rows[0]["volume"] == 43881
+
+
+async def test_leverage_volume_skips_write_when_upstream_date_absent(tmp_db, upstream_client, monkeypatch):
+    """If the upstream omits `date` entirely, skip the write rather than
+    inventing a key — a later cycle catches it once the source rolls
+    forward. (Not observed live, but the old fallback made it latent.)"""
+    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 9, 2)))
+    with respx.mock:
+        respx.get(VOLUME_OI_URL).mock(return_value=httpx.Response(
+            200, json={"success": True, "symbol": "XAU",
+                       "data": {"openInterest": 419328, "volume": 176442}}))
+        await main_module._fetch_and_persist_gold_leverage()
+    assert tmp_db.get_volume_series("XAU") == []
+
+
+def test_leverage_volume_sources_poll_faster_than_daily():
+    """silver_leverage/gold_leverage carry their own 6h cadence, distinct
+    from the ~25h EXCHANGE_INVENTORY_INTERVAL_S their slow-tier peers use,
+    to catch the lagging volume-oi `date` roll-forward more often."""
+    from backend import sources
+    for key in ("silver_leverage", "gold_leverage"):
+        spec = sources.SOURCE_REGISTRY[key].cadence
+        assert spec.interval_seconds == main_module.LEVERAGE_VOLUME_INTERVAL_S == 21600
+        assert spec.interval_seconds < main_module.EXCHANGE_INVENTORY_INTERVAL_S
 
 
 # --- Census: 204-means-unpublished + qty sentinel -> NULL -----------------

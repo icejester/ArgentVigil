@@ -60,6 +60,35 @@ async def test_health_db_ships_derived_interval_and_tier(tmp_db, client):
     assert spot["last_attempt_status"] == "success"
 
 
+async def test_config_status_reports_presence_not_values(client):
+    """Settings' Configuration status panel: one row per env var AV uses,
+    set/not-set only — never the value. `used_by` is derived from each
+    source's requires_env. AI_BACKEND carries its effective value since
+    it's not a secret."""
+    resp = await client.get("/api/config/status")
+    assert resp.status_code == 200
+    rows = {r["key"]: r for r in resp.json()["data"]}
+    for var in ["FRED_API_KEY", "GAPI_API_KEY", "CENSUS_API_KEY", "ANTHROPIC_API_KEY", "AI_BACKEND"]:
+        assert var in rows
+        assert isinstance(rows[var]["set"], bool)
+        assert isinstance(rows[var]["used_by"], list)
+    # requires_env wiring surfaces in used_by, not hand-duplicated.
+    assert "money_supply" in rows["FRED_API_KEY"]["used_by"]
+    assert "lbma_fix" in rows["GAPI_API_KEY"]["used_by"]
+    # No real key value is ever echoed back.
+    for var in ["FRED_API_KEY", "GAPI_API_KEY", "CENSUS_API_KEY", "ANTHROPIC_API_KEY"]:
+        assert "value" not in rows[var]
+    assert rows["AI_BACKEND"]["value"] in ("forge", "anthropic") or rows["AI_BACKEND"]["value"]
+
+
+async def test_data_section_no_longer_pinnable(client):
+    """The Data tab moved into Settings (not a nav section) — pinning it
+    must now be rejected, and the frontend falls back to 'cot' for a stale
+    'data' value."""
+    resp = await client.post("/api/ui/pinned-section", json={"section": "data"})
+    assert resp.status_code == 400
+
+
 async def test_money_supply_custom_window_yoy_regression(tmp_db, client):
     """The real bug the user caught ('no M2 YoY stats earlier than 2021?'):
     the custom branch originally fetched from `start` with zero lookback,
