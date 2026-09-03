@@ -19,3 +19,17 @@ export function nearestRowDate(rows, pinnedDate) {
   if (best != null) return best;
   return rows[0]?.date ?? null;
 }
+
+// Evenly-spaced subset of a series' `date` values for a Recharts category
+// X-axis, capped at maxTicks — the exact date is already on the tooltip,
+// so a chart never needs a tick per row. The `|| 1` guards a series
+// shorter than maxTicks (where Math.floor(len/n) would be 0 → i % 0 is
+// NaN → zero ticks rendered). Was independently defined three times
+// (comex_inventory.jsx, money_supply_shared.js, an inline copy in
+// silver_cot_tracker.jsx's CombinedChart) before this consolidation.
+export function xTicks(data, maxTicks = 8) {
+  if (!data || data.length === 0) return [];
+  const n = Math.min(data.length, maxTicks);
+  const step = Math.floor(data.length / n) || 1;
+  return data.filter((_, i) => i % step === 0).map((r) => r.date);
+}

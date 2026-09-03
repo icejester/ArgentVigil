@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
@@ -174,15 +174,18 @@ export default function StackTracker() {
   const [mode, setMode] = useState("series"); // "date" | "series" | "flat"
   const [view, setView] = useState("list"); // "list" | "detail" | "add"
   const [metalFilter, setMetalFilter] = useState("all"); // "all" | "silver" | "gold"
-  // Lifted out of StackCharts so DcaStrip can also react to a pie-legend
-  // click, per the user's request that clicking a series filters every
-  // panel below the list, not just the two charts.
-  const [clickedSeries, setClickedSeries] = useState(null);
+  // The ONE legend for the Charts pane (sits under the pie) — a
+  // multi-select set of series names currently shown. Every chart on the
+  // pane (pie, oz-growth, cost-basis) and the DCA strip all render only
+  // the selected series. `null` means "not initialized yet / show all";
+  // once the series list loads it's seeded to the full set (everything
+  // on). Per the user's request: one legend, both charts react, each
+  // series individually togglable, charts rebuild dynamically.
+  const [selectedSeries, setSelectedSeries] = useState(null);
   const [items, setItems] = useState([]);
   const [summary, setSummary] = useState(null);
   const [seriesGroups, setSeriesGroups] = useState([]);
   const [dateGroups, setDateGroups] = useState([]);
-  const [timeseries, setTimeseries] = useState([]);
   const [listError, setListError] = useState(null);
   const [activeItemId, setActiveItemId] = useState(null);
   const [activeGroupIds, setActiveGroupIds] = useState(null); // item ids of the drilled-into group, or null
@@ -192,8 +195,27 @@ export default function StackTracker() {
     getJSON("/api/stack/summary/db").then(setSummary).catch(() => {});
     getJSON("/api/stack/series-summary/db").then(setSeriesGroups).catch(() => {});
     getJSON("/api/stack/date-summary/db").then(setDateGroups).catch(() => {});
-    getJSON("/api/stack/timeseries/db").then(setTimeseries).catch(() => {});
   }, []);
+
+  // Seed selectedSeries to "all series on" the first time the series list
+  // arrives; on a later list change, keep the user's current toggles for
+  // series that still exist and default any genuinely-new series to
+  // visible. Empty selection is coerced back to "all" (an empty Charts
+  // pane is never a useful state).
+  const allSeriesNames = useMemo(
+    () => seriesGroups.filter((g) => g.total_weight_oz).map((g) => g.label),
+    [seriesGroups]
+  );
+  useEffect(() => {
+    if (allSeriesNames.length === 0) return;
+    setSelectedSeries((prev) => {
+      if (prev === null) return new Set(allSeriesNames);
+      const known = new Set(allSeriesNames);
+      const wasHidden = new Set([...known].filter((s) => !prev.has(s)));
+      const next = new Set(allSeriesNames.filter((s) => !wasHidden.has(s)));
+      return next.size === 0 ? new Set(allSeriesNames) : next;
+    });
+  }, [allSeriesNames]);
 
   useEffect(() => {
     if (view === "list") refresh();
@@ -305,13 +327,32 @@ export default function StackTracker() {
                 </div>
               )}
 
-              <DcaStrip summary={summary} items={items} clickedSeries={clickedSeries} />
+              <DcaStrip
+                summary={summary}
+                items={filteredItems}
+                metalFilter={metalFilter}
+                selectedSeries={selectedSeries}
+                allSeriesNames={allSeriesNames}
+              />
               <StackCharts
                 seriesGroups={seriesGroups}
-                timeseries={timeseries}
-                items={items}
-                clickedSeries={clickedSeries}
-                setClickedSeries={setClickedSeries}
+                items={filteredItems}
+                metalFilter={metalFilter}
+                selectedSeries={selectedSeries}
+                allSeriesNames={allSeriesNames}
+                onToggleSeries={(name) =>
+                  setSelectedSeries((prev) => {
+                    const base = prev ?? new Set(allSeriesNames);
+                    const next = new Set(base);
+                    if (next.has(name)) next.delete(name);
+                    else next.add(name);
+                    // Never let the pane go fully empty — toggling off the
+                    // last one snaps back to all-on.
+                    return next.size === 0 ? new Set(allSeriesNames) : next;
+                  })
+                }
+                onSelectOnly={(name) => setSelectedSeries(new Set([name]))}
+                onSelectAll={() => setSelectedSeries(new Set(allSeriesNames))}
               />
             </div>
           )}
@@ -373,13 +414,13 @@ function DcaLine({ label, dca, spot }) {
   if (dca === null || dca === undefined) return null;
   const color = spot === null || spot === undefined ? "#8a94a6" : dca > spot ? "#4caf76" : "#e05252";
   return (
-    <span style={{ fontSize: 22, fontWeight: 700, whiteSpace: "nowrap" }}>
-      <span style={{ color: "#5a6278", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+    <span style={{ fontSize: 15, fontWeight: 700, whiteSpace: "nowrap" }}>
+      <span style={{ color: "#5a6278", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>
         {label} DCA{" "}
       </span>
       <span style={{ color }}>{fmtUsd(dca)}/oz</span>
       {spot !== null && spot !== undefined && (
-        <span className="comex-panel-note" style={{ fontSize: 13, fontWeight: 400 }}> (spot {fmtUsd(spot)}/oz)</span>
+        <span className="comex-panel-note" style={{ fontSize: 11, fontWeight: 400 }}> (spot {fmtUsd(spot)}/oz)</span>
       )}
     </span>
   );
@@ -405,28 +446,45 @@ function dcaForMetal(items, metal) {
   return anySpend && oz ? spend / oz : null;
 }
 
-function DcaStrip({ summary, items, clickedSeries }) {
+function DcaStrip({ summary, items, metalFilter, selectedSeries, allSeriesNames }) {
   if (!summary) return null;
 
+  // `items` is already metal-filtered by the parent. All series selected
+  // AND All metals = the whole-portfolio case, use the backend's own
+  // summary figures. Any narrower scope (some series hidden, or a metal
+  // filter) recomputes DCA over just the visible items (client-side twin
+  // of the backend's spend÷oz).
+  const sel = selectedSeries ?? new Set(allSeriesNames);
+  const isAll = sel.size >= allSeriesNames.length && metalFilter === "all";
   let silverDca = summary.silver_dca;
   let goldDca = summary.gold_dca;
-  if (clickedSeries) {
-    const seriesItems = items.filter((i) => (i.series || i.description) === clickedSeries);
-    silverDca = dcaForMetal(seriesItems, "silver");
-    goldDca = dcaForMetal(seriesItems, "gold");
+  let scopeLabel = "";
+  if (!isAll) {
+    const scopedItems = items.filter((i) => sel.has(i.series || i.description));
+    silverDca = dcaForMetal(scopedItems, "silver");
+    goldDca = dcaForMetal(scopedItems, "gold");
+    const parts = [];
+    if (metalFilter !== "all") parts.push(metalFilter);
+    if (sel.size < allSeriesNames.length)
+      parts.push(sel.size === 1 ? [...sel][0] : `${sel.size} series`);
+    scopeLabel = parts.length ? ` (${parts.join(", ")})` : "";
   }
   if (silverDca === null && goldDca === null) return null;
 
+  // No wrap: the two boxes are small enough to always sit on one line
+  // (silver left, gold right), so they stay anchored instead of
+  // reflowing/restacking as the chart pane below animates or as the DCA
+  // figures/scope label change width.
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", gap: 16 }}>
+    <div style={{ display: "flex", flexWrap: "nowrap", justifyContent: "space-between", gap: 12, overflowX: "auto" }}>
       {silverDca !== null && (
-        <div className="comex-panel" style={{ padding: "16px 20px" }}>
-          <DcaLine label={clickedSeries ? `Silver (${clickedSeries})` : "Silver"} dca={silverDca} spot={summary.spot_silver} />
+        <div className="comex-panel" style={{ padding: "8px 12px", flex: "0 0 auto" }}>
+          <DcaLine label={`Silver${scopeLabel}`} dca={silverDca} spot={summary.spot_silver} />
         </div>
       )}
       {goldDca !== null && (
-        <div className="comex-panel" style={{ padding: "16px 20px", marginLeft: silverDca === null ? "auto" : undefined }}>
-          <DcaLine label={clickedSeries ? `Gold (${clickedSeries})` : "Gold"} dca={goldDca} spot={summary.spot_gold} />
+        <div className="comex-panel" style={{ padding: "8px 12px", flex: "0 0 auto", marginLeft: silverDca === null ? "auto" : undefined }}>
+          <DcaLine label={`Gold${scopeLabel}`} dca={goldDca} spot={summary.spot_gold} />
         </div>
       )}
     </div>
@@ -442,10 +500,9 @@ function pieSliceLabel({ percent }) {
   return percent >= 0.04 ? `${(percent * 100).toFixed(0)}%` : "";
 }
 
-function SeriesPieTooltip({ active, payload, clickedSeries }) {
+function SeriesPieTooltip({ active, payload }) {
   if (!active || !payload?.length) return null;
   const d = payload[0].payload;
-  if (clickedSeries && d.name !== clickedSeries) return null;
   return (
     <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "6px 10px" }}>
       <div style={{ color: "#c8d0de", fontWeight: 600 }}>{d.name}</div>
@@ -506,53 +563,6 @@ function seriesCompositionAsOf(items, asOfDate) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// Client-side twin of backend/stack.py's stack.timeseries(), scoped to an
-// arbitrary item subset (e.g. one series' items after a pie-legend click)
-// rather than the whole portfolio — mirrors that function's shape
-// (day_spend/cumulative_spend/cumulative_*_oz/cumulative_melt_value) so
-// the oz-growth and gap charts can render identically whether they're
-// fed the portfolio-wide /timeseries/db response or a filtered subset.
-// Reuses each item's own melt_value/total_weight_oz (already computed
-// server-side at today's live spot by list_items_with_valuation) rather
-// than re-deriving from spot prices, which the frontend doesn't have
-// direct access to outside of what /items/db already returned.
-function timeseriesFromItems(items) {
-  const dated = items.filter((i) => i.purchase_date);
-  const byDate = new Map();
-  for (const item of dated) {
-    if (!byDate.has(item.purchase_date)) byDate.set(item.purchase_date, []);
-    byDate.get(item.purchase_date).push(item);
-  }
-  let cumulativeSpend = 0;
-  let cumulativeSilverOz = 0;
-  let cumulativeGoldOz = 0;
-  let cumulativeMeltValue = 0;
-  let anyMeltValue = false;
-  const rows = [];
-  for (const date of [...byDate.keys()].sort()) {
-    const dayItems = byDate.get(date);
-    const daySpend = dayItems.reduce((sum, i) => sum + (i.purchase_price || 0), 0);
-    cumulativeSpend += daySpend;
-    for (const item of dayItems) {
-      if (item.metal === "silver") cumulativeSilverOz += item.total_weight_oz || 0;
-      else if (item.metal === "gold") cumulativeGoldOz += item.total_weight_oz || 0;
-      if (item.melt_value !== null && item.melt_value !== undefined) {
-        cumulativeMeltValue += item.melt_value;
-        anyMeltValue = true;
-      }
-    }
-    rows.push({
-      date,
-      day_spend: daySpend,
-      cumulative_spend: cumulativeSpend,
-      cumulative_silver_oz: cumulativeSilverOz,
-      cumulative_gold_oz: cumulativeGoldOz,
-      cumulative_melt_value: anyMeltValue ? cumulativeMeltValue : null,
-    });
-  }
-  return rows;
-}
-
 // Cumulative oz over time, stacked by series — a client-side computation
 // (no backend route; items already carry series/total_weight_oz/
 // purchase_date in full) since this is a genuinely different shape from
@@ -593,56 +603,122 @@ function ozGrowthBySeries(items) {
   return { rows, seriesKeys };
 }
 
-function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClickedSeries }) {
-  const [pinnedDate, setPinnedDate] = useState(null);
-  const [hiddenOzSeries, setHiddenOzSeries] = useState(() => new Set());
+// Date-range presets for the Charts pane's two time-series charts
+// (oz-growth, cost-basis) — same shape/format as the CoT panel's
+// PAPER_GAMES_WINDOWS. `days: null` = All. `custom` reveals From/To
+// inputs. Default 1Y.
+const STACK_CHART_WINDOWS = [
+  { label: "1M", days: 30 },
+  { label: "3M", days: 90 },
+  { label: "1Y", days: 365 },
+  { label: "5Y", days: 365 * 5 },
+  { label: "10Y", days: 365 * 10 },
+  { label: "All", days: null },
+];
+const STACK_CHART_DEFAULT_DAYS = 365;
 
+function StackCharts({
+  seriesGroups,
+  items,
+  metalFilter,
+  selectedSeries,
+  allSeriesNames,
+  onToggleSeries,
+  onSelectOnly,
+  onSelectAll,
+}) {
+  const [pinnedDate, setPinnedDate] = useState(null);
+  // Date-range window for the two time-series charts (oz-growth,
+  // cost-basis). `days` is a preset from STACK_CHART_WINDOWS, or the
+  // string "custom". Client-side filter only — no refetch; the pie is a
+  // composition snapshot and ignores this entirely.
+  const [windowDays, setWindowDays] = useState(STACK_CHART_DEFAULT_DAYS);
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const customRangeIncomplete =
+    windowDays === "custom" && (!customStart || !customEnd || customStart > customEnd);
+  const cutoffStr =
+    windowDays === "custom"
+      ? customRangeIncomplete
+        ? null
+        : customStart
+      : windowDays == null
+        ? null
+        : new Date(Date.now() - windowDays * 86400000).toISOString().slice(0, 10);
+  const untilStr = windowDays === "custom" && !customRangeIncomplete ? customEnd : null;
+  const inWindow = (dateStr) =>
+    (cutoffStr == null || dateStr >= cutoffStr) && (untilStr == null || dateStr <= untilStr);
+
+  // One legend, one selection set (from the parent) — every chart on this
+  // pane renders only the selected series and rebuilds when the set
+  // changes. Fall back to "all" if not seeded yet.
+  const sel = selectedSeries ?? new Set(allSeriesNames);
+  const isAll = allSeriesNames.length > 0 && sel.size >= allSeriesNames.length;
+
+  // Stable color per series, keyed off the full series list so a series
+  // keeps its color regardless of which subset is currently shown.
+  const colorByName = new Map(allSeriesNames.map((n, i) => [n, VAULT_COLORS[i % VAULT_COLORS.length]]));
+
+  // `items` is already metal-filtered by the parent (the All/Silver/Gold
+  // dropdown). Which series actually have items under the current metal
+  // filter — used to dim dead legend rows and to scope the cost-basis
+  // fetch. A series a metal filter empties is still shown in the legend
+  // (so toggling it stays meaningful) but greyed.
+  const seriesPresentUnderFilter = new Set(items.map((i) => i.series || i.description));
+  const selectedItems = items.filter((i) => sel.has(i.series || i.description));
+  // The series actually contributing data right now — selected AND present
+  // under the metal filter. This is what the cost-basis fetch asks for.
+  const activeSeries = [...sel].filter((s) => seriesPresentUnderFilter.has(s)).sort();
+  const selKey = activeSeries.join("|"); // stable dep for the fetch effect
+  const fetchesWholeStack = metalFilter === "all" && isAll;
+
+  // --- Cost-basis chart: REAL weekly history for the active series ---
+  // /api/stack/value-history/db takes repeatable ?series= and a ?metal=
+  // filter. Omit both (whole stack) only when All metals + all series are
+  // selected. Re-fetches whenever the selection, metal filter, or series
+  // list changes.
+  const [valueHistory, setValueHistory] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    setValueHistory(null);
+    const params = [];
+    if (!fetchesWholeStack) {
+      for (const s of activeSeries) params.push(`series=${encodeURIComponent(s)}`);
+      if (metalFilter !== "all") params.push(`metal=${metalFilter}`);
+    }
+    // Nothing active under the current filters — show empty, skip the fetch.
+    if (!fetchesWholeStack && activeSeries.length === 0) {
+      setValueHistory([]);
+      return;
+    }
+    const qs = params.length ? `?${params.join("&")}` : "";
+    fetch(`/api/stack/value-history/db${qs}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((j) => {
+        if (!cancelled) setValueHistory(j.data ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setValueHistory([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selKey, metalFilter, fetchesWholeStack, allSeriesNames.length]);
+
+  // --- Pie: selected series only, snapped to a pinned date if set ---
   const livePieData = seriesGroups
-    .filter((g) => g.total_weight_oz)
+    .filter((g) => g.total_weight_oz && sel.has(g.label))
     .map((g) => ({ name: g.label, value: g.total_weight_oz }));
-  const pieSource = pinnedDate ? seriesCompositionAsOf(items, pinnedDate) : livePieData;
-  // Color assignment keys off the LIVE series list, not the pinned
-  // subset, so a given series keeps the same color whether or not it's
-  // pinned — a pinned date with fewer series present shouldn't cause the
-  // remaining slices to repaint into different colors than their live view.
-  const colorByName = new Map(livePieData.map((g, i) => [g.name, VAULT_COLORS[i % VAULT_COLORS.length]]));
+  const pieSource = pinnedDate
+    ? seriesCompositionAsOf(selectedItems, pinnedDate)
+    : livePieData;
   const pieData = pieSource.map((g) => ({ ...g, color: colorByName.get(g.name) || "#94a3b8" }));
 
-  // Selecting a series in the pie's legend re-scopes the two charts below
-  // to that series' own items — per the user's explicit "I'd see the
-  // graphs below change as if they were focused only on the rows with
-  // series American Eagle" request.
-  const activeTimeseries = clickedSeries
-    ? timeseriesFromItems(items.filter((i) => (i.series || i.description) === clickedSeries))
-    : timeseries;
-  const activeItems = clickedSeries
-    ? items.filter((i) => (i.series || i.description) === clickedSeries)
-    : items;
-
-  // Own stacked-by-series growth chart — separate from the pie's
-  // clickedSeries "solo one series" filter above. hiddenOzSeries is a
-  // checkbox-style multi-select (toggle any number of bands off/on),
-  // deliberately a different interaction than the pie legend's
-  // single-select highlight, per the user's explicit call.
-  const { rows: ozGrowthData, seriesKeys: ozSeriesKeys } = ozGrowthBySeries(activeItems);
-  const visibleOzSeriesKeys = ozSeriesKeys.filter((k) => !hiddenOzSeries.has(k));
-  const ozColorByKey = new Map(ozSeriesKeys.map((k, i) => [k, VAULT_COLORS[i % VAULT_COLORS.length]]));
-  // "Timeline should be min/max acquisition date": a category axis's
-  // domain is inherently the exact set of x-values present in its data
-  // (Recharts has no separate "domain" concept to override for
-  // type="category" the way a numeric/time axis does), and ozGrowthData
-  // is already sorted ascending by real purchase_date with no synthetic
-  // padding rows — so the axis already spans exactly [earliest purchase,
-  // latest purchase] by construction, with nothing further to set.
-
-  function toggleOzSeries(key) {
-    setHiddenOzSeries((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }
+  // --- Oz-growth chart: selected series' bands, windowed ---
+  const { rows: ozGrowthAll, seriesKeys: ozSeriesKeys } = ozGrowthBySeries(selectedItems);
+  const ozGrowthData = ozGrowthAll.filter((r) => inWindow(r.date));
+  const ozColorByKey = new Map(ozSeriesKeys.map((k) => [k, colorByName.get(k) || "#94a3b8"]));
 
   function handleOzChartClick(state) {
     const label = state?.activeLabel;
@@ -650,10 +726,16 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
     setPinnedDate((prev) => (prev === label ? null : label));
   }
 
-  const gapData = activeTimeseries.map((r) => ({
-    date: r.date,
-    gap: r.cumulative_melt_value === null ? null : r.cumulative_melt_value - r.cumulative_spend,
-  }));
+  // Cost-basis chart: REAL weekly melt-value-minus-cost-basis for the
+  // selected series (from /api/stack/value-history/db — real historical
+  // daily closes back to 2006, not today's spot applied backward). Works
+  // for the whole stack (nothing filtered) and any selected subset alike;
+  // the route just takes a repeatable ?series= param.
+  const gapData = Array.isArray(valueHistory)
+    ? valueHistory.filter((r) => inWindow(r.date)).map((r) => ({ date: r.date, gap: r.gain }))
+    : [];
+  const gapLoading = valueHistory === null;
+
   const gapValues = gapData.map((r) => r.gap).filter((v) => v !== null);
   const gapMax = gapValues.length ? Math.max(...gapValues) : 0;
   const gapMin = gapValues.length ? Math.min(...gapValues) : 0;
@@ -667,6 +749,56 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
     <details className="collapsible-pane" open>
       <summary className="collapsible-pane-title">Charts</summary>
       <div className="collapsible-pane-body" style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
+        {/* Date-range window for the two time-series charts below — same
+            1M/3M/1Y/5Y/10Y/All/Custom format as the CoT/Money Supply
+            panels. Client-side filter only; the pie ignores it. */}
+        <div style={{ flex: "1 1 100%" }}>
+          <div className="comex-range-selector">
+            {STACK_CHART_WINDOWS.map((w) => (
+              <button
+                key={w.label}
+                type="button"
+                className={`comex-range-btn${windowDays === w.days ? " comex-range-btn--active" : ""}`}
+                onClick={() => setWindowDays(w.days)}
+              >
+                {w.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              className={`comex-range-btn${windowDays === "custom" ? " comex-range-btn--active" : ""}`}
+              onClick={() => setWindowDays("custom")}
+            >
+              Custom
+            </button>
+          </div>
+          {windowDays === "custom" && (
+            <div className="comex-range-selector" style={{ marginTop: 8 }}>
+              <label className="form-inline-label">
+                From
+                <input
+                  type="date"
+                  value={customStart}
+                  onChange={(e) => setCustomStart(e.target.value)}
+                  max={customEnd || undefined}
+                />
+              </label>
+              <label className="form-inline-label">
+                To
+                <input
+                  type="date"
+                  value={customEnd}
+                  onChange={(e) => setCustomEnd(e.target.value)}
+                  min={customStart || undefined}
+                />
+              </label>
+              {customStart && customEnd && customStart > customEnd && (
+                <span style={{ fontSize: 11, color: "#e05252" }}>Start must be before end.</span>
+              )}
+            </div>
+          )}
+        </div>
+
         <div style={{ flex: "1 1 320px", minWidth: 280 }}>
           {pinnedDate && (
             <div className="comex-panel-note" style={{ textAlign: "center" }}>
@@ -677,7 +809,9 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
             </div>
           )}
           {pieData.length === 0 ? (
-            <div className="comex-empty">No weighed items yet.</div>
+            <div className="comex-empty">
+              {allSeriesNames.length === 0 ? "No weighed items yet." : "No series selected — pick one below."}
+            </div>
           ) : (
             <ResponsiveContainer width="100%" height={280}>
               <PieChart>
@@ -696,40 +830,71 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
                   labelLine={false}
                 >
                   {pieData.map((entry) => (
-                    <Cell
-                      key={entry.name}
-                      fill={entry.color}
-                      fillOpacity={clickedSeries && clickedSeries !== entry.name ? 0.35 : 1}
-                      stroke={clickedSeries === entry.name ? "#e8ecf4" : "#141820"}
-                      strokeWidth={clickedSeries === entry.name ? 3 : 2}
-                    />
+                    <Cell key={entry.name} fill={entry.color} stroke="#141820" strokeWidth={2} />
                   ))}
                 </Pie>
-                <Tooltip content={<SeriesPieTooltip clickedSeries={clickedSeries} />} />
+                <Tooltip content={<SeriesPieTooltip />} />
               </PieChart>
             </ResponsiveContainer>
           )}
-          {pieData.length > 0 && (
-            <div className="comex-legend-list comex-legend-list--horizontal">
-              {pieData.map((entry) => (
-                <button
-                  key={entry.name}
-                  type="button"
-                  className={`comex-legend-item legend-btn-row${clickedSeries === entry.name ? " legend-btn-row--baseline" : ""}`}
-                  style={{ "--legend-color": entry.color }}
-                  onClick={() => setClickedSeries((prev) => (prev === entry.name ? null : entry.name))}
-                >
-                  <span className="comex-legend-swatch" style={{ background: entry.color }} />
-                  <span>{entry.name}</span>
-                </button>
-              ))}
-            </div>
+          {/* THE legend for the whole Charts pane — a multi-select set.
+              Every chart on this pane (pie, oz-growth, cost-basis) plus the
+              DCA strip render only the selected series and rebuild when the
+              set changes. Toggle a row to show/hide that series; "Only"
+              solos it; "All" restores everything. */}
+          {allSeriesNames.length > 0 && (
+            <>
+              <div className="comex-legend-list comex-legend-list--horizontal">
+                {allSeriesNames.map((name) => {
+                  const on = sel.has(name);
+                  // Series with no items under the current metal filter —
+                  // still shown so toggling stays possible, but greyed and
+                  // marked so it's clear why it contributes nothing.
+                  const absent = metalFilter !== "all" && !seriesPresentUnderFilter.has(name);
+                  return (
+                    <button
+                      key={name}
+                      type="button"
+                      className={`comex-legend-item legend-btn-row${on ? "" : " legend-btn--off"}`}
+                      style={{ "--legend-color": colorByName.get(name), opacity: absent ? 0.35 : undefined }}
+                      onClick={() => onToggleSeries(name)}
+                      onDoubleClick={() => onSelectOnly(name)}
+                      title={
+                        absent
+                          ? `No ${metalFilter} items in “${name}”`
+                          : on
+                            ? "Click to hide · double-click to show only this"
+                            : "Click to show"
+                      }
+                    >
+                      <span className="comex-legend-swatch" style={{ background: colorByName.get(name) }} />
+                      <span>{name}{absent ? ` (no ${metalFilter})` : ""}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="comex-panel-note" style={{ marginTop: 4 }}>
+                {metalFilter !== "all" && `${metalFilter[0].toUpperCase()}${metalFilter.slice(1)} only. `}
+                {isAll
+                  ? "All series shown — click a legend entry to hide it, double-click to show only that one."
+                  : `${sel.size} of ${allSeriesNames.length} series shown. `}
+                {!isAll && (
+                  <button type="button" style={{ fontSize: 11 }} onClick={onSelectAll}>
+                    Show all
+                  </button>
+                )}
+              </div>
+            </>
           )}
         </div>
 
         <div style={{ flex: "1 1 320px", minWidth: 280 }}>
           {ozGrowthData.length === 0 ? (
-            <div className="comex-empty">No dated purchases yet.</div>
+            <div className="comex-empty">
+              {ozGrowthAll.length === 0
+                ? "No dated purchases in the selected series."
+                : "No data in the selected date range — widen the window."}
+            </div>
           ) : (
             <ResponsiveContainer width="100%" height={280}>
               <AreaChart
@@ -743,7 +908,7 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
                 <YAxis stroke="#5a6278" fontSize={11} width={60} />
                 <Tooltip content={<OzGrowthTooltip />} />
                 {pinnedDate && <ReferenceLine x={pinnedDate} stroke="#8a94a6" strokeDasharray="3 3" />}
-                {visibleOzSeriesKeys.map((key) => (
+                {ozSeriesKeys.map((key) => (
                   <Area
                     key={key}
                     type="monotone"
@@ -760,30 +925,22 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
               </AreaChart>
             </ResponsiveContainer>
           )}
-          <div className="comex-legend-list comex-legend-list--horizontal">
-            {ozSeriesKeys.map((key) => (
-              <button
-                key={key}
-                type="button"
-                className={`comex-legend-item legend-btn-row${hiddenOzSeries.has(key) ? " legend-btn--off" : ""}`}
-                style={{ "--legend-color": ozColorByKey.get(key) }}
-                onClick={() => toggleOzSeries(key)}
-              >
-                <span className="comex-legend-swatch" style={{ background: ozColorByKey.get(key) }} />
-                <span>{key}</span>
-              </button>
-            ))}
-          </div>
           <div className="comex-panel-note">
-            Cumulative oz held as of each purchase date, stacked by series — click a legend entry to
-            show/hide that series' band. Click anywhere on the chart to pin that date — the pie chart
-            recomputes to show your series composition as it stood then, not the current total.
+            Cumulative oz held as of each purchase date, stacked by the selected series. Click anywhere on
+            the chart to pin that date — the pie recomputes to show your composition as it stood then, not
+            the current total.
           </div>
         </div>
 
         <div style={{ flex: "1 1 320px", minWidth: 280 }}>
-          {gapData.length === 0 ? (
-            <div className="comex-empty">No dated purchases yet.</div>
+          {gapLoading ? (
+            <div className="comex-empty">Loading value history…</div>
+          ) : gapData.length === 0 ? (
+            <div className="comex-empty">
+              {Array.isArray(valueHistory) && valueHistory.length > 0
+                ? "No data in the selected date range — widen the window."
+                : "No value history for the selected series — its purchases may have no date, or predate available price data."}
+            </div>
           ) : (
             <ResponsiveContainer width="100%" height={280}>
               <AreaChart data={gapData} margin={{ top: 8, right: 16, bottom: 4, left: 4 }}>
@@ -825,8 +982,11 @@ function StackCharts({ seriesGroups, timeseries, items, clickedSeries, setClicke
             </ResponsiveContainer>
           )}
           <div className="comex-panel-note">
-            Cumulative melt value (at today's live spot) minus cumulative spend, as of each purchase date —
-            above zero means the running total is worth more than was paid, below zero means less.
+            {isAll ? "Your whole stack" : sel.size === 1 ? `“${[...sel][0]}”` : `${sel.size} selected series`} —
+            melt value minus cost basis at <strong>weekly</strong> intervals from the first purchase to today,
+            each week valued at that week's <strong>real</strong> silver/gold daily close (Yahoo Finance, back
+            to 2006). Above zero = worth more than paid, below = less. Genuine week-by-week history, not
+            today's spot applied backward.
           </div>
         </div>
       </div>

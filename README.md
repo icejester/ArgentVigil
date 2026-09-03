@@ -1,4 +1,4 @@
-# ArgentVigil v2.17.3
+# ArgentVigil v2.19.3
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -68,8 +68,8 @@ CATCOR and Research then keep the *narrative* honest: did the catalyst everyone 
 
 - **Backend**: Python / FastAPI + uvicorn, stdlib `sqlite3` (no ORM), `httpx` for all outbound calls. Every upstream source is a `SourceDefinition` in `backend/sources.py` (cadence, rate limit, table ownership) dispatched by one scheduler loop; every fetch persists to SQLite, and the frontend reads only `/db`-suffixed routes — never upstream directly.
 - **Pipeline**: `pipeline/` — stdlib-only CoT fetch/compute (CFTC Socrata), runnable without the venv, persists through the same shared `backend/db.py`.
-- **Frontend**: React 19 + Vite 5 + Recharts. No state library, no router — one page, six tab-sections, all mounted once and toggled by visibility.
-- **Tests**: pytest + respx, ~54 tests in <0.5s, never touch the real DB or a live upstream. Includes convention guards that mechanically enforce the documented rules (Data-tab sync, persist-on-fetch, table ownership, this doc's version binding).
+- **Frontend**: React 19 + Vite 5 + Recharts. No state library, no router — one page, seven tab-sections plus a gear-icon Settings view, all mounted once and toggled by visibility. Two React contexts wrap the app: `HealthProvider` (one shared `/api/health/db` poll) and `PinnedDateProvider` (one date pin shared across Trading / Money Supply / Inventory).
+- **Tests**: pytest + respx, 241 tests in ~11s, never touch the real DB or a live upstream. Includes convention guards that mechanically enforce the documented rules (Settings/Data registry sync, persist-on-fetch, table ownership, nav-list ↔ backend allowlist sync, this doc's version binding).
 
 *(Carve-out: architecture diagram, table schematic, and relationship map to land here. Until then, `utils/gen_data_dictionary.py` generates `docs/data-dictionary.md` from the live DDL + source registry.)*
 
@@ -84,14 +84,14 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
   bash utils/vigil.sh start            # venv bootstrap + backend :8000 + frontend :5173
   bash utils/vigil.sh restart backend  # after backend Python edits
   bash utils/vigil.sh stop
-  bash utils/vigil.sh test             # full test suite, pytest args pass through
+  bash utils/vigil.sh test             # full test suite (241 tests, ~11s), pytest args pass through
   python3 pipeline/run.py              # CoT pipeline — run once before first frontend use
   ```
 
 - **Python**: always through `.venv` (`vigil.sh start` creates it) — `pipeline/` is the sole stdlib-only exception.
 - **API keys** (all optional at boot; a missing key leaves that source's table empty, nothing crashes): `FRED_API_KEY` (Money Supply, CATCOR actuals), `GAPI_API_KEY` (LBMA fix), `CENSUS_API_KEY` (trade flow), `ANTHROPIC_API_KEY` (Research, only if `AI_BACKEND=anthropic` — default is the local `forge` backend).
 - **Versioning**: this README and `CLAUDE.md` carry the same `vX.Y.Z` in their titles, bumped together on feature completion (not per commit); `tests/test_conventions.py` fails on drift.
-- **Pre-commit hook**: `utils/githooks/pre-commit` runs the full test suite (<0.5s) on every commit — including the version-binding guard. Per-clone, one-time setup: `git config core.hooksPath utils/githooks`. Bypass deliberately with `git commit --no-verify`.
+- **Pre-commit hook**: `utils/githooks/pre-commit` runs the full test suite (~11s) on every commit — including the version-binding guard. Per-clone, one-time setup: `git config core.hooksPath utils/githooks`. Bypass deliberately with `git commit --no-verify`.
 
 ### Data source detail
 
@@ -124,6 +124,8 @@ LME (London) requires a paid subscription and is not tracked. CME's per-contract
 ## NEXT UP
 
 Carved out for forward-looking goals, business- or tech-centric. Seeded from threads already flagged in `CLAUDE.md`'s TODO / known-gaps sections; add freely.
+
+- **MVP → release cleanup** (`specs/cleanup-spec.md`, in progress) — Settings page + global date pin (done), per-tab readability refactor pass (in progress), then containerization + a deploy doc. Splitting the data collectors into their own always-on process, independent of the API/UI, is a flagged sub-decision for the containerization stage.
 
 ### Business-centric
 

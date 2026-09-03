@@ -741,6 +741,132 @@ def test_timeseries_empty_portfolio(tmp_db, tmp_stack_db):
     assert stack.timeseries() == []
 
 
+# --- value_history: REAL historical weekly melt-vs-cost-basis -----------
+
+
+def test_value_history_uses_real_weekly_closes_not_todays_spot(tmp_db, tmp_stack_db):
+    """value_history() values each week at that week's REAL silver close
+    (settlement_price XAG_YAHOO_DAILY_CLOSE), not today's spot applied
+    backward the way timeseries() does — the whole point of the feature."""
+    # Real close series: $30/oz through mid-Jan, $40/oz after.
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 30.0, "session": "daily"},
+        {"date": "2026-01-19", "price": 40.0, "session": "daily"},
+    ])
+    # Today's spot is deliberately different again ($99) — must NOT be used.
+    db_module.append_spot_price_ticks(
+        [{"instrument": "XAG_SPOT", "ts": "2026-08-01T00:00:00Z", "price": 99.0, "change_pct_24h": None}]
+    )
+    stack.create_item(
+        _base_fields(series="Test Series", purchase_date="2026-01-05",
+                     unit_weight_oz=1.0, count=2, purchase_price=55.0)
+    )
+    rows = stack.value_history(series=["Test Series"])
+    assert rows, "expected weekly rows"
+    assert rows[0]["date"] == "2026-01-05"
+    # Week of purchase: 2 oz x real $30 close = $60 melt, spend $55 -> gain +5
+    assert rows[0]["melt_value"] == pytest.approx(60.0)
+    assert rows[0]["gain"] == pytest.approx(5.0)
+    # A later week (>= 2026-01-19) picks up the real $40 close -> $80 melt, +25
+    later = [r for r in rows if r["date"] >= "2026-01-19"]
+    assert later and later[0]["melt_value"] == pytest.approx(80.0)
+    assert later[0]["gain"] == pytest.approx(25.0)
+
+
+def test_value_history_series_filter_scopes_to_one_series(tmp_db, tmp_stack_db):
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 30.0, "session": "daily"},
+    ])
+    stack.create_item(_base_fields(series="Keep", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=1, purchase_price=25.0))
+    stack.create_item(_base_fields(series="Drop", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=5, purchase_price=200.0))
+    rows = stack.value_history(series=["Keep"])
+    # Only the 1-oz "Keep" item: melt = 1 x $30 = $30, not 6 oz.
+    assert rows[0]["melt_value"] == pytest.approx(30.0)
+
+
+def test_value_history_null_melt_when_no_real_close_yet(tmp_db, tmp_stack_db):
+    """A week before any real close exists for a metal actually held gets
+    melt_value/gain NULL — nulls over zeros, no today's-spot fallback."""
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-06-01", "price": 30.0, "session": "daily"},
+    ])
+    stack.create_item(_base_fields(series="Early", purchase_date="2026-01-01",
+                                   unit_weight_oz=1.0, count=1, purchase_price=25.0))
+    rows = stack.value_history(series=["Early"])
+    # First week (2026-01-01) predates the only real close (2026-06-01).
+    assert rows[0]["melt_value"] is None
+    assert rows[0]["gain"] is None
+    # A week on/after 2026-06-01 has a real value again.
+    assert any(r["melt_value"] is not None for r in rows)
+
+
+def test_value_history_empty_for_unknown_series(tmp_db, tmp_stack_db):
+    assert stack.value_history(series=["Nope"]) == []
+
+
+def test_value_history_accepts_multiple_series(tmp_db, tmp_stack_db):
+    """The multi-select legend passes a list — value_history sums oz/spend
+    across every selected series-key, same as the whole-stack case scoped
+    to a subset."""
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 30.0, "session": "daily"},
+    ])
+    stack.create_item(_base_fields(series="A", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=1, purchase_price=25.0))
+    stack.create_item(_base_fields(series="B", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=2, purchase_price=55.0))
+    stack.create_item(_base_fields(series="C", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=9, purchase_price=300.0))
+    rows = stack.value_history(series=["A", "B"])
+    # A (1 oz) + B (2 oz) = 3 oz x $30 = $90 melt, spend 25+55 = $80 -> +10.
+    # C is excluded.
+    assert rows[0]["melt_value"] == pytest.approx(90.0)
+    assert rows[0]["gain"] == pytest.approx(10.0)
+
+
+def test_value_history_none_or_empty_list_is_whole_stack(tmp_db, tmp_stack_db):
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 30.0, "session": "daily"},
+    ])
+    stack.create_item(_base_fields(series="A", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=1, purchase_price=25.0))
+    stack.create_item(_base_fields(series="B", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, count=1, purchase_price=25.0))
+    # Both None and [] mean "no filter" -> whole stack (2 oz x $30 = $60).
+    for arg in (None, []):
+        rows = stack.value_history(series=arg)
+        assert rows[0]["melt_value"] == pytest.approx(60.0)
+
+
+def test_value_history_metal_filter(tmp_db, tmp_stack_db):
+    """The tab's All/Silver/Gold dropdown reaches this via ?metal= — a
+    'silver' filter drops gold items from the oz/spend accumulation."""
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 30.0, "session": "daily"},
+    ])
+    db_module.upsert_settlement_price_rows("XAU_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 2000.0, "session": "daily"},
+    ])
+    stack.create_item(_base_fields(series="S", metal="silver", purchase_date="2026-01-05",
+                                   unit_weight_oz=1.0, gold_weight_oz=None, count=2, purchase_price=55.0))
+    stack.create_item(_base_fields(series="G", metal="gold", purchase_date="2026-01-05",
+                                   unit_weight_oz=0.1, silver_weight_oz=None, gold_weight_oz=None,
+                                   count=1, purchase_price=210.0))
+    # Silver only: 2 oz x $30 = $60 melt, $55 spend -> +5. Gold excluded.
+    s_rows = stack.value_history(metal="silver")
+    assert s_rows[0]["melt_value"] == pytest.approx(60.0)
+    assert s_rows[0]["gain"] == pytest.approx(5.0)
+    # Gold only: 0.1 oz x $2000 = $200 melt, $210 spend -> -10.
+    g_rows = stack.value_history(metal="gold")
+    assert g_rows[0]["melt_value"] == pytest.approx(200.0)
+    assert g_rows[0]["gain"] == pytest.approx(-10.0)
+    # An unrecognized metal value is ignored (no filter).
+    both = stack.value_history(metal="platinum")
+    assert both[0]["melt_value"] == pytest.approx(260.0)
+
+
 # --- Reference links ---------------------------------------------------
 
 
@@ -944,6 +1070,24 @@ async def test_route_timeseries(stack_client):
     assert len(data) == 1
     assert data[0]["date"] == "2026-01-30"
     assert data[0]["cumulative_spend"] == pytest.approx(30.0)
+
+
+@pytest.mark.asyncio
+async def test_route_value_history(stack_client):
+    db_module.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-01-05", "price": 30.0, "session": "daily"},
+    ])
+    await stack_client.post(
+        "/api/stack/items",
+        json=_base_fields(series="Route Series", purchase_date="2026-01-05",
+                          unit_weight_oz=1.0, count=1, purchase_price=25.0),
+    )
+    resp = await stack_client.get("/api/stack/value-history/db", params={"series": "Route Series"})
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data and data[0]["date"] == "2026-01-05"
+    assert data[0]["melt_value"] == pytest.approx(30.0)
+    assert data[0]["gain"] == pytest.approx(5.0)
 
 
 @pytest.mark.asyncio

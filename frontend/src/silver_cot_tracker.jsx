@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { nearestRowDate } from "./date_utils";
+import { nearestRowDate, xTicks } from "./date_utils";
 import {
   LineChart,
   Line,
@@ -22,6 +22,20 @@ import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
+
+// Fire a GET, unwrap { data }, hand it to a setter; any failure leaves the
+// setter at `fallback` (default []). MetalLeverageCurveVolumeChart's four
+// series fetches were four verbatim copies of this before it was pulled
+// out. NB: only for the routes that follow the plain { data } shape and
+// want a bare fallback on error — the panel-level /api/cot/db fetch keeps
+// its own bespoke error message, and SpotPriceBadge/MetalCurrentReadout
+// swallow errors silently with no state change, both deliberately.
+function fetchInto(url, setter, fallback = []) {
+  return fetch(url)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((j) => setter(j.data ?? fallback))
+    .catch(() => setter(fallback));
+}
 
 const CATEGORY_LABELS = {
   producer_merchant: "Producer/Merchant",
@@ -241,11 +255,20 @@ function CombinedChartTooltipContent({ active, label, chartData }) {
   );
 }
 
-function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silverLatest, silverWindows, goldLatest, goldWindows, pinnedDate, onPin }) {
-  const [clickedKey, setClickedKey] = useState(null);
+function percentile(vals, p) {
+  const sorted = [...vals].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length * p)];
+}
 
-  if (!silverSeries || silverSeries.length === 0) return null;
-
+// Everything CombinedChart plots, derived from the three raw series and
+// the active window — no React state involved, so it lives outside the
+// component: the merged {date, silver, gold, gsr} rows (GSR joined by
+// nearest-within-6-days, the "Tolerance join" convention since GSR closes
+// on a different weekday than CoT's Tuesday), the x-axis tick subset, both
+// axis domains, and the per-metal value arrays a percentile line needs.
+// The clicked-metal gating of which percentiles actually render stays in
+// the component, since that's interaction state.
+function buildCombinedChartData(silverSeries, goldSeries, gsrSeries, since, until) {
   const cutoff = since ?? COT_COVERAGE_START;
 
   const goldByDate = {};
@@ -253,12 +276,9 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
     for (const r of goldSeries) goldByDate[r.date] = r.net_long_pct_oi;
   }
 
-  // GSR bars are weekly but close on a different weekday than CoT (Tuesday).
-  // Build a sorted list of [date, gsr] pairs and find the nearest within 6 days.
   const gsrSorted = gsrSeries
     ? [...gsrSeries].sort((a, b) => a.date.localeCompare(b.date))
     : [];
-
   function nearestGsr(cotDate) {
     if (!gsrSorted.length) return null;
     const target = new Date(cotDate).getTime();
@@ -269,7 +289,6 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
       if (diff < bestDiff) { bestDiff = diff; best = gsr; }
       else break; // sorted, so once diff grows we're done
     }
-    // Accept only if within 6 days
     return bestDiff <= 6 * 86400000 ? best : null;
   }
 
@@ -285,32 +304,36 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
       gsr: nearestGsr(r.date),
     }));
 
-  const tickCount = Math.min(chartData.length, 10);
-  const step = tickCount > 0 ? Math.floor(chartData.length / tickCount) : 1;
-  const xTicks = chartData.filter((_, i) => i % step === 0).map((r) => r.date);
-
-  // Left axis domain: CoT net long % values
   const cotVals = chartData.flatMap((r) => [r.silver, r.gold].filter((v) => v !== null));
   const cotMin = cotVals.length ? Math.floor(Math.min(...cotVals) - 2) : -20;
   const cotMax = cotVals.length ? Math.ceil(Math.max(...cotVals) + 2) : 60;
 
-  // Right axis domain: GSR values
   const gsrVals = chartData.map((r) => r.gsr).filter((v) => v !== null);
   const gsrMin = gsrVals.length ? Math.floor(Math.min(...gsrVals) - 2) : 40;
   const gsrMax = gsrVals.length ? Math.ceil(Math.max(...gsrVals) + 2) : 130;
+
+  return {
+    chartData,
+    ticks: xTicks(chartData, 10),
+    cotMin, cotMax, gsrMin, gsrMax,
+    silverVals: chartData.map((r) => r.silver).filter((v) => v !== null),
+    goldVals: chartData.map((r) => r.gold).filter((v) => v !== null),
+  };
+}
+
+function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silverLatest, silverWindows, goldLatest, goldWindows, pinnedDate, onPin }) {
+  const [clickedKey, setClickedKey] = useState(null);
+
+  if (!silverSeries || silverSeries.length === 0) return null;
+
+  const { chartData, ticks, cotMin, cotMax, gsrMin, gsrMax, silverVals, goldVals } =
+    buildCombinedChartData(silverSeries, goldSeries, gsrSeries, since, until);
 
   // Percentile reference lines — only show for a metal when it's the one
   // currently highlighted (clicked), replacing the old "only the other
   // metal is hidden" condition now that lines never actually disappear.
   const silverAlone = clickedKey === "silver";
   const goldAlone = clickedKey === "gold";
-
-  function percentile(vals, p) {
-    const sorted = [...vals].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length * p)];
-  }
-  const silverVals = chartData.map((r) => r.silver).filter((v) => v !== null);
-  const goldVals = chartData.map((r) => r.gold).filter((v) => v !== null);
   const silverP10 = silverAlone ? percentile(silverVals, 0.1) : null;
   const silverP90 = silverAlone ? percentile(silverVals, 0.9) : null;
   const goldP10 = goldAlone ? percentile(goldVals, 0.1) : null;
@@ -364,7 +387,7 @@ function CombinedChart({ silverSeries, goldSeries, gsrSeries, since, until, silv
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
           <XAxis
             dataKey="date"
-            ticks={xTicks}
+            ticks={ticks}
             tickFormatter={(d) => new Date(d).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
             tick={{ fill: "#8a94a6", fontSize: 11 }}
           />
@@ -962,28 +985,16 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
   const legend = metalChartLegend(label);
 
   const fetchAll = useCallback(() => {
-    fetch(leverageHistoryUrl)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((j) => setLeverageRows(j.data ?? []))
-      .catch(() => setLeverageRows([]));
-    fetch(`/api/curve-spread/db?metal=${spotKey}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((j) => setCurveRows(j.data ?? []))
-      .catch(() => setCurveRows([]));
-    fetch(`/api/volume/db/history?metal=${spotKey}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((j) => setVolumeRows(j.data ?? []))
-      .catch(() => setVolumeRows([]));
+    fetchInto(leverageHistoryUrl, setLeverageRows);
+    fetchInto(`/api/curve-spread/db?metal=${spotKey}`, setCurveRows);
+    fetchInto(`/api/volume/db/history?metal=${spotKey}`, setVolumeRows);
     // Real daily high/low/close, NOT the 60s spot tick feed — that only
     // accumulates a few hours of real history at a time (fast tier just
     // started), which would leave most of this chart's window blank. This
     // reads settlement_price's real Yahoo daily bars instead (years of
     // real history already on file), per the header ticker/leverage-chart
     // scoping discussion.
-    fetch(`/api/metals/prices/db/daily-range?metal=${spotKey}&since=2015-01-01`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((j) => setPriceRangeRows(j.data ?? []))
-      .catch(() => setPriceRangeRows([]));
+    fetchInto(`/api/metals/prices/db/daily-range?metal=${spotKey}&since=2015-01-01`, setPriceRangeRows);
   }, [leverageHistoryUrl, spotKey]);
 
   useEffect(() => {
@@ -1254,6 +1265,12 @@ export default function SilverCoTTracker() {
   const effectiveSince = days === "custom" ? customSince : since;
   const effectiveUntil = days === "custom" ? customUntil : until;
   const customRangeIncomplete = days === "custom" && (!customStart || !customEnd || customStart > customEnd);
+  // The since/until every chart in the panel actually gets: the effective
+  // window, unless a half-filled Custom range means "don't filter yet."
+  // Computed once here rather than repeating the ternary at all four call
+  // sites below.
+  const chartSince = customRangeIncomplete ? null : effectiveSince;
+  const chartUntil = customRangeIncomplete ? null : effectiveUntil;
 
   return (
     <div className="app-shell">
@@ -1291,7 +1308,7 @@ export default function SilverCoTTracker() {
         </div>
         {days === "custom" && (
           <div className="comex-range-selector" style={{ marginBottom: 8 }}>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+            <label className="form-inline-label">
               From
               <input
                 type="date"
@@ -1300,7 +1317,7 @@ export default function SilverCoTTracker() {
                 max={customEnd || undefined}
               />
             </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+            <label className="form-inline-label">
               To
               <input
                 type="date"
@@ -1327,8 +1344,8 @@ export default function SilverCoTTracker() {
                 silverSeries={data.series}
                 goldSeries={data.gold?.series}
                 gsrSeries={data.gsr_series}
-                since={customRangeIncomplete ? null : effectiveSince}
-                until={customRangeIncomplete ? null : effectiveUntil}
+                since={chartSince}
+                until={chartUntil}
                 silverLatest={data.latest}
                 silverWindows={data.windows}
                 goldLatest={data.gold?.latest}
@@ -1349,8 +1366,8 @@ export default function SilverCoTTracker() {
             <div className="collapsible-pane-body">
               <MetalLeverageCurveVolumeChart
                 metal="silver"
-                since={customRangeIncomplete ? null : effectiveSince}
-                until={customRangeIncomplete ? null : effectiveUntil}
+                since={chartSince}
+                until={chartUntil}
                 pinnedDate={pinnedDate}
                 onPin={setPinnedDate}
               />
@@ -1367,8 +1384,8 @@ export default function SilverCoTTracker() {
             <div className="collapsible-pane-body">
               <MetalLeverageCurveVolumeChart
                 metal="gold"
-                since={customRangeIncomplete ? null : effectiveSince}
-                until={customRangeIncomplete ? null : effectiveUntil}
+                since={chartSince}
+                until={chartUntil}
                 pinnedDate={pinnedDate}
                 onPin={setPinnedDate}
               />
@@ -1382,8 +1399,8 @@ export default function SilverCoTTracker() {
             </summary>
             <div className="collapsible-pane-body">
               <CategoryCompositionPanel
-                since={customRangeIncomplete ? null : effectiveSince}
-                until={customRangeIncomplete ? null : effectiveUntil}
+                since={chartSince}
+                until={chartUntil}
                 pinnedDate={pinnedDate}
                 onPin={setPinnedDate}
               />

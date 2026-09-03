@@ -449,6 +449,119 @@ def timeseries() -> list[dict]:
     return rows
 
 
+def _series_key(item: dict) -> str:
+    """Same grouping key stack.series_summary uses — the series name, or
+    the description for un-seriesed items."""
+    return item.get("series") or item.get("description") or ""
+
+
+def value_history(series: list[str] | None = None, metal: str | None = None) -> list[dict]:
+    """Real weekly melt value vs. cost basis, from the earliest purchase
+    through today — unlike timeseries(), this uses REAL historical daily
+    closes (settlement_price's XAG/XAU_YAHOO_DAILY_CLOSE, back to 2006),
+    not today's spot applied backward. Powers the Stack tab's Cost-basis
+    chart ("plot value as of several dates since purchase", user request
+    2026-09).
+
+    One point per calendar week from the first relevant purchase date to
+    today. At each week: the oz held as of that week (items purchased
+    on-or-before it) x that week's real silver/gold close = real melt
+    value that week; cumulative spend as of that week is the cost-basis
+    line. `melt_value`/`gain` are NULL on any week a needed metal's close
+    is missing (nulls-over-zeros) — no forward-fill, no today's-spot
+    fallback.
+
+    `series` (optional) is a list of series-keys (series name, or
+    description for un-seriesed items) to scope to — the multi-select
+    legend on the Stack Charts pane passes whatever's currently toggled
+    on. Omitted or empty = every series.
+    `metal` (optional, "silver"|"gold") mirrors the tab's All/Silver/Gold
+    dropdown — restricts to items of that metal so the chart reacts to
+    that toggle too. Omitted = both.
+    """
+    from datetime import date as _date, timedelta
+
+    items = [i for i in list_items() if i.get("purchase_date")]
+    if series:
+        wanted = set(series)
+        items = [i for i in items if _series_key(i) in wanted]
+    if metal in ("silver", "gold"):
+        items = [i for i in items if i.get("metal") == metal]
+    if not items:
+        return []
+
+    # Real historical daily closes, as {date_str: price}.
+    silver_closes = {
+        r["date"]: r["price"]
+        for r in main_db.get_settlement_price_series("XAG_YAHOO_DAILY_CLOSE")
+        if r["price"] is not None
+    }
+    gold_closes = {
+        r["date"]: r["price"]
+        for r in main_db.get_settlement_price_series("XAU_YAHOO_DAILY_CLOSE")
+        if r["price"] is not None
+    }
+    silver_dates = sorted(silver_closes)
+    gold_dates = sorted(gold_closes)
+
+    def _close_asof(sorted_dates: list[str], closes: dict[str, float], target: str) -> float | None:
+        """Most recent real close on-or-before `target` — the "As-of
+        lookup" nearest-date variant. Returns None if `target` predates
+        all real data."""
+        import bisect
+        idx = bisect.bisect_right(sorted_dates, target)
+        if idx == 0:
+            return None
+        return closes[sorted_dates[idx - 1]]
+
+    # Purchases bucketed by date, plus a running oz/spend accumulator.
+    by_date: dict[str, list[dict]] = {}
+    for item in items:
+        by_date.setdefault(item["purchase_date"], []).append(item)
+
+    first_purchase = min(by_date)
+    today = _date.today()
+    start = _date.fromisoformat(first_purchase)
+    # Anchor the weekly grid on the first purchase date itself, then step
+    # 7 days at a time; always include today as the final point.
+    weeks: list[str] = []
+    cur = start
+    while cur < today:
+        weeks.append(cur.isoformat())
+        cur += timedelta(days=7)
+    if not weeks or weeks[-1] != today.isoformat():
+        weeks.append(today.isoformat())
+
+    sorted_purchase_dates = sorted(by_date)
+    rows: list[dict] = []
+    for week in weeks:
+        cum_silver_oz = 0.0
+        cum_gold_oz = 0.0
+        cum_spend = 0.0
+        for pdate in sorted_purchase_dates:
+            if pdate > week:
+                break
+            for it in by_date[pdate]:
+                s_oz, g_oz = _total_weight_oz(it)
+                cum_silver_oz += s_oz or 0
+                cum_gold_oz += g_oz or 0
+                if it.get("purchase_price") is not None:
+                    cum_spend += it["purchase_price"]
+
+        s_close = _close_asof(silver_dates, silver_closes, week) if cum_silver_oz else 0.0
+        g_close = _close_asof(gold_dates, gold_closes, week) if cum_gold_oz else 0.0
+        # NULL melt if a metal we actually hold has no real close as-of this week.
+        missing = (cum_silver_oz and s_close is None) or (cum_gold_oz and g_close is None)
+        melt = None if missing else cum_silver_oz * (s_close or 0) + cum_gold_oz * (g_close or 0)
+        rows.append({
+            "date": week,
+            "spend": round(cum_spend, 2),
+            "melt_value": None if melt is None else round(melt, 2),
+            "gain": None if melt is None else round(melt - cum_spend, 2),
+        })
+    return rows
+
+
 def portfolio_summary() -> dict:
     spot = _spot_prices()
     items = list_items()

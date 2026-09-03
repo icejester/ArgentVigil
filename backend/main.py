@@ -3929,6 +3929,20 @@ async def stack_timeseries_db():
     return {"success": True, "data": stack.timeseries()}
 
 
+@app.get("/api/stack/value-history/db")
+async def stack_value_history_db(
+    series: list[str] = Query(None),
+    metal: str = Query(None),
+):
+    """Real weekly melt-value-vs-cost-basis history (from real historical
+    daily closes, not today's spot applied backward) — the Stack tab's
+    Cost-basis chart. `series` is a repeatable query param
+    (?series=A&series=B) scoping to those series-keys; `metal`
+    ("silver"|"gold") mirrors the tab's metal dropdown. Both omitted = the
+    whole dated stack."""
+    return {"success": True, "data": stack.value_history(series=series, metal=metal)}
+
+
 @app.post("/api/stack/items")
 async def stack_items_create(body: dict = Body(...)):
     item_id = stack.create_item(body)

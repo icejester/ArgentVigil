@@ -737,6 +737,20 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .config-status-pill--set { background: #16351f; color: #4caf76; }
 .config-status-pill--unset { background: #341a1c; color: #e0555c; }
 .config-status-usedby { color: #5a6278; font-size: 11px; }
+
+/* Inline form label — a small caption sitting left of a control, used
+   across OFAC filters, CoT's custom-range From/To, and anywhere else a
+   short label precedes an <input>/<select> on one line. */
+.form-inline-label {
+  display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8a94a6;
+}
+
+/* OFAC panel — filter row controls */
+.ofac-filter-row { flex-wrap: wrap; gap: 8px; }
+.ofac-search-input {
+  background: #141820; border: 1px solid #2e3547; color: #e8ecf4;
+  padding: 4px 8px; font-size: 12px; min-width: 260px;
+}
 .comex-table td.data-reference-col,
 .comex-table th.data-reference-col { color: #5a6278; font-size: 11px; }
 

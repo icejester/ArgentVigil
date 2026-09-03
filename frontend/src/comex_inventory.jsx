@@ -20,7 +20,7 @@ import DeliveryBehaviorPanel from "./delivery_behavior_panel";
 import TradeFlowPanel from "./trade_flow_panel";
 import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
-import { nearestRowDate } from "./date_utils";
+import { nearestRowDate, xTicks } from "./date_utils";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
 
@@ -68,12 +68,6 @@ function filterBySFWindow(data, window_, customStart, customEnd) {
   return data.filter((r) => r.date >= cutoff);
 }
 
-function xTicks(data) {
-  if (!data || data.length === 0) return [];
-  const n = Math.min(data.length, 8);
-  const step = Math.floor(data.length / n);
-  return data.filter((_, i) => i % step === 0).map((r) => r.date);
-}
 
 // ── Panel 4: Paper leverage ratio ──────────────────────────────────────────
 // The volume-oi endpoint returns today's snapshot only (no historical series),

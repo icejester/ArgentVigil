@@ -200,6 +200,82 @@ function makeLinkedShape(color, hoveredEventId, baseRadius, diamond) {
   };
 }
 
+// Shared axis styling for both scatter charts (was repeated inline 4x).
+const AXIS_TICK = { fill: "#8a94a6", fontSize: 11 };
+const AXIS_LABEL_FILL = "#5a6278";
+
+// The two charts on this tab — Catalyst Timeline and Surprise vs. Reaction
+// — are the same shape: a ScatterChart of `${type}: point[]` groups, each
+// group rendered with makeLinkedShape so hovering a point in one chart
+// enlarges its twin in the other (shared hoveredEventId), and clicking a
+// point with a research_session_id hotlinks to Research. Only the axes,
+// tooltip, height, and empty-state copy differ, so those are props and
+// everything else lives here once.
+function LinkedScatterChart({
+  dataByType,
+  xAxis,
+  yLabel,
+  tooltip,
+  height,
+  loading,
+  hasReactions,
+  error,
+  emptyTitle,
+  emptyNote,
+  hoveredEventId,
+  setHoveredEventId,
+  onPointClick,
+}) {
+  if (loading && !hasReactions) return <div className="comex-empty">Loading…</div>;
+  if (error) {
+    return (
+      <div className="comex-empty">
+        No data available.
+        <div className="comex-empty-note">{error}</div>
+      </div>
+    );
+  }
+  const entries = Object.entries(dataByType);
+  if (entries.length === 0) {
+    return (
+      <div className="comex-empty">
+        {emptyTitle}
+        <div className="comex-empty-note">{emptyNote}</div>
+      </div>
+    );
+  }
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <ScatterChart margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+        {xAxis}
+        <YAxis
+          type="number"
+          dataKey="y"
+          width={70}
+          tickFormatter={(v) => `${v.toFixed(1)}%`}
+          tick={AXIS_TICK}
+          label={{ value: yLabel, angle: -90, position: "center", dx: -30, fill: AXIS_LABEL_FILL, fontSize: 11 }}
+        />
+        <ZAxis range={[60, 60]} />
+        <Tooltip content={tooltip} cursor={{ strokeDasharray: "3 3" }} />
+        {entries.map(([type, typePoints]) => (
+          <Scatter
+            key={type}
+            data={typePoints}
+            fill={CATCOR_EVENT_COLORS[type] ?? "#94a3b8"}
+            shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, type !== "observed")}
+            onMouseEnter={(p) => setHoveredEventId(p.event_id)}
+            onMouseLeave={() => setHoveredEventId(null)}
+            onClick={onPointClick}
+            style={{ cursor: typePoints.some((p) => p.research_session_id) ? "pointer" : "default" }}
+          />
+        ))}
+      </ScatterChart>
+    </ResponsiveContainer>
+  );
+}
+
 export default function CatcorPanel({ onOpenResearchSession }) {
   const [events, setEvents] = useState(null);
   const [reactions, setReactions] = useState(null);
@@ -341,113 +417,59 @@ export default function CatcorPanel({ onOpenResearchSession }) {
               </button>
             ))}
           </div>
-          {loading && !reactions ? (
-            <div className="comex-empty">Loading…</div>
-          ) : error ? (
-            <div className="comex-empty">
-              No data available.
-              <div className="comex-empty-note">{error}</div>
-            </div>
-          ) : timeline.length > 0 ? (
-            <ResponsiveContainer width="100%" height={180}>
-              <ScatterChart margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-                <XAxis
-                  type="number"
-                  dataKey="t"
-                  name="date"
-                  domain={[lookbackStart, lookaheadEnd]}
-                  tickFormatter={fmtMonthYear}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
-                  label={{ value: "Date", position: "insideBottom", offset: -4, fill: "#5a6278", fontSize: 11 }}
-                />
-                <YAxis
-                  type="number"
-                  dataKey="y"
-                  width={70}
-                  tickFormatter={(v) => `${v.toFixed(1)}%`}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
-                  label={{ value: `${metal} reaction (%)`, angle: -90, position: "center", dx: -30, fill: "#5a6278", fontSize: 11 }}
-                />
-                <ZAxis range={[60, 60]} />
-                <Tooltip content={<TimelineTooltip />} cursor={{ strokeDasharray: "3 3" }} />
-                {Object.entries(timelineByType).map(([type, typePoints]) => (
-                  <Scatter
-                    key={type}
-                    data={typePoints}
-                    fill={CATCOR_EVENT_COLORS[type] ?? "#94a3b8"}
-                    shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, type !== "observed")}
-                    onMouseEnter={(p) => setHoveredEventId(p.event_id)}
-                    onMouseLeave={() => setHoveredEventId(null)}
-                    onClick={handlePointClick}
-                    style={{ cursor: typePoints.some((p) => p.research_session_id) ? "pointer" : "default" }}
-                  />
-                ))}
-              </ScatterChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="comex-empty">
-              No catalysts captured in this range.
-              <div className="comex-empty-note">Try an earlier month, or hit Refresh.</div>
-            </div>
-          )}
+          <LinkedScatterChart
+            dataByType={timelineByType}
+            height={180}
+            yLabel={`${metal} reaction (%)`}
+            tooltip={<TimelineTooltip />}
+            xAxis={
+              <XAxis
+                type="number"
+                dataKey="t"
+                name="date"
+                domain={[lookbackStart, lookaheadEnd]}
+                tickFormatter={fmtMonthYear}
+                tick={AXIS_TICK}
+                label={{ value: "Date", position: "insideBottom", offset: -4, fill: AXIS_LABEL_FILL, fontSize: 11 }}
+              />
+            }
+            emptyTitle="No catalysts captured in this range."
+            emptyNote="Try an earlier month, or hit Refresh."
+            loading={loading}
+            hasReactions={!!reactions}
+            error={error}
+            hoveredEventId={hoveredEventId}
+            setHoveredEventId={setHoveredEventId}
+            onPointClick={handlePointClick}
+          />
 
           <div className="comex-section-label" style={{ marginTop: 20 }}>
             Surprise Magnitude vs. Price Reaction
           </div>
 
-          {loading && !reactions ? (
-            <div className="comex-empty">Loading…</div>
-          ) : error ? (
-            <div className="comex-empty">
-              No data available.
-              <div className="comex-empty-note">{error}</div>
-            </div>
-          ) : withSurprise.length > 0 ? (
-            <ResponsiveContainer width="100%" height={220}>
-              <ScatterChart margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-                <XAxis
-                  type="number"
-                  dataKey="x"
-                  name="surprise magnitude"
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
-                  label={{ value: "Surprise magnitude", position: "insideBottom", offset: -4, fill: "#5a6278", fontSize: 11 }}
-                />
-                <YAxis
-                  type="number"
-                  dataKey="y"
-                  name="price reaction"
-                  width={70}
-                  tickFormatter={(v) => `${v.toFixed(1)}%`}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
-                  label={{ value: `${metal} reaction (%)`, angle: -90, position: "center", dx: -30, fill: "#5a6278", fontSize: 11 }}
-                />
-                <ZAxis range={[60, 60]} />
-                <Tooltip content={<CatcorTooltip />} cursor={{ strokeDasharray: "3 3" }} />
-                {Object.entries(pointsByType).map(([type, typePoints]) => (
-                  <Scatter
-                    key={type}
-                    data={typePoints}
-                    fill={CATCOR_EVENT_COLORS[type] ?? "#94a3b8"}
-                    shape={makeLinkedShape(CATCOR_EVENT_COLORS[type] ?? "#94a3b8", hoveredEventId, 5, type !== "observed")}
-                    onMouseEnter={(p) => setHoveredEventId(p.event_id)}
-                    onMouseLeave={() => setHoveredEventId(null)}
-                    onClick={handlePointClick}
-                    style={{ cursor: typePoints.some((p) => p.research_session_id) ? "pointer" : "default" }}
-                  />
-                ))}
-              </ScatterChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="comex-empty">
-              No data available.
-              <div className="comex-empty-note">
-                Hit Refresh to seed the event calendar and fetch ALFRED actuals, or run
-                pipeline data collection for a while so price reactions can be captured.
-              </div>
-            </div>
-          )}
+          <LinkedScatterChart
+            dataByType={pointsByType}
+            height={220}
+            yLabel={`${metal} reaction (%)`}
+            tooltip={<CatcorTooltip />}
+            xAxis={
+              <XAxis
+                type="number"
+                dataKey="x"
+                name="surprise magnitude"
+                tick={AXIS_TICK}
+                label={{ value: "Surprise magnitude", position: "insideBottom", offset: -4, fill: AXIS_LABEL_FILL, fontSize: 11 }}
+              />
+            }
+            emptyTitle="No data available."
+            emptyNote="Hit Refresh to seed the event calendar and fetch ALFRED actuals, or run pipeline data collection for a while so price reactions can be captured."
+            loading={loading}
+            hasReactions={!!reactions}
+            error={error}
+            hoveredEventId={hoveredEventId}
+            setHoveredEventId={setHoveredEventId}
+            onPointClick={handlePointClick}
+          />
 
           {allWithSurprise.length > 0 && (
             <div className="comex-legend-list">

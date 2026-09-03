@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useReducer } from "react";
 import ChartStaleness from "./chart_staleness";
 
 // Client-side sort over an already-fetched array — same shape as
@@ -48,6 +48,44 @@ function SortTh({ label, sortKeyName, currentKey, currentDir, onSort, className 
 }
 
 const PAGE_SIZE = 50;
+
+// Filter/view state as one reducer instead of eight useState hooks. The
+// binding rule every one of them shared — "any filter/search/group/sort
+// change lands back on page 1" — lives here once (every action except
+// SET_PAGE resets page), replacing a resetToFirstPage() wrapper and six
+// inline `{ toggleSort(k); setPage(1); }` copies. Changing the group-by
+// field additionally clears the drilled-in group (a stale selection from
+// a different grouping dimension is meaningless).
+const INITIAL_VIEW = {
+  search: "",
+  entityType: "all",
+  listSource: "all",
+  program: "all",
+  showDelisted: false,
+  // Default view (user's explicit 2026-08-29 request): grouped by program,
+  // most-recently-changed group first (GroupTable's own useSort defaults to
+  // latest_date desc, so this + that together produce exactly that view).
+  groupBy: "program",
+  openGroup: null,
+  page: 1,
+};
+
+function viewReducer(state, action) {
+  switch (action.type) {
+    case "SET_PAGE":
+      return { ...state, page: action.page };
+    case "SET_GROUP_BY":
+      return { ...state, groupBy: action.value, openGroup: null, page: 1 };
+    case "OPEN_GROUP":
+      return { ...state, openGroup: action.group, page: 1 };
+    case "CLOSE_GROUP":
+      return { ...state, openGroup: null, page: 1 };
+    case "SET_FIELD":
+      return { ...state, [action.field]: action.value, page: 1 };
+    default:
+      return state;
+  }
+}
 
 // Group-by field options — deliberately parent-row fields only (Program,
 // Entity Type, List Source). Country (address-derived, one-to-many via
@@ -130,23 +168,13 @@ function GroupTable({ groups, onOpenGroup }) {
 export default function SanctionsPanel() {
   const [rows, setRows] = useState(null);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
-  const [entityTypeFilter, setEntityTypeFilter] = useState("all");
-  const [listSourceFilter, setListSourceFilter] = useState("all");
-  const [showDelisted, setShowDelisted] = useState(false);
-  const [page, setPage] = useState(1);
-  // Defaults to grouped-by-program, most-recently-changed-first — the
-  // user's explicit request for the tab's default view (2026-08-29):
-  // "I want the default display to be grouped by PROGRAM and sorted to
-  // most recently changed." GroupTable's own useSort defaults to
-  // latest_date desc, so this plus that default together produce exactly
-  // that view with no extra wiring.
-  const [groupBy, setGroupBy] = useState("program");
-  // Set once a group row is clicked (drill-in) — cleared to return to the
-  // grouped overview. Holds the clicked group directly ({value, count,
-  // ofac_uids}) rather than just a key, so the drill-in view's own header
-  // can show which value it's scoped to without re-deriving it.
-  const [openGroup, setOpenGroup] = useState(null);
+  const [view, dispatch] = useReducer(viewReducer, INITIAL_VIEW);
+  const { search, entityType, listSource, program, showDelisted, groupBy, openGroup, page } = view;
+
+  // Convenience wrappers so the JSX reads as `setField("search", value)`
+  // rather than a raw dispatch each time.
+  const setField = (field) => (value) => dispatch({ type: "SET_FIELD", field, value });
+  const setPage = (p) => dispatch({ type: "SET_PAGE", page: p });
 
   // Flat-table sort — used whenever groupBy is "none" (a user-chosen
   // override of the default grouped view) or inside a drill-in. Defaults
@@ -154,8 +182,14 @@ export default function SanctionsPanel() {
   // same reason GroupTable defaults to latest_date descending: chart_date
   // (the backend's own COALESCE(designation_date, first_seen_snapshot_date),
   // GET /api/ofac/db) is a real per-entity date for essentially every row,
-  // not a raw column that could occasionally be NULL.
+  // not a raw column that could occasionally be NULL. Kept as its own
+  // independent hook; every SortTh routes through handleFlatSort so a sort
+  // change also lands back on page 1, like every filter change does.
   const { sortKey, sortDir, toggleSort, sorted } = useSort("chart_date", "desc");
+  const handleFlatSort = (key) => {
+    toggleSort(key);
+    setPage(1);
+  };
 
   useEffect(() => {
     fetch("/api/ofac/db")
@@ -176,7 +210,6 @@ export default function SanctionsPanel() {
     }
     return Array.from(set).sort();
   }, [rows]);
-  const [programFilter, setProgramFilter] = useState("all");
 
   // Search now matches across every top-level text field, not just
   // entity_name — one box, one lowercased match against a joined string of
@@ -188,9 +221,9 @@ export default function SanctionsPanel() {
     const q = search.trim().toLowerCase();
     return rows.filter((r) => {
       if (!showDelisted && r.delisted_date) return false;
-      if (entityTypeFilter !== "all" && r.entity_type !== entityTypeFilter) return false;
-      if (listSourceFilter !== "all" && r.list_source !== listSourceFilter) return false;
-      if (programFilter !== "all" && !(r.program_tags || []).includes(programFilter)) return false;
+      if (entityType !== "all" && r.entity_type !== entityType) return false;
+      if (listSource !== "all" && r.list_source !== listSource) return false;
+      if (program !== "all" && !(r.program_tags || []).includes(program)) return false;
       if (q) {
         const haystack = [
           r.entity_name,
@@ -206,7 +239,7 @@ export default function SanctionsPanel() {
       }
       return true;
     });
-  }, [rows, search, entityTypeFilter, listSourceFilter, programFilter, showDelisted]);
+  }, [rows, search, entityType, listSource, program, showDelisted]);
 
   // Grouping operates on the filtered/searched set above, so it composes
   // with every other control rather than always reflecting the full
@@ -237,21 +270,6 @@ export default function SanctionsPanel() {
   const pageClamped = Math.min(page, totalPages);
   const pageRows = sortedRows.slice((pageClamped - 1) * PAGE_SIZE, pageClamped * PAGE_SIZE);
 
-  // Any filter/search/sort change should land back on page 1 — otherwise a
-  // narrower result set can leave the view stuck past its own last page.
-  function resetToFirstPage(setter) {
-    return (value) => {
-      setter(value);
-      setPage(1);
-    };
-  }
-
-  function handleGroupByChange(value) {
-    setGroupBy(value);
-    setOpenGroup(null);
-    setPage(1);
-  }
-
   const showingGroupedOverview = groupBy !== "none" && !openGroup;
   const showingDrillIn = groupBy !== "none" && !!openGroup;
   const groupFieldLabel = GROUP_BY_OPTIONS.find((o) => o.value === groupBy)?.label;
@@ -269,24 +287,17 @@ export default function SanctionsPanel() {
         <div className="comex-empty-note">Loading…</div>
       ) : (
         <>
-          <div className="comex-range-selector" style={{ flexWrap: "wrap", gap: 8 }}>
+          <div className="comex-range-selector ofac-filter-row">
             <input
               type="text"
+              className="ofac-search-input"
               placeholder="Search name, type, list, legal basis, programs…"
               value={search}
-              onChange={(e) => resetToFirstPage(setSearch)(e.target.value)}
-              style={{
-                background: "#141820",
-                border: "1px solid #2e3547",
-                color: "#e8ecf4",
-                padding: "4px 8px",
-                fontSize: 12,
-                minWidth: 260,
-              }}
+              onChange={(e) => setField("search")(e.target.value)}
             />
             <select
-              value={entityTypeFilter}
-              onChange={(e) => resetToFirstPage(setEntityTypeFilter)(e.target.value)}
+              value={entityType}
+              onChange={(e) => setField("entityType")(e.target.value)}
               className="comex-range-btn"
             >
               <option value="all">All types</option>
@@ -296,8 +307,8 @@ export default function SanctionsPanel() {
               <option value="aircraft">Aircraft</option>
             </select>
             <select
-              value={listSourceFilter}
-              onChange={(e) => resetToFirstPage(setListSourceFilter)(e.target.value)}
+              value={listSource}
+              onChange={(e) => setField("listSource")(e.target.value)}
               className="comex-range-btn"
             >
               <option value="all">All lists</option>
@@ -305,8 +316,8 @@ export default function SanctionsPanel() {
               <option value="Consolidated">Consolidated</option>
             </select>
             <select
-              value={programFilter}
-              onChange={(e) => resetToFirstPage(setProgramFilter)(e.target.value)}
+              value={program}
+              onChange={(e) => setField("program")(e.target.value)}
               className="comex-range-btn"
             >
               <option value="all">All programs</option>
@@ -316,17 +327,21 @@ export default function SanctionsPanel() {
                 </option>
               ))}
             </select>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+            <label className="form-inline-label">
               <input
                 type="checkbox"
                 checked={showDelisted}
-                onChange={(e) => resetToFirstPage(setShowDelisted)(e.target.checked)}
+                onChange={(e) => setField("showDelisted")(e.target.checked)}
               />
               Include delisted
             </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+            <label className="form-inline-label">
               Group by
-              <select value={groupBy} onChange={(e) => handleGroupByChange(e.target.value)} className="comex-range-btn">
+              <select
+                value={groupBy}
+                onChange={(e) => dispatch({ type: "SET_GROUP_BY", value: e.target.value })}
+                className="comex-range-btn"
+              >
                 {GROUP_BY_OPTIONS.map((o) => (
                   <option key={o.value} value={o.value}>
                     {o.label}
@@ -340,7 +355,11 @@ export default function SanctionsPanel() {
             {showingDrillIn ? (
               <>
                 {groupFieldLabel}: <strong>{openGroup.value}</strong> — {sortedRows.length.toLocaleString()} designations
-                <button className="comex-range-btn" style={{ marginLeft: 8 }} onClick={() => setOpenGroup(null)}>
+                <button
+                  className="comex-range-btn"
+                  style={{ marginLeft: 8 }}
+                  onClick={() => dispatch({ type: "CLOSE_GROUP" })}
+                >
                   ← Back to {groupFieldLabel} groups
                 </button>
               </>
@@ -352,21 +371,21 @@ export default function SanctionsPanel() {
           </div>
 
           {showingGroupedOverview ? (
-            <GroupTable groups={groups} onOpenGroup={setOpenGroup} />
+            <GroupTable groups={groups} onOpenGroup={(g) => dispatch({ type: "OPEN_GROUP", group: g })} />
           ) : (
             <>
               <div className="comex-table-wrap" style={{ marginTop: 8 }}>
                 <table className="comex-table comex-table--zebra">
                   <thead>
                     <tr>
-                      <SortTh label="Date" sortKeyName="chart_date" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
-                      <SortTh label="Entity" sortKeyName="entity_name" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
-                      <SortTh label="Type" sortKeyName="entity_type" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
-                      <SortTh label="Programs" sortKeyName="program_tags" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
-                      <SortTh label="Legal Basis" sortKeyName="legal_basis" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
-                      <SortTh label="List" sortKeyName="list_source" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
+                      <SortTh label="Date" sortKeyName="chart_date" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
+                      <SortTh label="Entity" sortKeyName="entity_name" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
+                      <SortTh label="Type" sortKeyName="entity_type" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
+                      <SortTh label="Programs" sortKeyName="program_tags" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
+                      <SortTh label="Legal Basis" sortKeyName="legal_basis" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
+                      <SortTh label="List" sortKeyName="list_source" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
                       {showDelisted && (
-                        <SortTh label="Delisted" sortKeyName="delisted_date" currentKey={sortKey} currentDir={sortDir} onSort={(k) => { toggleSort(k); setPage(1); }} />
+                        <SortTh label="Delisted" sortKeyName="delisted_date" currentKey={sortKey} currentDir={sortDir} onSort={handleFlatSort} />
                       )}
                     </tr>
                   </thead>
