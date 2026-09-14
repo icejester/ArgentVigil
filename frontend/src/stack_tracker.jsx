@@ -27,6 +27,24 @@ const METALS = ["silver", "gold"];
 // item editor, which covers every stack_items column.
 const METALS_FULL = ["silver", "gold", "bimetallic"];
 const FORMS = ["coin", "bar", "round", "other"];
+// Geometric glyphs, one per form. Used wherever an item/group needs a
+// compact form indicator (the flat list's per-row icon, a group row's
+// form-mix breakdown) — colored by metal (gold vs. silver/other) so the
+// same glyph set also discerns "gold bar" from "silver bar" at a glance,
+// per the user's explicit request.
+const FORM_ICONS = { coin: "●", bar: "▬", round: "○", other: "◆" };
+function formIcon(form) {
+  return FORM_ICONS[form] || "◆";
+}
+// Gold uses this app's existing established gold accent (silver_cot_
+// tracker.jsx's Gold Net Long line/label color) rather than inventing a
+// new hex value; silver/bimetallic/unknown fall back to this app's
+// standard muted-text gray (used throughout this file for secondary
+// text) since there's no pre-existing "silver" accent color to reuse.
+const METAL_ICON_COLOR = { gold: "#c9a227" };
+function metalIconColor(metal) {
+  return METAL_ICON_COLOR[metal] || "#8a94a6";
+}
 const SERIES = [
   "American Eagle",
   "Canadian Maple Leaf",
@@ -123,13 +141,21 @@ const SERIES_CUSTOM_SENTINEL = "__custom__";
 
 // Series is freehand text server-side (per the user's "this DB is mine"
 // call — a casino chip's series is just as valid as "Canadian Maple
-// Leaf"), but the SERIES list stays as one-click quick-picks for the
-// common cases. Shared across the Add/Edit/Bulk-update forms so all three
-// offer the same picker rather than drifting into three slightly
-// different inputs. `blankLabel` differs per call site ("No series" vs.
-// "Series — leave unchanged" for bulk update).
-function SeriesInput({ value, onChange, blankLabel }) {
-  const isCustom = value !== "" && !SERIES.includes(value);
+// Leaf"), and SERIES is only the seed list of common-case quick-picks.
+// `knownSeries` (any distinct series values already in use, sourced from
+// series-summary — see callers) is merged in so a custom series typed
+// once becomes a selectable quick-pick from then on, rather than only
+// ever being reachable by re-typing it. Shared across the Add/Edit/
+// Bulk-update forms so all three offer the same picker rather than
+// drifting into three slightly different inputs. `blankLabel` differs
+// per call site ("No series" vs. "Series — leave unchanged" for bulk
+// update).
+function SeriesInput({ value, onChange, blankLabel, knownSeries }) {
+  const options = useMemo(() => {
+    const merged = new Set([...SERIES, ...(knownSeries || []).filter(Boolean)]);
+    return [...merged].sort((a, b) => a.localeCompare(b));
+  }, [knownSeries]);
+  const isCustom = value !== "" && !options.includes(value);
   const [customMode, setCustomMode] = useState(isCustom);
 
   function handleSelectChange(e) {
@@ -146,7 +172,7 @@ function SeriesInput({ value, onChange, blankLabel }) {
     <>
       <select value={customMode ? SERIES_CUSTOM_SENTINEL : value} onChange={handleSelectChange}>
         <option value="">{blankLabel}</option>
-        {SERIES.map((s) => <option key={s} value={s}>{s}</option>)}
+        {options.map((s) => <option key={s} value={s}>{s}</option>)}
         <option value={SERIES_CUSTOM_SENTINEL}>Custom…</option>
       </select>
       {customMode && (
@@ -161,19 +187,109 @@ function SeriesInput({ value, onChange, blankLabel }) {
   );
 }
 
-// Grouped by date is the default per the user's request — "I only want to
-// see the aggregate when I first open the tab." Flat and Grouped by series
-// stay available as alternate modes via the same toggle row.
-const GROUP_MODES = [
-  { key: "date", label: "Grouped by date" },
-  { key: "series", label: "Grouped by series" },
-  { key: "flat", label: "Flat list" },
+// Group-by dropdown — Date/Series/Metal/Form, or "none" for the flat
+// list. Grouped by date is the default per the user's earlier request
+// ("I only want to see the aggregate when I first open the tab").
+// Computed entirely client-side from `items` (see groupItemsBy below) —
+// items already carry every field (series/metal/form/purchase_date/
+// total_weight_oz/melt_value/purchase_price) needed to group+rollup by
+// any of the four, so this no longer needs the two dedicated
+// date-summary/series-summary backend fetches an earlier version used
+// (those routes/functions stay live server-side — series_summary/
+// date_summary have their own tests and are a reasonable small public
+// API on their own — the frontend just stopped being their only caller's
+// use case now that grouping generalized to 4 dimensions).
+const GROUP_BY_OPTIONS = [
+  { key: "date", label: "Date" },
+  { key: "series", label: "Series" },
+  { key: "metal", label: "Metal" },
+  { key: "form", label: "Form" },
+  { key: "none", label: "Flat list" },
 ];
 
+// One key-fn per group dimension — the group LABEL an item belongs
+// under. Missing values get an explicit "Unknown ___" bucket (matching
+// stack.date_summary's existing "Unknown date" convention) rather than
+// silently dropping the item from every group.
+const GROUP_KEY_FNS = {
+  date: (i) => i.purchase_date || "Unknown date",
+  series: (i) => i.series || i.description || "Unknown series",
+  metal: (i) => i.metal || "Unknown metal",
+  form: (i) => i.form || "Unknown form",
+};
+
+// Generic replacement for the old series_summary/date_summary split —
+// groups already-filtered items by whichever dimension is active and
+// rolls up the same per-group totals GroupList expects (item_count/
+// total_count/total_weight_oz/total_melt_value/total_spent/item_ids),
+// nulls-over-zeros throughout (a group with no real melt_value anywhere
+// in it reports null, not 0 — same convention backend/stack.py's
+// _summarize_group already established, mirrored here since this now
+// runs client-side instead of round-tripping through it).
+function groupItemsBy(items, dimension) {
+  const keyFn = GROUP_KEY_FNS[dimension];
+  const groups = new Map();
+  for (const item of items) {
+    const label = keyFn(item);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(item);
+  }
+  // Metal+form breakdown discerns "silver bar" from "gold bar" (per the
+  // user's explicit request), not just form alone — skipped on whichever
+  // group-by dimension(s) already collapse that axis to one value (every
+  // member of a Metal group shares one metal; every member of a Form
+  // group shares one form), since the breakdown would be partially or
+  // fully redundant with the group label itself.
+  const breakMetal = dimension !== "metal";
+  const breakForm = dimension !== "form";
+  const summaries = [];
+  for (const [label, members] of groups) {
+    let totalCount = 0, totalOz = null, totalMelt = null, totalSpent = null;
+    // Count breakdown within this group (e.g. "●12 ▬4", colored by
+    // metal) — how many of this group's items are gold/silver coins vs.
+    // bars vs. rounds, shown in its own Count column rather than folded
+    // into Total oz.
+    const byMetalForm = new Map();
+    for (const m of members) {
+      totalCount += m.count || 1;
+      if (m.total_weight_oz !== null && m.total_weight_oz !== undefined) totalOz = (totalOz || 0) + m.total_weight_oz;
+      if (m.melt_value !== null && m.melt_value !== undefined) totalMelt = (totalMelt || 0) + m.melt_value;
+      if (m.purchase_price !== null && m.purchase_price !== undefined) totalSpent = (totalSpent || 0) + m.purchase_price;
+      if (breakMetal || breakForm) {
+        const metalKey = breakMetal ? m.metal || "other" : null;
+        const formKey = breakForm ? m.form || "other" : null;
+        const key = `${metalKey}|${formKey}`;
+        const entry = byMetalForm.get(key) || { metal: metalKey, form: formKey, count: 0 };
+        entry.count += m.count || 1;
+        byMetalForm.set(key, entry);
+      }
+    }
+    summaries.push({
+      label,
+      series: dimension === "series" ? (members[0].series || null) : undefined,
+      item_count: members.length,
+      total_count: totalCount,
+      total_weight_oz: totalOz,
+      total_melt_value: totalMelt,
+      total_spent: totalSpent,
+      by_metal_form: [...byMetalForm.values()].sort((a, b) => {
+        if (a.metal !== b.metal) return (a.metal || "").localeCompare(b.metal || "");
+        return FORMS.indexOf(a.form) - FORMS.indexOf(b.form);
+      }),
+      item_ids: members.map((m) => m.id),
+    });
+  }
+  return summaries;
+}
+
 export default function StackTracker() {
-  const [mode, setMode] = useState("series"); // "date" | "series" | "flat"
+  const [groupBy, setGroupBy] = useState("date"); // "date" | "series" | "metal" | "form" | "none"
   const [view, setView] = useState("list"); // "list" | "detail" | "add"
   const [metalFilter, setMetalFilter] = useState("all"); // "all" | "silver" | "gold"
+  const [formFilter, setFormFilter] = useState("all"); // "all" | "coin" | "bar" | "round" | "other"
+  const [dateFromFilter, setDateFromFilter] = useState(""); // "" | "YYYY-MM-DD"
+  const [dateToFilter, setDateToFilter] = useState("");
+  const [photoFilter, setPhotoFilter] = useState("all"); // "all" | "has" | "none"
   // The ONE legend for the Charts pane (sits under the pie) — a
   // multi-select set of series names currently shown. Every chart on the
   // pane (pie, oz-growth, cost-basis) and the DCA strip all render only
@@ -184,8 +300,6 @@ export default function StackTracker() {
   const [selectedSeries, setSelectedSeries] = useState(null);
   const [items, setItems] = useState([]);
   const [summary, setSummary] = useState(null);
-  const [seriesGroups, setSeriesGroups] = useState([]);
-  const [dateGroups, setDateGroups] = useState([]);
   const [listError, setListError] = useState(null);
   const [activeItemId, setActiveItemId] = useState(null);
   const [activeGroupIds, setActiveGroupIds] = useState(null); // item ids of the drilled-into group, or null
@@ -193,18 +307,28 @@ export default function StackTracker() {
   const refresh = useCallback(() => {
     getJSON("/api/stack/items/db").then(setItems).catch((err) => setListError(err.message));
     getJSON("/api/stack/summary/db").then(setSummary).catch(() => {});
-    getJSON("/api/stack/series-summary/db").then(setSeriesGroups).catch(() => {});
-    getJSON("/api/stack/date-summary/db").then(setDateGroups).catch(() => {});
   }, []);
 
-  // Seed selectedSeries to "all series on" the first time the series list
-  // arrives; on a later list change, keep the user's current toggles for
-  // series that still exist and default any genuinely-new series to
-  // visible. Empty selection is coerced back to "all" (an empty Charts
-  // pane is never a useful state).
-  const allSeriesNames = useMemo(
-    () => seriesGroups.filter((g) => g.total_weight_oz).map((g) => g.label),
-    [seriesGroups]
+  // Every real series value in use, across the WHOLE portfolio
+  // (unfiltered) — feeds both the Charts legend/DCA strip (allSeriesNames,
+  // weight-bearing only) and the series picker's quick-pick list
+  // (knownSeriesNames, every real value regardless of weight — a custom
+  // series typed on an item with no weight yet must still show up as a
+  // pick next time). Computed directly from `items` now that grouping
+  // dropped its dedicated backend fetches — same series-or-description
+  // fallback stack.series_summary already used.
+  const allSeriesNames = useMemo(() => {
+    const totals = new Map();
+    for (const item of items) {
+      if (!item.total_weight_oz) continue;
+      const key = item.series || item.description;
+      totals.set(key, (totals.get(key) || 0) + item.total_weight_oz);
+    }
+    return [...totals.keys()];
+  }, [items]);
+  const knownSeriesNames = useMemo(
+    () => [...new Set(items.map((i) => i.series).filter(Boolean))],
+    [items]
   );
   useEffect(() => {
     if (allSeriesNames.length === 0) return;
@@ -231,47 +355,31 @@ export default function StackTracker() {
     setView("list");
   }
 
-  function switchMode(nextMode) {
-    setMode(nextMode);
+  function switchGroupBy(nextGroupBy) {
+    setGroupBy(nextGroupBy);
     setActiveGroupIds(null);
   }
 
-  // Metal filter applies to whichever mode is active — items directly for
-  // Flat, and both the item set AND the group summaries (each group's
-  // item_ids filtered down, empty groups dropped, AND every numeric
-  // total genuinely recomputed from the filtered member items — a group
-  // that mixes metals, e.g. "Canadian Maple Leaf" spanning both silver
-  // and gold coins, was previously keeping its unfiltered combined oz
-  // total even after filtering to one metal, a real bug confirmed live)
-  // for the grouped modes.
-  const itemsById = new Map(items.map((i) => [i.id, i]));
-  const filteredItems = metalFilter === "all" ? items : items.filter((i) => i.metal === metalFilter);
-  const filteredItemIds = new Set(filteredItems.map((i) => i.id));
-  function filterGroups(groups) {
-    if (metalFilter === "all") return groups;
-    return groups
-      .map((g) => {
-        const memberIds = g.item_ids.filter((id) => filteredItemIds.has(id));
-        const members = memberIds.map((id) => itemsById.get(id)).filter(Boolean);
-        let totalCount = 0, totalOz = null, totalMelt = null, totalSpent = null;
-        for (const m of members) {
-          totalCount += m.count || 1;
-          if (m.total_weight_oz !== null && m.total_weight_oz !== undefined) totalOz = (totalOz || 0) + m.total_weight_oz;
-          if (m.melt_value !== null && m.melt_value !== undefined) totalMelt = (totalMelt || 0) + m.melt_value;
-          if (m.purchase_price !== null && m.purchase_price !== undefined) totalSpent = (totalSpent || 0) + m.purchase_price;
-        }
-        return {
-          ...g,
-          item_ids: memberIds,
-          item_count: members.length,
-          total_count: totalCount,
-          total_weight_oz: totalOz,
-          total_melt_value: totalMelt,
-          total_spent: totalSpent,
-        };
-      })
-      .filter((g) => g.item_ids.length > 0);
-  }
+  // Metal, Form, Date-range, and Photos filters all apply the same way,
+  // regardless of which grouping is active — everything downstream (the
+  // list itself, the group rollups computed FROM this already-filtered
+  // set via groupItemsBy, DCA, and the Charts pane) reads filteredItems,
+  // so a filter change updates all of them together rather than needing
+  // a separate recompute path per consumer (the old per-mode
+  // filterGroups that recomputed group totals from a fetched group's
+  // item_ids is gone — groupItemsBy always groups the already-filtered
+  // items directly). Photos is client-side only (items already carry
+  // photo_count from list_items' LEFT JOIN — no backend filter param
+  // needed, unlike metal/form/date which the value-history fetch also
+  // has to pass server-side).
+  const filteredItems = items.filter(
+    (i) =>
+      (metalFilter === "all" || i.metal === metalFilter) &&
+      (formFilter === "all" || i.form === formFilter) &&
+      (!dateFromFilter || (i.purchase_date && i.purchase_date >= dateFromFilter)) &&
+      (!dateToFilter || (i.purchase_date && i.purchase_date <= dateToFilter)) &&
+      (photoFilter === "all" || (photoFilter === "has" ? i.photo_count > 0 : !i.photo_count))
+  );
 
   return (
     <div className="app-shell">
@@ -283,46 +391,79 @@ export default function StackTracker() {
           {view === "list" && (
             <div>
               <SummaryStrip summary={summary} />
-              <div className="research-input-row" style={{ margin: "12px 0" }}>
+              <div className="research-input-row" style={{ margin: "12px 0", flexWrap: "wrap" }}>
                 <button type="button" onClick={() => setView("add")}>+ Add</button>
-                {GROUP_MODES.map((m) => (
-                  <button
-                    key={m.key}
-                    type="button"
-                    onClick={() => switchMode(m.key)}
-                    disabled={mode === m.key && !activeGroupIds}
+                <label className="form-inline-label">
+                  Group by
+                  <select
+                    value={groupBy}
+                    onChange={(e) => switchGroupBy(e.target.value)}
                   >
-                    {m.label}
-                  </button>
-                ))}
+                    {GROUP_BY_OPTIONS.map((o) => (
+                      <option key={o.key} value={o.key}>{o.label}</option>
+                    ))}
+                  </select>
+                </label>
                 <select value={metalFilter} onChange={(e) => setMetalFilter(e.target.value)}>
                   <option value="all">All metals</option>
                   <option value="silver">Silver</option>
                   <option value="gold">Gold</option>
                 </select>
+                <select value={formFilter} onChange={(e) => setFormFilter(e.target.value)}>
+                  <option value="all">All forms</option>
+                  {FORMS.map((f) => (
+                    <option key={f} value={f}>{f[0].toUpperCase() + f.slice(1)}</option>
+                  ))}
+                </select>
+                <label className="form-inline-label">
+                  From
+                  <input type="date" value={dateFromFilter} onChange={(e) => setDateFromFilter(e.target.value)} />
+                </label>
+                <label className="form-inline-label">
+                  To
+                  <input type="date" value={dateToFilter} onChange={(e) => setDateToFilter(e.target.value)} />
+                </label>
+                {(dateFromFilter || dateToFilter) && (
+                  <button type="button" onClick={() => { setDateFromFilter(""); setDateToFilter(""); }}>
+                    Clear dates
+                  </button>
+                )}
+                <select value={photoFilter} onChange={(e) => setPhotoFilter(e.target.value)}>
+                  <option value="all">All items</option>
+                  <option value="has">📷 Has photos</option>
+                  <option value="none">No photos</option>
+                </select>
+              </div>
+              <div className="comex-panel-note" style={{ margin: "-4px 0 8px" }}>
+                Form: {FORMS.map((f) => `${formIcon(f)} ${f[0].toUpperCase() + f.slice(1)}`).join("  ·  ")}
+                {"  —  color: "}
+                <span style={{ color: metalIconColor("gold") }}>● gold</span>
+                {" / "}
+                <span style={{ color: metalIconColor("silver") }}>● silver</span>
               </div>
 
-              {mode === "flat" && (
-                <ItemList items={filteredItems} error={listError} onOpen={openItem} onBulkUpdated={refresh} />
+              {groupBy === "none" && (
+                <ItemList items={filteredItems} error={listError} onOpen={openItem} onBulkUpdated={refresh} knownSeries={knownSeriesNames} />
               )}
 
-              {mode !== "flat" && !activeGroupIds && (
+              {groupBy !== "none" && !activeGroupIds && (
                 <GroupList
-                  groups={filterGroups(mode === "date" ? dateGroups : seriesGroups)}
+                  groups={groupItemsBy(filteredItems, groupBy)}
                   error={listError}
                   onOpenGroup={setActiveGroupIds}
                 />
               )}
-              {mode !== "flat" && activeGroupIds && (
+              {groupBy !== "none" && activeGroupIds && (
                 <div>
                   <button type="button" onClick={() => setActiveGroupIds(null)}>
-                    ← Back to {mode === "date" ? "dates" : "series"}
+                    ← Back to {GROUP_BY_OPTIONS.find((o) => o.key === groupBy)?.label.toLowerCase()} groups
                   </button>
                   <ItemList
                     items={filteredItems.filter((i) => activeGroupIds.includes(i.id))}
                     error={listError}
                     onOpen={openItem}
                     onBulkUpdated={refresh}
+                    knownSeries={knownSeriesNames}
                   />
                 </div>
               )}
@@ -331,13 +472,17 @@ export default function StackTracker() {
                 summary={summary}
                 items={filteredItems}
                 metalFilter={metalFilter}
+                formFilter={formFilter}
                 selectedSeries={selectedSeries}
                 allSeriesNames={allSeriesNames}
               />
               <StackCharts
-                seriesGroups={seriesGroups}
+                seriesGroups={groupItemsBy(filteredItems, "series")}
                 items={filteredItems}
                 metalFilter={metalFilter}
+                formFilter={formFilter}
+                dateFromFilter={dateFromFilter}
+                dateToFilter={dateToFilter}
                 selectedSeries={selectedSeries}
                 allSeriesNames={allSeriesNames}
                 onToggleSeries={(name) =>
@@ -356,8 +501,8 @@ export default function StackTracker() {
               />
             </div>
           )}
-          {view === "detail" && <ItemDetail itemId={activeItemId} onBack={backToList} />}
-          {view === "add" && <AddForm onDone={backToList} onCancel={backToList} />}
+          {view === "detail" && <ItemDetail itemId={activeItemId} onBack={backToList} knownSeries={knownSeriesNames} />}
+          {view === "add" && <AddForm onDone={backToList} onCancel={backToList} knownSeries={knownSeriesNames} />}
         </div>
       </details>
     </div>
@@ -446,16 +591,16 @@ function dcaForMetal(items, metal) {
   return anySpend && oz ? spend / oz : null;
 }
 
-function DcaStrip({ summary, items, metalFilter, selectedSeries, allSeriesNames }) {
+function DcaStrip({ summary, items, metalFilter, formFilter, selectedSeries, allSeriesNames }) {
   if (!summary) return null;
 
-  // `items` is already metal-filtered by the parent. All series selected
-  // AND All metals = the whole-portfolio case, use the backend's own
-  // summary figures. Any narrower scope (some series hidden, or a metal
-  // filter) recomputes DCA over just the visible items (client-side twin
-  // of the backend's spend÷oz).
+  // `items` is already metal- and form-filtered by the parent. All series
+  // selected AND All metals AND All forms = the whole-portfolio case, use
+  // the backend's own summary figures. Any narrower scope (some series
+  // hidden, or a metal/form filter) recomputes DCA over just the visible
+  // items (client-side twin of the backend's spend÷oz).
   const sel = selectedSeries ?? new Set(allSeriesNames);
-  const isAll = sel.size >= allSeriesNames.length && metalFilter === "all";
+  const isAll = sel.size >= allSeriesNames.length && metalFilter === "all" && formFilter === "all";
   let silverDca = summary.silver_dca;
   let goldDca = summary.gold_dca;
   let scopeLabel = "";
@@ -465,6 +610,7 @@ function DcaStrip({ summary, items, metalFilter, selectedSeries, allSeriesNames 
     goldDca = dcaForMetal(scopedItems, "gold");
     const parts = [];
     if (metalFilter !== "all") parts.push(metalFilter);
+    if (formFilter !== "all") parts.push(formFilter);
     if (sel.size < allSeriesNames.length)
       parts.push(sel.size === 1 ? [...sel][0] : `${sel.size} series`);
     scopeLabel = parts.length ? ` (${parts.join(", ")})` : "";
@@ -621,6 +767,9 @@ function StackCharts({
   seriesGroups,
   items,
   metalFilter,
+  formFilter,
+  dateFromFilter,
+  dateToFilter,
   selectedSeries,
   allSeriesNames,
   onToggleSeries,
@@ -670,13 +819,15 @@ function StackCharts({
   // under the metal filter. This is what the cost-basis fetch asks for.
   const activeSeries = [...sel].filter((s) => seriesPresentUnderFilter.has(s)).sort();
   const selKey = activeSeries.join("|"); // stable dep for the fetch effect
-  const fetchesWholeStack = metalFilter === "all" && isAll;
+  const fetchesWholeStack =
+    metalFilter === "all" && formFilter === "all" && !dateFromFilter && !dateToFilter && isAll;
 
   // --- Cost-basis chart: REAL weekly history for the active series ---
-  // /api/stack/value-history/db takes repeatable ?series= and a ?metal=
-  // filter. Omit both (whole stack) only when All metals + all series are
-  // selected. Re-fetches whenever the selection, metal filter, or series
-  // list changes.
+  // /api/stack/value-history/db takes repeatable ?series= and ?metal=/
+  // ?form=/?date_from=/?date_to= filters. Omit all of them (whole stack)
+  // only when All metals + All forms + no date range + all series are
+  // selected. Re-fetches whenever the selection, any filter, or the
+  // series list changes.
   const [valueHistory, setValueHistory] = useState(null);
   useEffect(() => {
     let cancelled = false;
@@ -685,6 +836,9 @@ function StackCharts({
     if (!fetchesWholeStack) {
       for (const s of activeSeries) params.push(`series=${encodeURIComponent(s)}`);
       if (metalFilter !== "all") params.push(`metal=${metalFilter}`);
+      if (formFilter !== "all") params.push(`form=${formFilter}`);
+      if (dateFromFilter) params.push(`date_from=${dateFromFilter}`);
+      if (dateToFilter) params.push(`date_to=${dateToFilter}`);
     }
     // Nothing active under the current filters — show empty, skip the fetch.
     if (!fetchesWholeStack && activeSeries.length === 0) {
@@ -704,7 +858,7 @@ function StackCharts({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selKey, metalFilter, fetchesWholeStack, allSeriesNames.length]);
+  }, [selKey, metalFilter, formFilter, dateFromFilter, dateToFilter, fetchesWholeStack, allSeriesNames.length]);
 
   // --- Pie: selected series only, snapped to a pinned date if set ---
   const livePieData = seriesGroups
@@ -1039,6 +1193,41 @@ function SortTh({ label, sortKeyName, currentKey, currentDir, onSort, className 
   );
 }
 
+// Count column content — the group's real total item count (sum of
+// `count` across members) plus a metal+form breakdown, always shown
+// (even a single-entry group, e.g. "35 (▬35)") so the icon/color
+// indicator is consistently present rather than only appearing once a
+// group happens to mix types — per the user's explicit request.
+// `byMetalForm` is empty only when grouping BY metal or BY form already
+// collapses that axis to one value — see groupItemsBy's
+// breakMetal/breakForm.
+function GroupCountCell({ totalCount, byMetalForm }) {
+  return (
+    <>
+      {totalCount}
+      {byMetalForm && byMetalForm.length > 0 && (
+        <span style={{ marginLeft: 6, fontSize: 11, whiteSpace: "nowrap" }}>
+          (
+          {byMetalForm.map((f, i) => {
+            const metalLabel = f.metal ? f.metal[0].toUpperCase() + f.metal.slice(1) + " " : "";
+            const formLabel = f.form ? f.form[0].toUpperCase() + f.form.slice(1) : "item";
+            return (
+              <span
+                key={`${f.metal}|${f.form}`}
+                title={`${metalLabel}${formLabel}: ${f.count}`}
+                style={{ color: metalIconColor(f.metal) }}
+              >
+                {i > 0 ? " " : ""}{f.form ? formIcon(f.form) : "•"}{f.count}
+              </span>
+            );
+          })}
+          )
+        </span>
+      )}
+    </>
+  );
+}
+
 // Shared table for both Grouped by date and Grouped by series — each row
 // shows only the aggregate (count/oz/value) until clicked, per the user's
 // "I only want to see the aggregate when I first open the tab."
@@ -1057,6 +1246,7 @@ function GroupList({ groups, error, onOpenGroup }) {
             <thead>
               <tr>
                 <SortTh label="Group" sortKeyName="label" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
+                <SortTh label="Count" sortKeyName="total_count" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
                 <SortTh label="Total oz" sortKeyName="total_weight_oz" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
                 <SortTh label="Melt value" sortKeyName="total_melt_value" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
               </tr>
@@ -1065,6 +1255,7 @@ function GroupList({ groups, error, onOpenGroup }) {
               {rows.map((g) => (
                 <tr key={g.label} onClick={() => onOpenGroup(g.item_ids)} style={{ cursor: "pointer" }}>
                   <td>{g.label}</td>
+                  <td className="right"><GroupCountCell totalCount={g.total_count} byMetalForm={g.by_metal_form} /></td>
                   <td className="right">{fmtOzBare(g.total_weight_oz)}</td>
                   <td className="right">{fmtUsd(g.total_melt_value)}</td>
                 </tr>
@@ -1083,9 +1274,10 @@ function GroupList({ groups, error, onOpenGroup }) {
 // BULK_UPDATE_FIELDS) to every selected row at once. e.g. select the 12
 // rows from the 1/29 order, set series="Canadian Maple Leaf" + mint_year
 // once, apply to all 12 — date/price/count stay per-row, untouched.
-function ItemList({ items, error, onOpen, onBulkUpdated }) {
+function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkEditing, setBulkEditing] = useState(false);
+  const [applyingPhoto, setApplyingPhoto] = useState(false);
   const { sortKey, sortDir, toggleSort, sorted } = useSort("purchase_date", "desc");
 
   const itemAccessor = (item, key) => (key === "series" ? item.series || item.description : item[key]);
@@ -1113,6 +1305,12 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
     onBulkUpdated?.();
   }
 
+  function handlePhotoApplied() {
+    setApplyingPhoto(false);
+    setSelected(new Set());
+    onBulkUpdated?.();
+  }
+
   return (
     <div>
       {error && <div className="comex-panel-note">{error}</div>}
@@ -1124,6 +1322,7 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
             <div className="research-input-row" style={{ margin: "8px 0" }}>
               <span className="comex-panel-note">{selected.size} selected</span>
               <button type="button" onClick={() => setBulkEditing(true)}>Bulk update</button>
+              <button type="button" onClick={() => setApplyingPhoto(true)}>Apply photo</button>
               <button type="button" onClick={() => setSelected(new Set())}>Clear selection</button>
             </div>
           )}
@@ -1132,6 +1331,14 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
               itemIds={[...selected]}
               onDone={handleBulkUpdated}
               onCancel={() => setBulkEditing(false)}
+              knownSeries={knownSeries}
+            />
+          )}
+          {applyingPhoto && (
+            <ApplyPhotoForm
+              itemIds={[...selected]}
+              onDone={handlePhotoApplied}
+              onCancel={() => setApplyingPhoto(false)}
             />
           )}
           <div className="comex-table-wrap comex-table-wrap--capped">
@@ -1159,7 +1366,22 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
                       />
                     </td>
                     <td>{item.purchase_date || "—"}</td>
-                    <td>{item.series || item.description}</td>
+                    <td>
+                      {item.form && (
+                        <span
+                          title={`${item.metal ? item.metal[0].toUpperCase() + item.metal.slice(1) + " " : ""}${item.form[0].toUpperCase() + item.form.slice(1)}`}
+                          style={{ marginRight: 6, color: metalIconColor(item.metal), opacity: 0.85 }}
+                        >
+                          {formIcon(item.form)}
+                        </span>
+                      )}
+                      {item.series || item.description}
+                      {item.photo_count > 0 && (
+                        <span title={`${item.photo_count} photo${item.photo_count === 1 ? "" : "s"}`} style={{ marginLeft: 6, opacity: 0.75 }}>
+                          📷
+                        </span>
+                      )}
+                    </td>
                     <td className="right">{fmtOzBare(item.total_weight_oz)}</td>
                     <td className="right">{fmtUsd(item.purchase_price)}</td>
                     <td className="right">{fmtUsd(item.melt_value)}</td>
@@ -1180,6 +1402,80 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
   );
 }
 
+// Applies ONE photo, uploaded once, to every selected row — for the real
+// case of a bulk lot photographed together (e.g. one box shot for all 21
+// coins from an order) where re-uploading the same file per item would
+// mean N physical copies with nothing tying them together as "the same
+// shot." Uploads to the first selected item via the existing single-item
+// route, then copies that stored photo onto every other selected item
+// via POST /api/stack/photos/{id}/copy-to — each target still gets its
+// own real file + row (see backend/stack.py's copy_photo_to_items), so
+// deleting one item's copy later never affects any other item's.
+function ApplyPhotoForm({ itemIds, onDone, onCancel }) {
+  const [file, setFile] = useState(null);
+  const [caption, setCaption] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null);
+
+  async function handleApply(e) {
+    e.preventDefault();
+    if (!file || itemIds.length === 0) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      if (caption.trim()) formData.append("caption", caption.trim());
+      const uploaded = await postForm(`/api/stack/items/${itemIds[0]}/photos`, formData);
+      const rest = itemIds.slice(1);
+      const outcome = rest.length
+        ? await postJSON(`/api/stack/photos/${uploaded.id}/copy-to`, { item_ids: rest })
+        : { copied: [], skipped_full: [], skipped_missing: [] };
+      setResult({
+        appliedCount: 1 + outcome.copied.length,
+        skippedFull: outcome.skipped_full.length,
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <div className="comex-panel-note" style={{ margin: "8px 0" }}>
+        Applied to {result.appliedCount} of {itemIds.length} selected item(s).
+        {result.skippedFull > 0 && ` ${result.skippedFull} already at the per-item photo limit, skipped.`}
+        <div style={{ marginTop: 6 }}>
+          <button type="button" onClick={onDone}>Done</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={handleApply} className="comex-panel" style={{ padding: 12, margin: "8px 0" }}>
+      {error && <div className="comex-panel-note">{error}</div>}
+      <div className="comex-panel-note">
+        Applies one photo to all {itemIds.length} selected item(s) — e.g. one shared box shot for a bulk lot.
+      </div>
+      <div className="research-input-row">
+        <input type="file" accept="image/*" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        <input
+          className="research-input" placeholder="Caption (optional)"
+          value={caption} onChange={(e) => setCaption(e.target.value)}
+        />
+      </div>
+      <div className="research-input-row">
+        <button type="submit" disabled={!file || saving}>{saving ? "Applying…" : "Apply to selected"}</button>
+        <button type="button" onClick={onCancel} disabled={saving}>Cancel</button>
+      </div>
+    </form>
+  );
+}
+
 // Blank form — only fields actually filled in get applied, per the user's
 // choice: leaving a field blank means "don't touch this on any selected
 // row," so a bulk update can't accidentally blank out data on rows that
@@ -1190,7 +1486,7 @@ function ItemList({ items, error, onOpen, onBulkUpdated }) {
 // to bulk update any one (or all) of the nested fields of the coin"
 // request. Every field starts blank; only fields actually filled in get
 // sent, so an untouched field is never overwritten with an empty value.
-function BulkUpdateForm({ itemIds, onDone, onCancel }) {
+function BulkUpdateForm({ itemIds, onDone, onCancel, knownSeries }) {
   const [series, setSeries] = useState("");
   const [description, setDescription] = useState("");
   const [metal, setMetal] = useState("");
@@ -1256,7 +1552,7 @@ function BulkUpdateForm({ itemIds, onDone, onCancel }) {
       </div>
 
       <div className="research-input-row">
-        <SeriesInput value={series} onChange={setSeries} blankLabel="Series — leave unchanged" />
+        <SeriesInput value={series} onChange={setSeries} blankLabel="Series — leave unchanged" knownSeries={knownSeries} />
         <input
           className="research-input" placeholder="Description — leave blank to skip"
           value={description} onChange={(e) => setDescription(e.target.value)}
@@ -1372,7 +1668,7 @@ function unitWeightOzFromState(state) {
   return raw ? parseFloat(raw) : null;
 }
 
-function MinimalFieldsInputs({ state, setField }) {
+function MinimalFieldsInputs({ state, setField, knownSeries }) {
   return (
     <div>
       <div className="research-input-row">
@@ -1380,6 +1676,7 @@ function MinimalFieldsInputs({ state, setField }) {
           value={state.series}
           onChange={(v) => setField("series", v)}
           blankLabel="No series (bar / generic round) — type a description below"
+          knownSeries={knownSeries}
         />
       </div>
       <div className="research-input-row">
@@ -1422,7 +1719,7 @@ function MinimalFieldsInputs({ state, setField }) {
   );
 }
 
-function AddForm({ onDone, onCancel }) {
+function AddForm({ onDone, onCancel, knownSeries }) {
   const [state, setState] = useState(EMPTY_STATE);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -1473,7 +1770,7 @@ function AddForm({ onDone, onCancel }) {
         Quantity &gt; 1 creates that many independent entries (own edit/delete later), not one row with a
         count — e.g. "7, 2013 Canadian Maple Leaf" becomes 7 separate rows you can track individually.
       </div>
-      <MinimalFieldsInputs state={state} setField={setField} />
+      <MinimalFieldsInputs state={state} setField={setField} knownSeries={knownSeries} />
       {error && <div className="comex-panel-note">{error}</div>}
       <div className="research-input-row">
         <button type="submit" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
@@ -1504,7 +1801,7 @@ function FormField({ label, children }) {
   );
 }
 
-function ItemDetail({ itemId, onBack }) {
+function ItemDetail({ itemId, onBack, knownSeries }) {
   const [item, setItem] = useState(null);
   const [description, setDescription] = useState("");
   const [series, setSeries] = useState("");
@@ -1708,7 +2005,7 @@ function ItemDetail({ itemId, onBack }) {
           Basics
         </div>
         <div className="research-input-row">
-          <SeriesInput value={series} onChange={setSeries} blankLabel="No series" />
+          <SeriesInput value={series} onChange={setSeries} blankLabel="No series" knownSeries={knownSeries} />
         </div>
         <div className="research-input-row">
           <FormField label="Description">

@@ -6,6 +6,7 @@ spot-price getter — a Python-level import, not a second raw connection or
 an ATTACH DATABASE, per the spec's "a read, not a write" framing."""
 
 import os
+import shutil
 import uuid
 from datetime import datetime, timezone
 
@@ -222,7 +223,15 @@ def get_item(item_id: int) -> dict | None:
 
 def list_items() -> list[dict]:
     with stack_db.get_conn() as conn:
-        rows = conn.execute("SELECT * FROM stack_items ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT stack_items.*, COUNT(stack_item_images.id) AS photo_count
+            FROM stack_items
+            LEFT JOIN stack_item_images ON stack_item_images.stack_item_id = stack_items.id
+            GROUP BY stack_items.id
+            ORDER BY stack_items.created_at DESC
+            """
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -455,7 +464,13 @@ def _series_key(item: dict) -> str:
     return item.get("series") or item.get("description") or ""
 
 
-def value_history(series: list[str] | None = None, metal: str | None = None) -> list[dict]:
+def value_history(
+    series: list[str] | None = None,
+    metal: str | None = None,
+    form: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict]:
     """Real weekly melt value vs. cost basis, from the earliest purchase
     through today — unlike timeseries(), this uses REAL historical daily
     closes (settlement_price's XAG/XAU_YAHOO_DAILY_CLOSE, back to 2006),
@@ -478,6 +493,15 @@ def value_history(series: list[str] | None = None, metal: str | None = None) -> 
     `metal` (optional, "silver"|"gold") mirrors the tab's All/Silver/Gold
     dropdown — restricts to items of that metal so the chart reacts to
     that toggle too. Omitted = both.
+    `form` (optional, one of FORMS) mirrors the tab's Form filter
+    (coin/bar/round/other) the same way `metal` does. Omitted = every form.
+    `date_from`/`date_to` (optional, ISO date strings) restrict to items
+    whose own `purchase_date` falls in that range (inclusive) — the tab's
+    Date filter. Note this scopes WHICH ITEMS count, not which weeks of
+    history are returned: a narrower purchase-date range still produces
+    real weekly history from that narrower set's own earliest purchase
+    through today, same "real weekly history for whatever's in scope"
+    behavior series/metal/form already have.
     """
     from datetime import date as _date, timedelta
 
@@ -487,6 +511,12 @@ def value_history(series: list[str] | None = None, metal: str | None = None) -> 
         items = [i for i in items if _series_key(i) in wanted]
     if metal in ("silver", "gold"):
         items = [i for i in items if i.get("metal") == metal]
+    if form in FORMS:
+        items = [i for i in items if i.get("form") == form]
+    if date_from:
+        items = [i for i in items if i["purchase_date"] >= date_from]
+    if date_to:
+        items = [i for i in items if i["purchase_date"] <= date_to]
     if not items:
         return []
 
@@ -726,3 +756,46 @@ def delete_photo(photo_id: int):
             raise HTTPException(404, f"No photo with id {photo_id}")
         _delete_image_file(row["file_path"])
         conn.execute("DELETE FROM stack_item_images WHERE id = ?", (photo_id,))
+
+
+def copy_photo_to_items(photo_id: int, target_item_ids: list[int]) -> dict:
+    """Copies an existing photo (e.g. one shared box shot for a bulk lot)
+    onto each target item — a real physical file copy per item, not a
+    shared/reference-counted file, so each item's photo lifecycle stays
+    fully independent (delete_photo on one item's copy never affects any
+    other item's copy, same as if each had been uploaded separately).
+    Skips (doesn't error) a target already at MAX_PHOTOS_PER_ITEM or a
+    target that doesn't exist, and reports both back so the caller can
+    show a real per-item outcome rather than an all-or-nothing failure.
+    """
+    with stack_db.get_conn() as conn:
+        src = conn.execute("SELECT * FROM stack_item_images WHERE id = ?", (photo_id,)).fetchone()
+    if src is None:
+        raise HTTPException(404, f"No photo with id {photo_id}")
+    src_abs_path = os.path.join(stack_db.IMAGES_ROOT, src["file_path"])
+    if not os.path.exists(src_abs_path):
+        raise HTTPException(404, f"Photo {photo_id}'s file is missing on disk")
+
+    ext = os.path.splitext(src["file_path"])[1]
+    copied, skipped_full, skipped_missing = [], [], []
+    for item_id in target_item_ids:
+        if get_item(item_id) is None:
+            skipped_missing.append(item_id)
+            continue
+        if len(list_images(item_id)) >= MAX_PHOTOS_PER_ITEM:
+            skipped_full.append(item_id)
+            continue
+
+        filename = f"{uuid.uuid4().hex}{ext}"
+        item_dir = os.path.join(stack_db.IMAGES_ROOT, str(item_id))
+        os.makedirs(item_dir, exist_ok=True)
+        shutil.copyfile(src_abs_path, os.path.join(item_dir, filename))
+        relative_path = f"{item_id}/{filename}"
+        with stack_db.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO stack_item_images (stack_item_id, file_path, caption) VALUES (?, ?, ?)",
+                (item_id, relative_path, src["caption"]),
+            )
+        copied.append(item_id)
+
+    return {"copied": copied, "skipped_full": skipped_full, "skipped_missing": skipped_missing}

@@ -3933,14 +3933,21 @@ async def stack_timeseries_db():
 async def stack_value_history_db(
     series: list[str] = Query(None),
     metal: str = Query(None),
+    form: str = Query(None),
+    date_from: str = Query(None),
+    date_to: str = Query(None),
 ):
     """Real weekly melt-value-vs-cost-basis history (from real historical
     daily closes, not today's spot applied backward) — the Stack tab's
     Cost-basis chart. `series` is a repeatable query param
     (?series=A&series=B) scoping to those series-keys; `metal`
-    ("silver"|"gold") mirrors the tab's metal dropdown. Both omitted = the
-    whole dated stack."""
-    return {"success": True, "data": stack.value_history(series=series, metal=metal)}
+    ("silver"|"gold"), `form` ("coin"|"bar"|"round"|"other"), and
+    `date_from`/`date_to` (ISO date strings, inclusive) mirror the tab's
+    metal/form/date filters. All omitted = the whole dated stack."""
+    return {
+        "success": True,
+        "data": stack.value_history(series=series, metal=metal, form=form, date_from=date_from, date_to=date_to),
+    }
 
 
 @app.post("/api/stack/items")
@@ -3991,6 +3998,19 @@ async def stack_photos_upload(item_id: int, file: UploadFile = File(...), captio
 async def stack_photos_delete(photo_id: int):
     stack.delete_photo(photo_id)
     return {"success": True, "data": None}
+
+
+@app.post("/api/stack/photos/{photo_id}/copy-to")
+async def stack_photos_copy_to(photo_id: int, body: dict = Body(...)):
+    """Copies one existing photo onto a caller-selected set of other
+    items — e.g. one shared box-shot photographed once and applied to all
+    21 rows of a bulk lot, instead of re-uploading it 21 times. Each
+    target gets its own real file copy + stack_item_images row (see
+    stack.copy_photo_to_items) so every item's photo lifecycle stays
+    independent — deleting one item's copy never removes another's."""
+    item_ids = body.get("item_ids") or []
+    result = stack.copy_photo_to_items(photo_id, item_ids)
+    return {"success": True, "data": result}
 
 
 @app.post("/api/stack/items/{item_id}/links")
