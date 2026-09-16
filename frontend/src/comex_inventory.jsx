@@ -131,7 +131,7 @@ function VaultTooltipContent({ active, label, rows, vaultKeys, vaultColor, click
   );
 }
 
-function VaultSnapshotPanel({ metal, depositoriesHistory, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
+function VaultSnapshotPanel({ metal, depositoriesHistory, aggregateHistory, sfWindow, sfCustomStart, sfCustomEnd, pinnedDate, onPin }) {
   const [pieMetric, setPieMetric] = useState("total");
   const [clickedVault, setClickedVault] = useState(null);
 
@@ -260,14 +260,73 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, sfWindow, sfCustomStar
 
   const METRIC_LABELS = { total: "Total", registered: "Registered", eligible: "Eligible" };
 
+  // Deliverable-pressure readout: registered's share of registered+eligible
+  // combined, summed across every vault on a given date — "how much of
+  // what's sitting in the vault is actually deliverable," a different
+  // question from paper leverage (OI vs. registered) and not derived from
+  // it. Null unless every vault present on that date has both real
+  // registered and eligible figures, per nulls-over-zeros — a partial sum
+  // would understate the true total silently. One shared helper computes
+  // this per-date so the header badge and the historical chart below never
+  // diverge on what "deliverable %" means.
+  function pctDeliverableForDateRow(dateRow) {
+    if (!dateRow) return null;
+    const vaultRows = allVaultNames
+      .map((name) => dateRow[name])
+      .filter((v) => v != null && v.oz != null);
+    if (vaultRows.length === 0) return null;
+    const complete = vaultRows.every((v) => v.registered != null && v.eligible != null);
+    if (!complete) return null;
+    const sumReg = vaultRows.reduce((s, v) => s + v.registered, 0);
+    const sumElig = vaultRows.reduce((s, v) => s + v.eligible, 0);
+    return sumReg + sumElig > 0 ? (sumReg / (sumReg + sumElig)) * 100 : null;
+  }
+
+  const pctDeliverable = pctDeliverableForDateRow(snapshotRow);
+  const prevPctDeliverable = pctDeliverableForDateRow(prevRow);
+  const pctDeliverableDelta =
+    pctDeliverable != null && prevPctDeliverable != null ? pctDeliverable - prevPctDeliverable : null;
+
+  // Full historical series for the "Deliverable % Over Time" chart below —
+  // sourced from the COMEX-wide aggregate table (inventory_aggregate /
+  // gold_inventory_aggregate), NOT the per-vault pivot above. The per-vault
+  // breakdown (depositoriesHistory) only has real history from whenever
+  // that specific table started being populated (2026-07-01 silver /
+  // 2026-07-04 gold, no upstream backfill) — but the aggregate table
+  // already carries its own real registered/eligible columns back to
+  // 2020-01-02 (silver) / 2026-02-02 (gold), since it's a different,
+  // longer-lived upstream feed. Using it here means this one chart gets a
+  // real multi-year window even though the bar chart/pie above it (which
+  // genuinely need the per-vault split) cannot. Same window filter
+  // (filterBySFWindow) as every other Stock & Flow chart.
+  const aggregateRows = filterBySFWindow(aggregateHistory || [], sfWindow, sfCustomStart, sfCustomEnd);
+  const pctDeliverableSeries = aggregateRows
+    .filter((r) => r.registered != null && r.eligible != null && r.registered + r.eligible > 0)
+    .map((r) => ({ date: r.date, pct: (r.registered / (r.registered + r.eligible)) * 100 }));
+
   return (
     <div className="comex-panel comex-panel--vault-snapshot">
-      <div className="comex-panel-header">{headerLabel}</div>
+      <div className="comex-panel-header">
+        {headerLabel}
+        {pctDeliverable != null && (
+          <span className="staleness-label" style={{ marginLeft: "auto" }}>
+            Deliverable: <strong>{pctDeliverable.toFixed(1)}%</strong> of vault stock
+            {pctDeliverableDelta != null && pctDeliverableDelta !== 0 && (
+              <span className={delta_class(pctDeliverableDelta)} style={{ marginLeft: 4 }}>
+                ({pctDeliverableDelta > 0 ? "+" : ""}{pctDeliverableDelta.toFixed(1)}pp)
+              </span>
+            )}
+          </span>
+        )}
+      </div>
       <div className="comex-panel-note">
         Each vault's real ounces held, day by day — click a bar to pin that date across the
         Stock & Flow charts below, or click a legend row to highlight one vault's segment (oz and
         % of COMEX total together in the tooltip). Real history only goes back to whenever this
         data first started being recorded (no upstream backfill), so this may be a short window.
+        "Deliverable" above is registered's share of registered+eligible stock combined — how much
+        of what's in the vault could be delivered against a futures contract today, distinct from
+        paper leverage (which compares open interest to registered ounces).
       </div>
 
       <div className="comex-vault-snapshot-body">
@@ -455,6 +514,58 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, sfWindow, sfCustomStar
             );
           })}
         </div>
+
+        {pctDeliverableSeries.length > 1 && (
+          <div style={{ marginTop: 16 }}>
+            <div className="comex-panel-note" style={{ marginBottom: 4 }}>
+              Deliverable % over time — COMEX-wide registered's share of registered+eligible
+              stock, one point per real day in the current window. Sourced from the aggregate
+              inventory series, not the per-vault breakdown above, so it reaches back to real
+              history's actual start ({metal === "XAU" ? "2026-02-02" : "2020-01-02"}) rather
+              than being limited to per-vault data's shorter window. Gaps are days with no real
+              registered/eligible split reported upstream, not zero activity.
+            </div>
+            <ResponsiveContainer width="100%" height={160}>
+              <LineChart
+                data={pctDeliverableSeries}
+                margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+                onClick={(state) => {
+                  if (state?.activeLabel && onPin) onPin(state.activeLabel);
+                }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+                <XAxis
+                  dataKey="date"
+                  ticks={xTicks(pctDeliverableSeries, 8)}
+                  tickFormatter={(d) => `${d.slice(5, 7)}/${d.slice(8, 10)}`}
+                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  tickFormatter={(v) => `${v.toFixed(0)}%`}
+                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  width={44}
+                />
+                <Tooltip
+                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
+                  formatter={(v) => [`${v.toFixed(1)}%`, "Deliverable"]}
+                  labelStyle={{ color: "#c8d0de" }}
+                />
+                {pinnedDateSnapped && (
+                  <ReferenceLine x={pinnedDateSnapped} stroke="#e0a84c" strokeDasharray="3 3" />
+                )}
+                <Line
+                  type="monotone"
+                  dataKey="pct"
+                  stroke="#4ea1e0"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -462,8 +573,36 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, sfWindow, sfCustomStar
 
 // ── Panel 6: Delivery notices MTD ──────────────────────────────────────────
 
+// COMEX silver futures contract size — same 5,000 troy oz figure as
+// backend/units.py's SILVER_CONTRACT_OZ. This is a display-only conversion
+// (contracts -> oz shown in this one table), not a computation feeding
+// into any other derived value, so per the unit-constants convention it's
+// fine as a local literal rather than importing a shared frontend module —
+// silver_cot_tracker.jsx already has its own equally-scoped copy.
+const SILVER_CONTRACT_OZ = 5000;
+
+// Shown above the table in every render state (loading/empty/populated) so
+// it's not lost depending on data availability.
+function DeliveryNoticesEli5() {
+  return (
+    <div className="comex-panel-note">
+      A delivery notice is COMEX's paperwork for one seller actually handing over metal against a
+      futures contract instead of rolling/closing the position — "issued" is the seller's side,
+      "stopped" is the buyer's side of that same paired event, which is why the two columns always
+      match exactly (confirmed against CME's own official report — not a data bug). More notices
+      relative to open interest is a sign more of the market is standing for physical delivery
+      rather than just trading paper.
+    </div>
+  );
+}
+
 function DeliveryNoticesPanel({ delivery }) {
-  if (!delivery) return <div className="comex-empty">Loading…</div>;
+  if (!delivery) return (
+    <>
+      <DeliveryNoticesEli5 />
+      <div className="comex-empty">Loading…</div>
+    </>
+  );
 
   const data = delivery.data;
   const isArray = Array.isArray(data);
@@ -499,44 +638,88 @@ function DeliveryNoticesPanel({ delivery }) {
     return String(v);
   }
 
-  if (!isArray) return renderValue(summary);
-  if (summary.length === 0) return <div className="comex-empty">No MTD notices yet</div>;
+  if (!isArray) return (
+    <>
+      <DeliveryNoticesEli5 />
+      {renderValue(summary)}
+    </>
+  );
+  if (summary.length === 0) return (
+    <>
+      <DeliveryNoticesEli5 />
+      <div className="comex-empty">No delivery notices yet</div>
+    </>
+  );
 
   // mtdCumulative/ytdCumulative are always 0 in metalcharts' response —
   // an unpopulated upstream field, not real zero-activity — so they're
   // dropped rather than shown as misleading data.
   const HIDDEN_COLUMNS = new Set(["mtdCumulative", "ytdCumulative"]);
-  const rows = summary.slice(0, 20);
+  // get_delivery_history orders ASC by date; this panel reads type="ytd"
+  // (see the fetch site's comment — a real recurring fetch no longer
+  // exists for type="mtd"), so the most recent days are at the END of
+  // `summary`, not the start. Slice from the tail and re-reverse so the
+  // table still reads most-recent-first, same as before this switch.
+  // Capped to the 10 most recent rows, in a fixed-height scrollable window
+  // (comex-table-wrap--capped — same convention Stack Tracker's own tables
+  // use) rather than a flat list, so a YTD-scale row count doesn't turn
+  // this into a long page scroll.
+  const rows = summary.slice(-10).reverse();
   const isTabular = rows.every((item) => item != null && typeof item === "object");
   const columns = isTabular
     ? Object.keys(rows[0]).filter((k) => !HIDDEN_COLUMNS.has(k))
     : [];
+  // Only add oz-equivalent columns when this is really contract-count data
+  // (both real fields present as numbers) — a row missing either field gets
+  // "—" for its oz cells rather than a manufactured 0, per nulls-over-zeros.
+  const hasContractColumns = columns.includes("daily_issued") && columns.includes("daily_stopped");
 
-  return isTabular ? (
-    <div className="comex-table-wrap">
-      <table className="comex-table">
-        <thead>
-          <tr>
-            {columns.map((k) => <th key={k}>{k}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((item, i) => (
-            <tr key={i}>
-              {columns.map((k) => (
-                <td key={k}>
-                  {typeof item[k] === "number" ? item[k].toLocaleString() : String(item[k] ?? "—")}
-                </td>
+  function ozCell(v) {
+    return v == null ? <span className="comex-empty">—</span> : (v * SILVER_CONTRACT_OZ).toLocaleString();
+  }
+
+  return (
+    <>
+      <DeliveryNoticesEli5 />
+      {isTabular ? (
+        <div className="comex-table-wrap comex-table-wrap--capped">
+          <table className="comex-table">
+            <thead>
+              <tr>
+                {columns.map((k) => <th key={k}>{k}</th>)}
+                {hasContractColumns && (
+                  <>
+                    <th>dailyIssued (oz)</th>
+                    <th>dailyStopped (oz)</th>
+                  </>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((item, i) => (
+                <tr key={i}>
+                  {columns.map((k) => (
+                    <td key={k}>
+                      {typeof item[k] === "number" ? item[k].toLocaleString() : String(item[k] ?? "—")}
+                    </td>
+                  ))}
+                  {hasContractColumns && (
+                    <>
+                      <td>{ozCell(item.daily_issued)}</td>
+                      <td>{ozCell(item.daily_stopped)}</td>
+                    </>
+                  )}
+                </tr>
               ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  ) : (
-    <div className="comex-delivery-list">
-      {rows.map((item, i) => <div key={i} className="comex-delivery-item">{String(item)}</div>)}
-    </div>
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="comex-delivery-list">
+          {rows.map((item, i) => <div key={i} className="comex-delivery-item">{String(item)}</div>)}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1180,6 +1363,7 @@ function GlobalSilverPanel({ comexHistory, shfeHistory, pslv }) {
 
 export default function ComexInventoryDashboard() {
   const [history, setHistory] = useState(null);
+  const [goldHistory, setGoldHistory] = useState(null);
   const [depositoriesHistory, setDepositoriesHistory] = useState(null);
   const [goldDepositoriesHistory, setGoldDepositoriesHistory] = useState(null);
   const [delivery, setDelivery] = useState(null);
@@ -1249,11 +1433,23 @@ export default function ComexInventoryDashboard() {
     // server-side by the tiered background refresh (see RefreshControls).
     await get("/api/silver/db/history",           setHistory,       (j) => j.data ?? null);
     await delay(300);
+    await get("/api/gold/db/history",             setGoldHistory,   (j) => j.data ?? null);
+    await delay(300);
     await get("/api/silver/db/depositories/history", setDepositoriesHistory, (j) => j.data ?? null);
     await delay(300);
     await get("/api/gold/db/depositories/history", setGoldDepositoriesHistory, (j) => j.data ?? null);
     await delay(300);
-    await get("/api/silver/db/delivery?type=mtd", setDelivery,      null);
+    // type=ytd, not mtd: the recurring background fetch was switched to
+    // type="ytd" (see _fetch_and_persist_delivery_ytd's own comment in
+    // main.py) since it returns a superset of mtd's window at no extra
+    // cost, needed for Delivery Behavior's reclassification signal to have
+    // real coverage. Nothing fetches type="mtd" on any recurring cadence
+    // anymore — reading it here left this panel silently frozen on
+    // whatever the last one-off mtd fetch happened to leave behind (found
+    // 2026-09-14: stuck at 2026-07-06 while type="ytd" was current through
+    // today, source_health green throughout since it only tracks the ytd
+    // fetch's own success/failure, not which type this panel reads).
+    await get("/api/silver/db/delivery?type=ytd", setDelivery,      null);
     await delay(300);
     await get("/api/shfe/db/history",             setShfeHistory,   (j) => j.data ?? null);
     await delay(300);
@@ -1371,6 +1567,7 @@ export default function ComexInventoryDashboard() {
               <VaultSnapshotPanel
                 metal={comexMetal}
                 depositoriesHistory={comexMetal === "XAU" ? goldDepositoriesHistory : depositoriesHistory}
+                aggregateHistory={comexMetal === "XAU" ? goldHistory : history}
                 sfWindow={sfWindow}
                 sfCustomStart={sfCustomStart}
                 sfCustomEnd={sfCustomEnd}
@@ -1402,7 +1599,7 @@ export default function ComexInventoryDashboard() {
               <details className="collapsible-pane">
                 <summary className="collapsible-pane-title">
                   <ChartStaleness sourceKey="delivery_notices" />
-                  <span>Delivery Notices — Month to Date</span>
+                  <span>Delivery Notices — Recent</span>
                 </summary>
                 <div className="collapsible-pane-body">
                   <DeliveryNoticesPanel delivery={delivery} />
