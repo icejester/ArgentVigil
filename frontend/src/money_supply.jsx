@@ -4,6 +4,27 @@ import { VAULT_COLORS } from "./palette";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
 import {
+  fmtTrillions,
+  fmtBillions,
+  fmtPct,
+  fmtUsd,
+  round1,
+  xTicks,
+  RATIO_COLOR,
+  WIN_COLOR,
+  LOSS_COLOR,
+  OUTLAYS_COLOR,
+  RECEIPTS_COLOR,
+  DEFICIT_COLOR,
+  INTEREST_COLOR,
+} from "./money_supply_shared";
+import TreasuryAuctionsPanel from "./treasury_auctions_panel";
+import TicHoldingsPanel from "./tic_holdings_panel";
+// Federal Outlays sub-panel extraction is deferred — see cleanup-spec.md
+// Stage 3.5; it stays inline in this file for now (it's the one sub-panel
+// coupled to window_/setWindow, so it needs a props contract designing
+// rather than a mechanical move).
+import {
   ComposedChart,
   LineChart,
   AreaChart,
@@ -35,13 +56,11 @@ const RRPONTSYD_COLOR = "#c9536b";
 const WSHOTSL_COLOR = "#4caf76";
 const WSHOMCB_COLOR = "#7fcf9a";
 const WLCFLPCL_COLOR = "#2f8f5b";
-const RATIO_COLOR = "#e8ecf4";
+// RATIO_COLOR / WIN_COLOR / LOSS_COLOR now imported from money_supply_shared.js
 const FIAT_COLOR = "#1f6f4a";
 const PP_COLOR = "#c026d3";
 const XAU_COLOR = "#d4af37";
 const XAG_COLOR = "#9aa5b1";
-const WIN_COLOR = "#4caf76";
-const LOSS_COLOR = "#e05252";
 
 // Treasury Yields sub-panel — each series its own distinct shade, no
 // group-color convention needed (unlike Composition's assets/liabilities
@@ -73,116 +92,11 @@ const T10Y3MO_COLOR = "#fb923c";
 // singled out as the most narratively-loaded figure here (what the
 // government pays just to service existing debt, independent of any new
 // spending decision).
-const OUTLAYS_COLOR = "#e05252";
-const RECEIPTS_COLOR = "#4caf76";
-const DEFICIT_COLOR = "#7b9fff";
-const INTEREST_COLOR = "#e0a84c";
+// OUTLAYS_COLOR / RECEIPTS_COLOR / DEFICIT_COLOR / INTEREST_COLOR now
+// imported from money_supply_shared.js (used by federal_outlays_panel.jsx).
 
-// Treasury Auctions sub-panel (Treasuries-picture expansion) — bid-to-cover
-// and buyer-category mix, per real settled auction. Security types get
-// their own distinct colors (bid-to-cover chart plots multiple types on
-// one shared axis); buyer categories get their own separate palette (the
-// %-stacked mix chart only ever shows one security type at a time, so its
-// 4 categories don't need to be visually distinct from the security-type
-// colors above).
-const AUCTION_SECURITY_TYPES = ["Bill", "Note", "Bond", "TIPS", "FRN"];
-const AUCTION_TYPE_COLOR = {
-  Bill: "#7b9fff",
-  Note: "#4caf76",
-  Bond: "#e0a84c",
-  TIPS: "#a78bfa",
-  FRN: "#f472b6",
-};
-const AUCTION_BUYER_COLORS = {
-  primary_dealer: "#7b9fff",
-  indirect_bidder: "#4caf76",
-  direct_bidder: "#e0a84c",
-  soma: "#e05252",
-};
-const AUCTION_BUYERS = [
-  { key: "primary_dealer", label: "Primary Dealers" },
-  { key: "indirect_bidder", label: "Indirect Bidders" },
-  { key: "direct_bidder", label: "Direct Bidders" },
-  { key: "soma", label: "SOMA (the Fed)" },
-];
 
-// One row per real settled auction (bid_to_cover_ratio non-null — an
-// announced-but-unsettled row has every result field null, per the
-// standing nulls-over-zeros convention, and isn't meaningful to plot).
-// buyer_mix_pct is computed here at read time (not persisted) as each
-// category's share of total_accepted — "who actually bought this auction,"
-// the % framing making auctions of very different sizes comparable on one
-// chart the way raw dollar amounts wouldn't be. This is a flat per-auction
-// list (potentially several rows sharing one date, since multiple security
-// types can auction the same day) — used by the buyer-mix chart (which
-// filters to one security type at a time, so no ambiguity there) and by
-// AuctionsTooltipContent (which explicitly looks up ALL rows for a hovered
-// date). It is NOT used directly as chart `data` for the multi-type
-// bid-to-cover chart — see mergeAuctionsByType below for why.
-function mergeAuctions(rows) {
-  return (rows || [])
-    .filter((r) => r.bid_to_cover_ratio != null)
-    .map((r) => {
-      const total = r.total_accepted;
-      const pct = (v) => (v != null && total ? round1((v / total) * 100) : null);
-      return {
-        date: r.auction_date,
-        cusip: r.cusip,
-        security_type: r.security_type,
-        security_term: r.security_term,
-        bid_to_cover_ratio: r.bid_to_cover_ratio,
-        high_yield: r.high_yield,
-        primary_dealer_pct: pct(r.primary_dealer_accepted),
-        indirect_bidder_pct: pct(r.indirect_bidder_accepted),
-        direct_bidder_pct: pct(r.direct_bidder_accepted),
-        soma_pct: pct(r.soma_accepted),
-      };
-    })
-    .sort((a, b) => (a.date < b.date ? -1 : 1));
-}
-
-// Pivots mergeAuctions' flat per-auction list into one row per real date,
-// with each security type as its own column (bid_to_cover_ratio keyed by
-// type) — the same "one row per date, one column per series" shape every
-// other multi-line chart in this file uses. A real bug this replaces: the
-// bid-to-cover chart originally gave each <Line> its own filtered
-// data={auctionsByType[t]} array while the chart itself used the full
-// auctionsMerged as its shared data — Recharts positions a category-axis
-// point by that SERIES' OWN array index/date, not a globally shared
-// position, so two types' points landed at mismatched x-positions on the
-// same visual axis even when their real dates matched (confirmed live —
-// the user's own "same date, different location" report). Rows with only
-// ONE type auctioned that day still get every other type's column as
-// null, which Line's connectNulls already handles correctly (a real gap,
-// not a manufactured value).
-function mergeAuctionsByType(auctionRows) {
-  const byDate = {};
-  for (const r of auctionRows) {
-    const row = (byDate[r.date] ??= { date: r.date });
-    row[r.security_type] = r.bid_to_cover_ratio;
-  }
-  return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
-}
-
-function fmtTrillions(v) {
-  if (v == null) return "—";
-  return `$${v.toFixed(2)}T`;
-}
-
-// Federal Outlays / Outlays by Agency sub-panels use billions, not
-// trillions like the rest of this panel — most individual agencies' monthly
-// figures are well under $1T, which read as near-invisible fractions
-// ("$0.20T") in trillions; billions gives real precision at the actual
-// scale these numbers move at.
-function fmtBillions(v) {
-  if (v == null) return "—";
-  return `$${v.toFixed(1)}B`;
-}
-
-function fmtPct(v) {
-  if (v == null) return "—";
-  return `${v.toFixed(1)}%`;
-}
+// fmtTrillions / fmtBillions / fmtPct now imported from money_supply_shared.js
 
 // Lightens a hex color toward white by `amount` (0-1) — used to derive a
 // visually-related "other" shade from a base agency color, so a
@@ -198,12 +112,7 @@ function lightenHex(hex, amount) {
   return `#${[mix(r), mix(g), mix(b)].map((c) => c.toString(16).padStart(2, "0")).join("")}`;
 }
 
-function xTicks(data, maxTicks = 8) {
-  if (!data || data.length === 0) return [];
-  const n = Math.min(data.length, maxTicks);
-  const step = Math.floor(data.length / n) || 1;
-  return data.filter((_, i) => i % step === 0).map((r) => r.date);
-}
+// xTicks now imported from money_supply_shared.js
 
 // All 7 Treasury yield series are real daily FRED series in the same %
 // units already — a plain date-key merge, no forward-fill/ratio math
@@ -238,38 +147,6 @@ function mergeYields(dgs2, dgs10, dfii10, t10y2y, dgs3mo, dgs5, dgs30) {
   return rows;
 }
 
-// Foreign/TIC holdings — data.tic_countries is {countryName: [{date,
-// value_trillions}]}, data.tic_grand_total is the same shape as one more
-// series. Merged into one flat per-date row (same date-key-merge pattern
-// as mergeYields) so all countries + the grand total share one chart's x
-// axis. TIC_COUNTRY_ORDER fixes a stable ranking (largest real 2026-05
-// holders first) so a country's assigned color/legend position doesn't
-// reshuffle as values change month to month — same "fixed ranking, not
-// re-ranked per period" reasoning as topAgenciesByLatestMonth's own
-// comment. Grand Total is NOT one of these countries — see its own
-// TIC_COUNTRY_ORDER exclusion and the standalone tic_grand_total field.
-const TIC_COUNTRY_ORDER = [
-  "Japan", "China", "United Kingdom", "Belgium", "Cayman Islands", "Luxembourg",
-  "Canada", "Total Caribbean", "Taiwan", "Ireland", "Switzerland", "Hong Kong",
-  "India", "Turkey",
-];
-const TIC_COUNTRY_COLOR = Object.fromEntries(
-  TIC_COUNTRY_ORDER.map((country, i) => [country, VAULT_COLORS[i % VAULT_COLORS.length]])
-);
-const TIC_GRAND_TOTAL_COLOR = "#e8ecf4";
-
-function mergeTicHoldings(ticCountries, ticGrandTotal) {
-  const byDate = {};
-  for (const country of TIC_COUNTRY_ORDER) {
-    for (const r of ticCountries?.[country] || []) {
-      byDate[r.date] = { ...(byDate[r.date] || {}), date: r.date, [country]: r.value_trillions };
-    }
-  }
-  for (const r of ticGrandTotal || []) {
-    byDate[r.date] = { ...(byDate[r.date] || {}), date: r.date, grand_total: r.value_trillions };
-  }
-  return Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1));
-}
 
 // treasury_outlays/db already returns one flat row per real calendar month
 // (date, receipts_usd, outlays_usd, deficit_usd, interest_usd) — no merge
@@ -869,9 +746,7 @@ function rebaseToBaseline(rows, baselineKey) {
   });
 }
 
-function round1(v) {
-  return Math.round(v * 10) / 10;
-}
+// round1 now imported from money_supply_shared.js
 
 // Hypothetical stake used to show the held-comparison tooltip's relative
 // return in dollars alongside the percentage — "if I'd put $100 into the
@@ -1082,78 +957,6 @@ function YieldsTooltipContent({ active, label, yieldsMerged }) {
       {row.dfii10 != null && <div style={{ color: DFII10_COLOR }}>10-Year Real (TIPS): {row.dfii10.toFixed(2)}%</div>}
       {row.t10y2y != null && <div style={{ color: T10Y2Y_COLOR }}>10Y–2Y Spread: {row.t10y2y >= 0 ? "+" : ""}{row.t10y2y.toFixed(2)}%</div>}
       {row.t10y3mo != null && <div style={{ color: T10Y3MO_COLOR }}>10Y–3mo Spread: {row.t10y3mo >= 0 ? "+" : ""}{row.t10y3mo.toFixed(2)}%</div>}
-    </div>
-  );
-}
-
-// Foreign Holdings chart's hover tooltip — shows only currently-visible
-// (not hidden) countries plus the grand total, sorted largest-first at
-// that date so the ranking is legible at a glance rather than fixed
-// alphabetically or by TIC_COUNTRY_ORDER's own latest-month ranking (which
-// can differ from a hovered historical date's real ranking).
-function TicHoldingsTooltipContent({ active, label, ticMerged, hiddenCountries }) {
-  if (!active || !label) return null;
-  const row = ticMerged.find((r) => r.date === label);
-  if (!row) return null;
-  const countryRows = TIC_COUNTRY_ORDER
-    .filter((c) => !hiddenCountries.has(c) && row[c] != null)
-    .map((c) => ({ name: c, value: row[c], color: TIC_COUNTRY_COLOR[c] }))
-    .sort((a, b) => b.value - a.value);
-  return (
-    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
-      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
-      {row.grand_total != null && (
-        <div style={{ color: TIC_GRAND_TOTAL_COLOR, fontWeight: 600, marginBottom: 2 }}>
-          Grand Total (LT only): {fmtTrillions(row.grand_total)}
-        </div>
-      )}
-      {countryRows.map((c) => (
-        <div key={c.name} style={{ color: c.color }}>
-          {c.name}: {fmtTrillions(c.value)}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// Bid-to-cover chart's hover tooltip — unlike the other Money Supply
-// tooltips, more than one real auction can share the same date (a Bill and
-// a Note auctioned the same day are both real, distinct rows), so this
-// looks up ALL auctionsMerged rows for the hovered date rather than
-// find()ing a single row.
-function AuctionsTooltipContent({ active, label, auctionsMerged }) {
-  if (!active || !label) return null;
-  const rows = auctionsMerged.filter((r) => r.date === label);
-  if (!rows.length) return null;
-  return (
-    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
-      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
-      {rows.map((r) => (
-        <div key={r.cusip} style={{ color: AUCTION_TYPE_COLOR[r.security_type] ?? "#c8d0de", marginBottom: 2 }}>
-          {r.security_type} ({r.security_term}): {r.bid_to_cover_ratio.toFixed(2)}x bid-to-cover
-          {r.high_yield != null && `, ${r.high_yield.toFixed(2)}% yield`}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// Buyer-mix %-stacked chart's hover tooltip — single security type at a
-// time, so a plain find() by date is correct here (unlike AuctionsTooltipContent).
-function AuctionMixTooltipContent({ active, label, rows, hiddenBuyers }) {
-  if (!active || !label) return null;
-  const row = rows.find((r) => r.date === label);
-  if (!row) return null;
-  return (
-    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
-      <div style={{ color: "#c8d0de", marginBottom: 4 }}>
-        {label} ({row.security_term})
-      </div>
-      {AUCTION_BUYERS.filter((b) => !hiddenBuyers?.has(b.key) && row[`${b.key}_pct`] != null).map((b) => (
-        <div key={b.key} style={{ color: AUCTION_BUYER_COLORS[b.key] }}>
-          {b.label}: {row[`${b.key}_pct`].toFixed(1)}%
-        </div>
-      ))}
     </div>
   );
 }
@@ -1382,10 +1185,7 @@ function OutlaysByAgencyTooltipContent({ active, label, rows, topAgencies, agenc
   );
 }
 
-function fmtUsd(v) {
-  if (v == null) return "—";
-  return `$${v.toFixed(2)}`;
-}
+// fmtUsd now imported from money_supply_shared.js
 
 const METAL_SERIES_COLOR = { fiat_index: FIAT_COLOR, pp_index: PP_COLOR, xau_index: XAU_COLOR, xag_index: XAG_COLOR };
 const METAL_SERIES_UNIT = { fiat_index: null, pp_index: null, xau_index: "xau_price", xag_index: "xag_price" };
@@ -1452,15 +1252,6 @@ export default function MoneySupply() {
   const [metalsData, setMetalsData] = useState(null);
   const [outlaysData, setOutlaysData] = useState(null);
   const [outlaysByAgencyData, setOutlaysByAgencyData] = useState(null);
-  // Auctions data is fetched once per mount, independent of the panel-wide
-  // window_ state — /api/treasury-auctions/db has no window param at all
-  // (deliberately: real persisted history is a rolling ~120-day trailing
-  // window on disk, not multi-year, so a window selector implying more
-  // history exists than does would be misleading — see the route's own
-  // comment in main.py). Fetched separately from `load` below rather than
-  // folded into its Promise.all, since it doesn't need to re-fire on every
-  // window/custom-range change the way the money/metals/outlays fetches do.
-  const [auctionsData, setAuctionsData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -1545,8 +1336,6 @@ export default function MoneySupply() {
   const [compositionPanelOpen, setCompositionPanelOpen] = useState(false);
   const [qeQtPanelOpen, setQeQtPanelOpen] = useState(false);
   const [yieldsPanelOpen, setYieldsPanelOpen] = useState(false);
-  const [auctionsPanelOpen, setAuctionsPanelOpen] = useState(false);
-  const [ticPanelOpen, setTicPanelOpen] = useState(false);
   const [metalsPanelOpen, setMetalsPanelOpen] = useState(false);
   const [outlaysPanelOpen, setOutlaysPanelOpen] = useState(false);
   // Topline (flat outlays/receipts/deficit/interest lines) vs. By Department
@@ -1632,13 +1421,6 @@ export default function MoneySupply() {
     load(window_);
   }, [window_, customStart, customEnd, load]);
 
-  useEffect(() => {
-    fetch("/api/treasury-auctions/db")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((json) => setAuctionsData(json.data ?? null))
-      .catch(() => setAuctionsData(null));
-  }, []);
-
   async function handleRefresh() {
     setRefreshing(true);
     try {
@@ -1674,59 +1456,10 @@ export default function MoneySupply() {
   );
   const yieldsTicks = useMemo(() => xTicks(yieldsMerged), [yieldsMerged]);
 
-  const auctionsMerged = useMemo(() => mergeAuctions(auctionsData), [auctionsData]);
-  // Bid-to-cover chart plots every security type on one shared axis
-  // (auctionSelectedTypes controls which lines show, checkbox-style, same
-  // show/hide convention as the Yields/By-Department legends). The buyer-mix
-  // %-stacked chart only makes sense for ONE security type at a time (Bills
-  // vs. 30-Year Bonds have structurally different buyer compositions — an
-  // "all types stacked together" mix would be a meaningless blend), hence
-  // the separate single-select auctionMixType below.
-  const [auctionSelectedTypes, setAuctionSelectedTypes] = useState(() => new Set(AUCTION_SECURITY_TYPES));
-  const [auctionMixType, setAuctionMixType] = useState("Note");
-  // Click-to-highlight for both Treasury Auctions charts' legends — same
-  // convention as every other legend in this file (checkbox toggles
-  // visibility, a separate click highlights + dims the rest).
-  const [clickedAuctionTypeKey, setClickedAuctionTypeKey] = useState(null);
-  const [clickedAuctionBuyerKey, setClickedAuctionBuyerKey] = useState(null);
-  const [hiddenAuctionBuyers, setHiddenAuctionBuyers] = useState(() => new Set());
-  const auctionsByType = useMemo(() => {
-    const byType = {};
-    for (const t of AUCTION_SECURITY_TYPES) byType[t] = [];
-    for (const row of auctionsMerged) {
-      if (byType[row.security_type]) byType[row.security_type].push(row);
-    }
-    return byType;
-  }, [auctionsMerged]);
-  const auctionMixRows = auctionsByType[auctionMixType] || [];
-  // Bid-to-cover chart's real chart data — one row per date, one column
-  // per security type (see mergeAuctionsByType's own comment for the real
-  // mis-positioning bug this replaces). auctionsMerged itself stays a flat
-  // per-auction list, used elsewhere (buyer-mix filtering, the tooltip's
-  // multi-row-per-date lookup).
-  const auctionsPivoted = useMemo(() => mergeAuctionsByType(auctionsMerged), [auctionsMerged]);
-  const auctionsTicks = useMemo(() => xTicks(auctionsPivoted), [auctionsPivoted]);
-  const auctionMixTicks = useMemo(() => xTicks(auctionMixRows), [auctionMixRows]);
-  // Cross-chart pin (pinnedDate) never reached either Auctions chart before
-  // — a real gap the user caught ("doesn't seem to be shifting with the
-  // page like the others"): every other chart in this panel both
-  // originates a pin (click sets pinnedDate) and displays one set
-  // elsewhere via its own snapped ReferenceLine; Auctions did neither.
-  // auctionsMerged/auctionMixRows have their own date grids (auctionMixRows
-  // is additionally filtered to one security type), so each snaps
-  // independently, same "different charts, different grids" reasoning as
-  // every other nearestRowDate call in this file.
-  const pinnedDateAuctions = nearestRowDate(auctionsPivoted, pinnedDate);
-  const pinnedDateAuctionMix = nearestRowDate(auctionMixRows, pinnedDate);
-
-  // Foreign/TIC holdings — comes back inside the same /api/fred/money-supply/db
-  // response as everything else on this tab (data.tic_countries/
-  // data.tic_grand_total), so it shares the panel-wide window_ state and
-  // needs no separate fetch, unlike auctionsData above.
-  const ticMerged = useMemo(() => (data ? mergeTicHoldings(data.tic_countries, data.tic_grand_total) : []), [data]);
-  const ticTicks = useMemo(() => xTicks(ticMerged), [ticMerged]);
-  const [hiddenTicCountries, setHiddenTicCountries] = useState(() => new Set());
-  const [clickedTicKey, setClickedTicKey] = useState(null);
+  // Treasury Auctions and Foreign Holdings (TIC) are now their own
+  // components — treasury_auctions_panel.jsx (own fetch) and
+  // tic_holdings_panel.jsx (fed data.tic_countries/tic_grand_total from
+  // the shared window fetch as props).
 
   const outlaysMonthly = useMemo(() => mergeOutlays(outlaysData), [outlaysData]);
   // Annual rollup sums outlays/receipts/deficit/interest across each FY's
@@ -3168,418 +2901,9 @@ export default function MoneySupply() {
       )}
       </details>
 
-      <details className="collapsible-pane" open={auctionsPanelOpen} onToggle={(e) => setAuctionsPanelOpen(e.target.open)}>
-      <summary className="collapsible-pane-title">
-        <ChartStaleness sourceKey="treasury_auctions" />
-        <span>Treasury Auctions</span>
-        {auctionsMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
-            {(() => {
-              const latest = auctionsMerged[auctionsMerged.length - 1];
-              return `${latest.security_type} (${latest.security_term}) ${latest.date} · ${latest.bid_to_cover_ratio.toFixed(2)}x bid-to-cover`;
-            })()}
-          </span>
-        )}
-      </summary>
-      {auctionsPanelOpen && (
-      <div className="collapsible-pane-body">
-      <div className="comex-panel-note">
-        Real Treasury auction results — bid-to-cover ratio (demand strength) and who actually
-        bought each auction (primary dealers, indirect bidders — the closest public proxy for
-        foreign/other indirect buyers, direct bidders, and the Fed's own SOMA account). Real
-        persisted history is a rolling trailing window (see the note below), not multi-year —
-        this is about recent auction dynamics, not a long-run series. Descriptive only, per AV
-        Voice Rules — no claim about what a given bid-to-cover or buyer mix means for future
-        rates or prices.
-      </div>
-      {auctionsMerged.length > 0 ? (
-        <>
-          <ResponsiveContainer width="100%" height={240}>
-            <LineChart
-              data={auctionsPivoted}
-              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
-              onClick={(state) => {
-                if (state?.activeLabel) setPinnedDate(state.activeLabel);
-              }}
-            >
-              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={auctionsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-              <YAxis
-                domain={["dataMin - 0.2", "dataMax + 0.2"]}
-                tickFormatter={(v) => `${v.toFixed(1)}x`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Bid-to-Cover", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
-              />
-              <Tooltip content={<AuctionsTooltipContent auctionsMerged={auctionsMerged} />} />
-              {pinnedDateAuctions && (
-                <ReferenceLine x={pinnedDateAuctions} stroke={RATIO_COLOR} strokeDasharray="3 3" />
-              )}
-              {AUCTION_SECURITY_TYPES.filter((t) => auctionSelectedTypes.has(t)).map((t) => (
-                <Line
-                  key={t}
-                  type="monotone"
-                  dataKey={t}
-                  name={t}
-                  stroke={AUCTION_TYPE_COLOR[t]}
-                  dot={{ r: 2 }}
-                  strokeWidth={clickedAuctionTypeKey === t ? 3 : 1.5}
-                  strokeOpacity={clickedAuctionTypeKey && clickedAuctionTypeKey !== t ? 0.25 : 1}
-                  connectNulls
-                  isAnimationActive={false}
-                />
-              ))}
-            </LineChart>
-          </ResponsiveContainer>
-          {pinnedDateAuctions && (
-            <div style={{ marginTop: 4 }}>
-              <AuctionsTooltipContent active label={pinnedDateAuctions} auctionsMerged={auctionsMerged} />
-            </div>
-          )}
-          <div className="comex-legend-list comex-legend-list--horizontal">
-            {AUCTION_SECURITY_TYPES.map((t) => (
-              <div key={t} className="metals-legend-row">
-                <input
-                  type="checkbox"
-                  className="metals-legend-checkbox"
-                  checked={auctionSelectedTypes.has(t)}
-                  onChange={() =>
-                    setAuctionSelectedTypes((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(t)) next.delete(t);
-                      else next.add(t);
-                      return next;
-                    })
-                  }
-                  title={auctionSelectedTypes.has(t) ? "Hide this security type" : "Show this security type"}
-                />
-                <button
-                  className={`comex-legend-item legend-btn-row${clickedAuctionTypeKey === t ? " legend-btn-row--baseline" : ""}`}
-                  onClick={() => setClickedAuctionTypeKey((k) => (k === t ? null : t))}
-                >
-                  <span className="comex-legend-swatch" style={{ background: AUCTION_TYPE_COLOR[t] }} />
-                  <span>
-                    <strong>{t}</strong>
-                  </span>
-                </button>
-              </div>
-            ))}
-          </div>
+      <TreasuryAuctionsPanel />
 
-          <div className="comex-panel-note" style={{ marginTop: 16 }}>
-            Buyer mix — who actually bought this security, as a % of the total accepted at
-            auction. Only one security type at a time (a Bill's buyer mix isn't comparable to a
-            30-Year Bond's on the same chart).
-          </div>
-          <div className="comex-range-selector" style={{ marginBottom: 8 }}>
-            {AUCTION_SECURITY_TYPES.map((t) => (
-              <button
-                key={t}
-                className={`comex-range-btn${auctionMixType === t ? " comex-range-btn--active" : ""}`}
-                onClick={() => setAuctionMixType(t)}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-          {auctionMixRows.length > 0 ? (
-            <>
-            <ResponsiveContainer width="100%" height={220}>
-              <AreaChart
-                data={auctionMixRows}
-                stackOffset="expand"
-                margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
-                onClick={(state) => {
-                  if (state?.activeLabel) setPinnedDate(state.activeLabel);
-                }}
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-                <XAxis dataKey="date" ticks={auctionMixTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-                <YAxis tickFormatter={(v) => `${Math.round(v * 100)}%`} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-                <Tooltip content={<AuctionMixTooltipContent rows={auctionMixRows} hiddenBuyers={hiddenAuctionBuyers} />} />
-                {pinnedDateAuctionMix && (
-                  <ReferenceLine x={pinnedDateAuctionMix} stroke={RATIO_COLOR} strokeDasharray="3 3" />
-                )}
-                {AUCTION_BUYERS.filter((b) => !hiddenAuctionBuyers.has(b.key)).map((b) => (
-                  <Area
-                    key={b.key}
-                    type="monotone"
-                    dataKey={`${b.key}_pct`}
-                    name={b.label}
-                    stackId="mix"
-                    stroke={AUCTION_BUYER_COLORS[b.key]}
-                    fill={AUCTION_BUYER_COLORS[b.key]}
-                    strokeWidth={clickedAuctionBuyerKey === b.key ? 3 : 1}
-                    fillOpacity={clickedAuctionBuyerKey && clickedAuctionBuyerKey !== b.key ? 0.2 : 0.7}
-                    isAnimationActive={false}
-                  />
-                ))}
-              </AreaChart>
-            </ResponsiveContainer>
-            {pinnedDateAuctionMix && (
-              <div style={{ marginTop: 4 }}>
-                <AuctionMixTooltipContent active label={pinnedDateAuctionMix} rows={auctionMixRows} hiddenBuyers={hiddenAuctionBuyers} />
-              </div>
-            )}
-            </>
-          ) : (
-            <div className="comex-empty">
-              No settled {auctionMixType} auctions in the current window.
-            </div>
-          )}
-          <div className="comex-legend-list comex-legend-list--horizontal">
-            {AUCTION_BUYERS.map((b) => (
-              <div key={b.key} className="metals-legend-row">
-                <input
-                  type="checkbox"
-                  className="metals-legend-checkbox"
-                  checked={!hiddenAuctionBuyers.has(b.key)}
-                  onChange={() =>
-                    setHiddenAuctionBuyers((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(b.key)) next.delete(b.key);
-                      else next.add(b.key);
-                      return next;
-                    })
-                  }
-                  title={hiddenAuctionBuyers.has(b.key) ? "Show this buyer category" : "Hide this buyer category"}
-                />
-                <button
-                  className={`comex-legend-item legend-btn-row${clickedAuctionBuyerKey === b.key ? " legend-btn-row--baseline" : ""}`}
-                  onClick={() => setClickedAuctionBuyerKey((k) => (k === b.key ? null : b.key))}
-                >
-                  <span className="comex-legend-swatch" style={{ background: AUCTION_BUYER_COLORS[b.key] }} />
-                  <span>
-                    <strong>{b.label}</strong>
-                  </span>
-                </button>
-              </div>
-            ))}
-          </div>
-        </>
-      ) : (
-        <div className="comex-empty">
-          No data available.
-          <div className="comex-empty-note">Auction results accumulate on a rolling basis once the backend has run — check back after the next restart or scheduled fetch.</div>
-        </div>
-      )}
-      <div className="comex-panel-note" style={{ marginTop: 8 }}>
-        Source: U.S. Treasury (fiscaldata.treasury.gov) — Auctions Query API. Real persisted
-        history is a rolling ~120-day trailing window, refetched daily (not multi-year like the
-        other Treasury charts in this panel) — a newly-announced auction has every result field
-        null until it settles a few days later, at which point the same record is updated in
-        place with real values. "Indirect Bidders" is the closest public proxy for foreign
-        central bank and other indirect buyers — it does not identify individual countries.
-      </div>
-      </div>
-      )}
-      </details>
-
-      <details className="collapsible-pane" open={ticPanelOpen} onToggle={(e) => setTicPanelOpen(e.target.open)}>
-      <summary className="collapsible-pane-title">
-        <ChartStaleness sourceKey="money_supply" />
-        <span>Foreign Holdings of U.S. Treasuries</span>
-        {ticMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
-            {(() => {
-              const row = pinnedDate ? ticMerged.find((r) => r.date === nearestRowDate(ticMerged, pinnedDate)) : ticMerged[ticMerged.length - 1];
-              if (!row) return null;
-              const top = TIC_COUNTRY_ORDER.filter((c) => row[c] != null).sort((a, b) => row[b] - row[a])[0];
-              return (
-                <>
-                  {row.date}
-                  {row.grand_total != null && ` · Grand Total (LT) ${fmtTrillions(row.grand_total)}`}
-                  {top && ` · Top: ${top} ${fmtTrillions(row[top])}`}
-                </>
-              );
-            })()}
-          </span>
-        )}
-      </summary>
-      {ticPanelOpen && (
-      <div className="collapsible-pane-body">
-      <div className="comex-panel-note">
-        Which countries hold how much U.S. Treasury debt, over time — FRED's own ingestion of
-        Treasury's TIC (Treasury International Capital) data. <strong>Long-term Treasuries
-        only — excludes T-bills entirely.</strong> Treasury's own separately-published Major
-        Foreign Holders total (bills-inclusive) runs meaningfully higher than the grand total
-        this data represents; the two are not interchangeable. "Cayman Islands" is a real subset
-        of "Total Caribbean," not a duplicate — both are shown, but summing them would
-        double-count.
-      </div>
-      {ticMerged.length > 0 ? (
-        <div className="comex-vault-pie-row">
-          {(() => {
-            const pinnedDateTic = nearestRowDate(ticMerged, pinnedDate);
-            // Pin > hover > latest, same priority rule as every other pie
-            // in this panel (compositionPieRow, outlaysByAgencyPieRow).
-            const ticPieDate = pinnedDate ? pinnedDateTic : ticMerged[ticMerged.length - 1]?.date;
-            const ticPieRow = ticMerged.find((r) => r.date === ticPieDate) ?? null;
-            const ticPieData = ticPieRow
-              ? TIC_COUNTRY_ORDER
-                  .filter((c) => !hiddenTicCountries.has(c) && ticPieRow[c] != null && ticPieRow[c] > 0)
-                  .map((c) => ({ key: c, name: c, value: ticPieRow[c], color: TIC_COUNTRY_COLOR[c] }))
-              : [];
-            return (
-              <>
-          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
-          <div style={{ flex: "1 1 420px", minWidth: 0 }}>
-          <ResponsiveContainer width="100%" height={280}>
-            <ComposedChart data={ticMerged} margin={{ top: 4, right: 20, left: 12, bottom: 4 }} onClick={(state) => {
-              if (state?.activeLabel) setPinnedDate(state.activeLabel);
-            }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={ticTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-              <YAxis
-                tickFormatter={(v) => `$${v.toFixed(1)}T`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
-              />
-              <Tooltip content={<TicHoldingsTooltipContent ticMerged={ticMerged} hiddenCountries={hiddenTicCountries} />} />
-              {pinnedDateTic && <ReferenceLine x={pinnedDateTic} stroke={RATIO_COLOR} strokeDasharray="3 3" />}
-              {/* Stack order highest-to-lowest at the pinned/hovered/latest
-                  date (ticPieRow, same row the companion pie already
-                  computes), per the user's explicit request — largest
-                  holder's Area renders first, landing at the bottom of the
-                  stack. Same slot-index-key mechanism as the Outlays by
-                  Agency chart's own click-to-bottom fix: Recharts does NOT
-                  re-derive stack order from current JSX child order on
-                  every render, it tracks each Area's stack position by
-                  React key at mount time. Re-sorting the .map() output
-                  alone (same keys, new order) would have no visual effect —
-                  confirmed by that earlier fix. Keeping each Area's key
-                  pinned to a stable SLOT index and choosing which country's
-                  dataKey/color that slot renders is the only way to
-                  actually move stack order here too. Hidden countries are
-                  dropped before ranking, same as before. */}
-              {(() => {
-                const visible = TIC_COUNTRY_ORDER.filter((c) => !hiddenTicCountries.has(c));
-                const ranked = ticPieRow
-                  ? [...visible].sort((a, b) => (ticPieRow[b] ?? 0) - (ticPieRow[a] ?? 0))
-                  : visible;
-                return ranked.map((c, slot) => (
-                  <Area
-                    key={`slot-${slot}`}
-                    type="monotone"
-                    dataKey={c}
-                    name={c}
-                    stackId="tic-holdings"
-                    stroke={TIC_COUNTRY_COLOR[c]}
-                    fill={TIC_COUNTRY_COLOR[c]}
-                    strokeWidth={clickedTicKey === c ? 3 : 1}
-                    fillOpacity={clickedTicKey && clickedTicKey !== c ? 0.2 : 0.65}
-                    connectNulls
-                  />
-                ));
-              })()}
-            </ComposedChart>
-          </ResponsiveContainer>
-          {pinnedDateTic && (
-            <div style={{ marginTop: 4 }}>
-              <TicHoldingsTooltipContent active label={pinnedDateTic} ticMerged={ticMerged} hiddenCountries={hiddenTicCountries} />
-            </div>
-          )}
-          </div>
-
-          {/* Companion pie, same convention as every other paired chart+pie
-              in this panel (Composition, Outlays by Agency) — a 14-country
-              line chart was genuinely illegible (the user's own word) with
-              every series drawn at once; the pie makes "who's biggest right
-              now" legible at a glance for whatever date is pinned/hovered,
-              while the line chart above stays useful for trend-over-time on
-              whichever countries are checked visible. */}
-          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", alignItems: "center" }}>
-            <ResponsiveContainer width={180} height={180}>
-              <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                <Pie
-                  data={ticPieData}
-                  dataKey="value"
-                  nameKey="name"
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={70}
-                  innerRadius={36}
-                  paddingAngle={1}
-                  onClick={(entry) => setClickedTicKey((k) => (k === entry.key ? null : entry.key))}
-                  style={{ cursor: "pointer" }}
-                >
-                  {ticPieData.map((entry) => (
-                    <Cell
-                      key={entry.key}
-                      fill={entry.color}
-                      fillOpacity={clickedTicKey && clickedTicKey !== entry.key ? 0.35 : 1}
-                      stroke={clickedTicKey === entry.key ? "#e8ecf4" : undefined}
-                      strokeWidth={clickedTicKey === entry.key ? 2 : undefined}
-                    />
-                  ))}
-                </Pie>
-                <Tooltip
-                  contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
-                  formatter={(v, name) => [fmtTrillions(v), name]}
-                />
-              </PieChart>
-            </ResponsiveContainer>
-            {ticPieRow?.date && (
-              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
-                As of {ticPieRow.date}
-                {ticPieRow.grand_total != null && (
-                  <>
-                    <br />
-                    Grand Total (LT): {fmtTrillions(ticPieRow.grand_total)}
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-          </div>
-              </>
-            );
-          })()}
-          <div className="comex-legend-list comex-legend-list--horizontal">
-            {TIC_COUNTRY_ORDER.map((c) => (
-              <div key={c} className="metals-legend-row">
-                <input
-                  type="checkbox"
-                  className="metals-legend-checkbox"
-                  checked={!hiddenTicCountries.has(c)}
-                  onChange={() =>
-                    setHiddenTicCountries((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(c)) next.delete(c);
-                      else next.add(c);
-                      return next;
-                    })
-                  }
-                  title={hiddenTicCountries.has(c) ? "Show this country" : "Hide this country"}
-                />
-                <button
-                  className={`comex-legend-item legend-btn-row${clickedTicKey === c ? " legend-btn-row--baseline" : ""}`}
-                  onClick={() => setClickedTicKey((k) => (k === c ? null : c))}
-                >
-                  <span className="comex-legend-swatch" style={{ background: TIC_COUNTRY_COLOR[c] }} />
-                  <span>
-                    <strong>{c}</strong>
-                  </span>
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : (
-        <div className="comex-empty">
-          No data available.
-          <div className="comex-empty-note">Requires FRED_API_KEY — hit Refresh on the panel above, or run the refresh endpoint once to seed the database.</div>
-        </div>
-      )}
-      <div className="comex-panel-note" style={{ marginTop: 8 }}>
-        Source: FRED's own ingestion of U.S. Treasury's TIC (Treasury International Capital)
-        data — FORLTTREASPOS* series, monthly, real coverage from 1984-12 for most countries
-        (Belgium/Luxembourg/Cayman Islands from ~2001, a real TIC reporting-category change).
-        Country codes are TIC's own, looked up from Treasury's published country-code table,
-        not derived from ISO codes.
-      </div>
-      </div>
-      )}
-      </details>
+      <TicHoldingsPanel ticCountries={data?.tic_countries} ticGrandTotal={data?.tic_grand_total} />
 
       <details className="collapsible-pane" open={metalsPanelOpen} onToggle={(e) => setMetalsPanelOpen(e.target.open)}>
       <summary className="collapsible-pane-title">

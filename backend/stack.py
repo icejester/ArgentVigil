@@ -6,6 +6,7 @@ spot-price getter — a Python-level import, not a second raw connection or
 an ATTACH DATABASE, per the spec's "a read, not a write" framing."""
 
 import os
+import shutil
 import uuid
 from datetime import datetime, timezone
 
@@ -222,7 +223,15 @@ def get_item(item_id: int) -> dict | None:
 
 def list_items() -> list[dict]:
     with stack_db.get_conn() as conn:
-        rows = conn.execute("SELECT * FROM stack_items ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT stack_items.*, COUNT(stack_item_images.id) AS photo_count
+            FROM stack_items
+            LEFT JOIN stack_item_images ON stack_item_images.stack_item_id = stack_items.id
+            GROUP BY stack_items.id
+            ORDER BY stack_items.created_at DESC
+            """
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -449,6 +458,140 @@ def timeseries() -> list[dict]:
     return rows
 
 
+def _series_key(item: dict) -> str:
+    """Same grouping key stack.series_summary uses — the series name, or
+    the description for un-seriesed items."""
+    return item.get("series") or item.get("description") or ""
+
+
+def value_history(
+    series: list[str] | None = None,
+    metal: str | None = None,
+    form: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict]:
+    """Real weekly melt value vs. cost basis, from the earliest purchase
+    through today — unlike timeseries(), this uses REAL historical daily
+    closes (settlement_price's XAG/XAU_YAHOO_DAILY_CLOSE, back to 2006),
+    not today's spot applied backward. Powers the Stack tab's Cost-basis
+    chart ("plot value as of several dates since purchase", user request
+    2026-09).
+
+    One point per calendar week from the first relevant purchase date to
+    today. At each week: the oz held as of that week (items purchased
+    on-or-before it) x that week's real silver/gold close = real melt
+    value that week; cumulative spend as of that week is the cost-basis
+    line. `melt_value`/`gain` are NULL on any week a needed metal's close
+    is missing (nulls-over-zeros) — no forward-fill, no today's-spot
+    fallback.
+
+    `series` (optional) is a list of series-keys (series name, or
+    description for un-seriesed items) to scope to — the multi-select
+    legend on the Stack Charts pane passes whatever's currently toggled
+    on. Omitted or empty = every series.
+    `metal` (optional, "silver"|"gold") mirrors the tab's All/Silver/Gold
+    dropdown — restricts to items of that metal so the chart reacts to
+    that toggle too. Omitted = both.
+    `form` (optional, one of FORMS) mirrors the tab's Form filter
+    (coin/bar/round/other) the same way `metal` does. Omitted = every form.
+    `date_from`/`date_to` (optional, ISO date strings) restrict to items
+    whose own `purchase_date` falls in that range (inclusive) — the tab's
+    Date filter. Note this scopes WHICH ITEMS count, not which weeks of
+    history are returned: a narrower purchase-date range still produces
+    real weekly history from that narrower set's own earliest purchase
+    through today, same "real weekly history for whatever's in scope"
+    behavior series/metal/form already have.
+    """
+    from datetime import date as _date, timedelta
+
+    items = [i for i in list_items() if i.get("purchase_date")]
+    if series:
+        wanted = set(series)
+        items = [i for i in items if _series_key(i) in wanted]
+    if metal in ("silver", "gold"):
+        items = [i for i in items if i.get("metal") == metal]
+    if form in FORMS:
+        items = [i for i in items if i.get("form") == form]
+    if date_from:
+        items = [i for i in items if i["purchase_date"] >= date_from]
+    if date_to:
+        items = [i for i in items if i["purchase_date"] <= date_to]
+    if not items:
+        return []
+
+    # Real historical daily closes, as {date_str: price}.
+    silver_closes = {
+        r["date"]: r["price"]
+        for r in main_db.get_settlement_price_series("XAG_YAHOO_DAILY_CLOSE")
+        if r["price"] is not None
+    }
+    gold_closes = {
+        r["date"]: r["price"]
+        for r in main_db.get_settlement_price_series("XAU_YAHOO_DAILY_CLOSE")
+        if r["price"] is not None
+    }
+    silver_dates = sorted(silver_closes)
+    gold_dates = sorted(gold_closes)
+
+    def _close_asof(sorted_dates: list[str], closes: dict[str, float], target: str) -> float | None:
+        """Most recent real close on-or-before `target` — the "As-of
+        lookup" nearest-date variant. Returns None if `target` predates
+        all real data."""
+        import bisect
+        idx = bisect.bisect_right(sorted_dates, target)
+        if idx == 0:
+            return None
+        return closes[sorted_dates[idx - 1]]
+
+    # Purchases bucketed by date, plus a running oz/spend accumulator.
+    by_date: dict[str, list[dict]] = {}
+    for item in items:
+        by_date.setdefault(item["purchase_date"], []).append(item)
+
+    first_purchase = min(by_date)
+    today = _date.today()
+    start = _date.fromisoformat(first_purchase)
+    # Anchor the weekly grid on the first purchase date itself, then step
+    # 7 days at a time; always include today as the final point.
+    weeks: list[str] = []
+    cur = start
+    while cur < today:
+        weeks.append(cur.isoformat())
+        cur += timedelta(days=7)
+    if not weeks or weeks[-1] != today.isoformat():
+        weeks.append(today.isoformat())
+
+    sorted_purchase_dates = sorted(by_date)
+    rows: list[dict] = []
+    for week in weeks:
+        cum_silver_oz = 0.0
+        cum_gold_oz = 0.0
+        cum_spend = 0.0
+        for pdate in sorted_purchase_dates:
+            if pdate > week:
+                break
+            for it in by_date[pdate]:
+                s_oz, g_oz = _total_weight_oz(it)
+                cum_silver_oz += s_oz or 0
+                cum_gold_oz += g_oz or 0
+                if it.get("purchase_price") is not None:
+                    cum_spend += it["purchase_price"]
+
+        s_close = _close_asof(silver_dates, silver_closes, week) if cum_silver_oz else 0.0
+        g_close = _close_asof(gold_dates, gold_closes, week) if cum_gold_oz else 0.0
+        # NULL melt if a metal we actually hold has no real close as-of this week.
+        missing = (cum_silver_oz and s_close is None) or (cum_gold_oz and g_close is None)
+        melt = None if missing else cum_silver_oz * (s_close or 0) + cum_gold_oz * (g_close or 0)
+        rows.append({
+            "date": week,
+            "spend": round(cum_spend, 2),
+            "melt_value": None if melt is None else round(melt, 2),
+            "gain": None if melt is None else round(melt - cum_spend, 2),
+        })
+    return rows
+
+
 def portfolio_summary() -> dict:
     spot = _spot_prices()
     items = list_items()
@@ -613,3 +756,46 @@ def delete_photo(photo_id: int):
             raise HTTPException(404, f"No photo with id {photo_id}")
         _delete_image_file(row["file_path"])
         conn.execute("DELETE FROM stack_item_images WHERE id = ?", (photo_id,))
+
+
+def copy_photo_to_items(photo_id: int, target_item_ids: list[int]) -> dict:
+    """Copies an existing photo (e.g. one shared box shot for a bulk lot)
+    onto each target item — a real physical file copy per item, not a
+    shared/reference-counted file, so each item's photo lifecycle stays
+    fully independent (delete_photo on one item's copy never affects any
+    other item's copy, same as if each had been uploaded separately).
+    Skips (doesn't error) a target already at MAX_PHOTOS_PER_ITEM or a
+    target that doesn't exist, and reports both back so the caller can
+    show a real per-item outcome rather than an all-or-nothing failure.
+    """
+    with stack_db.get_conn() as conn:
+        src = conn.execute("SELECT * FROM stack_item_images WHERE id = ?", (photo_id,)).fetchone()
+    if src is None:
+        raise HTTPException(404, f"No photo with id {photo_id}")
+    src_abs_path = os.path.join(stack_db.IMAGES_ROOT, src["file_path"])
+    if not os.path.exists(src_abs_path):
+        raise HTTPException(404, f"Photo {photo_id}'s file is missing on disk")
+
+    ext = os.path.splitext(src["file_path"])[1]
+    copied, skipped_full, skipped_missing = [], [], []
+    for item_id in target_item_ids:
+        if get_item(item_id) is None:
+            skipped_missing.append(item_id)
+            continue
+        if len(list_images(item_id)) >= MAX_PHOTOS_PER_ITEM:
+            skipped_full.append(item_id)
+            continue
+
+        filename = f"{uuid.uuid4().hex}{ext}"
+        item_dir = os.path.join(stack_db.IMAGES_ROOT, str(item_id))
+        os.makedirs(item_dir, exist_ok=True)
+        shutil.copyfile(src_abs_path, os.path.join(item_dir, filename))
+        relative_path = f"{item_id}/{filename}"
+        with stack_db.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO stack_item_images (stack_item_id, file_path, caption) VALUES (?, ?, ?)",
+                (item_id, relative_path, src["caption"]),
+            )
+        copied.append(item_id)
+
+    return {"copied": copied, "skipped_full": skipped_full, "skipped_missing": skipped_missing}

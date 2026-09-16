@@ -536,7 +536,11 @@ function AssembledInput({ assembledPrompt }) {
 function TurnComposer({ sessionId, personas, currentMemoryMode, onSent }) {
   const [content, setContent] = useState("");
   const [backend, setBackend] = useState("forge");
-  const [persona, setPersona] = useState("word_count_v1");
+  // Init to the first persona the backend actually offers rather than a
+  // hardcoded name — word_count_v1 is no longer the default and could be
+  // removed entirely (list_personas() is dynamic). personaOptions below
+  // still guards the render if personas hasn't loaded yet.
+  const [persona, setPersona] = useState(personas[0] ?? "");
   const [checkedBlocks, setCheckedBlocks] = useState([]);
   const [freeformText, setFreeformText] = useState("");
   const [memoryMode, setMemoryMode] = useState(currentMemoryMode || "accumulating");
@@ -552,6 +556,22 @@ function TurnComposer({ sessionId, personas, currentMemoryMode, onSent }) {
     );
   }
 
+  // The turn payload the backend needs — shared verbatim by the live
+  // preview (POST /preview) and the actual send (POST /messages), so the
+  // one client-side prompt-shape rule ("freeform_text only applies when
+  // the freeform block is checked") lives in exactly one place. The send
+  // adds `backend` on top; everything else is identical, which is the
+  // point of the preview.
+  function buildTurnPayload() {
+    return {
+      persona,
+      context_blocks: checkedBlocks,
+      memory_mode: memoryMode,
+      freeform_text: checkedBlocks.includes("freeform") ? freeformText : undefined,
+      content,
+    };
+  }
+
   // Live, exact preview (spec 3.5's "non-editable preview of the fully
   // assembled payload... shown as plain structured text before you send")
   // — only fetched while the preview panel is open, and refetched whenever
@@ -559,13 +579,7 @@ function TurnComposer({ sessionId, personas, currentMemoryMode, onSent }) {
   useEffect(() => {
     if (!previewOpen) return;
     let cancelled = false;
-    postJSON(`/api/catcor/research/sessions/${sessionId}/preview`, {
-      persona,
-      context_blocks: checkedBlocks,
-      memory_mode: memoryMode,
-      freeform_text: checkedBlocks.includes("freeform") ? freeformText : undefined,
-      content,
-    })
+    postJSON(`/api/catcor/research/sessions/${sessionId}/preview`, buildTurnPayload())
       .then((data) => {
         if (!cancelled) {
           setPreview(data);
@@ -588,12 +602,9 @@ function TurnComposer({ sessionId, personas, currentMemoryMode, onSent }) {
     setError(null);
     try {
       await postJSON(`/api/catcor/research/sessions/${sessionId}/messages`, {
-        content: text,
+        ...buildTurnPayload(),
+        content: text, // trimmed
         backend,
-        persona,
-        context_blocks: checkedBlocks,
-        memory_mode: memoryMode,
-        freeform_text: checkedBlocks.includes("freeform") ? freeformText : undefined,
       });
       setContent("");
       onSent();

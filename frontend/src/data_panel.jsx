@@ -409,7 +409,7 @@ export default function DataPanel() {
           Every table AV persists to <code>runtime/argentvigil.db</code>, where its data
           comes from, and how often it's fetched. Editorial content (this note, per-field
           descriptions, curl examples) is hand-maintained in{" "}
-          <code>frontend/src/data_editorial.js</code> — see <code>backend/db.py</code> for
+          <code>frontend/src/data_editorial.json</code> — see <code>backend/db.py</code> for
           the live schema and <code>backend/sources.py</code> for the canonical cadence/
           rate-limit registry each card's operational rows below are read from.
         </div>
