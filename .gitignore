@@ -224,10 +224,8 @@ TDM/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
-*SPEC.MD
-*SPEC.md
-*spec.md
 *-spec.md
+*-plan.md
 
 # macOS
 .DS_Store
