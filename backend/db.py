@@ -9,7 +9,14 @@ from .price_instruments import GC_F_WEEKLY, GLD_CLOSE, SESSION_DAILY, SI_F_WEEKL
 from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_REPO_ROOT, "runtime", "argentvigil.db")
+# AV_RUNTIME_DIR overrides where the SQLite file lives — defaults to
+# runtime/ unchanged (today's behavior) so nothing breaks for anyone not
+# setting it. Added 2026-09-16 for the prod/test/backup data split under
+# runtime/data/{prod,test,backup}/ — vigil.sh sets this to runtime/data/prod
+# when starting prod; docker-compose.yml's api service can set it to
+# runtime/data/test the same way.
+_RUNTIME_DIR = os.environ.get("AV_RUNTIME_DIR") or os.path.join(_REPO_ROOT, "runtime")
+DB_PATH = os.path.join(_RUNTIME_DIR, "argentvigil.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # sqlite3.connect does not create parent dirs
 
 DDL = """

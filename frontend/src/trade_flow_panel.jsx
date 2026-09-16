@@ -15,6 +15,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { TRADE_FLOW_COLORS } from "./palette";
+import { apiFetch } from "./api_client";
 
 // Country-mix and net-flow are silver-only; the comparator is the one
 // sanctioned place gold appears (CLAUDE.md: HS 7108/gold gets no
@@ -273,11 +274,11 @@ export default function TradeFlowPanel() {
 
   useEffect(() => {
     Promise.all([
-      fetch("/api/census-trade/db?metal=XAG").then((r) => {
+      apiFetch("/api/census-trade/db?metal=XAG").then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       }),
-      fetch("/api/census-trade/db?metal=XAU").then((r) => {
+      apiFetch("/api/census-trade/db?metal=XAU").then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       }),

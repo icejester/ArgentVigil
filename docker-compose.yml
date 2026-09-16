@@ -1,0 +1,85 @@
+# ArgentVigil containerized deploy (api-split-implementation-plan.md
+# Story 1.3). Two services for now — api (FastAPI + the tiered background
+# scheduler, still in-process per Stage 1; the collector split is Stage 2)
+# and web (nginx serving the built frontend + proxying /stack_images to
+# api). `collector` joins in Stage 2 (Story 2.2), sharing the same
+# `runtime` mount.
+#
+# This is the containerized-deploy path — local development keeps using
+# `utils/vigil.sh start` (Vite dev server + uvicorn directly on the host,
+# no Docker) per Story 1.6. Both are expected to keep working, for
+# different purposes: vigil.sh is prod (host ports 8000/5173), this
+# compose stack is "Test AV" — a disposable test environment run against
+# a snapshot of prod's data, deliberately on its own ports (6977 api /
+# 6978 web, at the user's explicit request) so both can run at the same
+# time with zero manual port juggling.
+#
+# Data separation (2026-09-16, at the user's explicit request): vigil.sh's
+# native backend is prod — it owns runtime/data/prod/{argentvigil.db,
+# stack.db,stack_images/} continuously (see backend/db.py's AV_RUNTIME_DIR
+# override + utils/vigil.sh), and this compose stack must NEVER write
+# there. api instead bind-mounts runtime/data/test/, a snapshot directory
+# populated by `utils/refresh-test-db.sh` (copies prod's DB files +
+# stack_images/ into runtime/data/test/ on demand — "a copy of now," per
+# the user's own framing, refreshed by hand for the moment, not on an
+# automatic cadence). runtime/data/test/ is created empty by
+# refresh-test-db.sh if it doesn't exist; `docker compose up` before ever
+# running that script will boot api against an empty DB (same "No CoT
+# data persisted yet" behavior documented under Tab: CoT) rather than
+# touching prod — that's expected, not a bug, run the refresh script
+# first.
+#
+# HOST_RUNTIME_DIR makes the bind-mount source configurable rather than
+# hardcoded to runtime/data/test — override it (env var or .env file) to
+# point this stack at a different snapshot directory; defaults to
+# runtime/data/test if unset.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "6977:8000"
+    environment:
+      - CORS_ALLOWED_ORIGINS=http://localhost:6978
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - GAPI_API_KEY=${GAPI_API_KEY:-}
+      - CENSUS_API_KEY=${CENSUS_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AI_BACKEND=${AI_BACKEND:-forge}
+      # Inside the container this is always /app/runtime (the bind-mount
+      # target below) — set explicitly rather than relying on
+      # backend/db.py's own default so the container's behavior doesn't
+      # silently change if that default ever does.
+      - AV_RUNTIME_DIR=/app/runtime
+    volumes:
+      # Bind-mounts the TEST snapshot directory, never prod's data
+      # directly — see the file-level comment above for why. Confirmed
+      # live 2026-09-16: an earlier version of this file bind-mounted
+      # ./runtime directly, and the container's own background scheduler
+      # wrote into the real prod DB for ~10 minutes before this was caught
+      # (source_health rows confirmed the container's scheduler ticks
+      # landed in argentvigil.db) — no corruption resulted (a post-hoc
+      # `PRAGMA integrity_check` came back "ok"), but the exposure was
+      # real and is the reason this mount points at a dedicated test
+      # snapshot dir instead, now configurable via HOST_RUNTIME_DIR.
+      - ${HOST_RUNTIME_DIR:-./runtime/data/test}:/app/runtime
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: "http://localhost:6977"
+        # Stamped into the built bundle so the UI can show a visual
+        # "you are in Test AV" indicator (purple health dot, see
+        # App.jsx/HeaderHealthDot) that survives independent of which
+        # port you happen to be looking at. vigil.sh's prod frontend has
+        # no VITE_AV_ENV set at all, which App.jsx treats as prod
+        # (absence = prod, matching every other VITE_* var's
+        # "unset = today's default behavior" convention in this repo).
+        VITE_AV_ENV: "test"
+    ports:
+      - "6978:80"
+    depends_on:
+      - api

@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useReducer } from "react";
 import ChartStaleness from "./chart_staleness";
+import { apiFetch } from "./api_client";
 
 // Client-side sort over an already-fetched array — same shape as
 // stack_tracker.jsx's own useSort/SortTh (this repo's established pattern
@@ -192,7 +193,7 @@ export default function SanctionsPanel() {
   };
 
   useEffect(() => {
-    fetch("/api/ofac/db")
+    apiFetch("/api/ofac/db")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((json) => setRows(json.data ?? []))
       .catch((e) => setError(e.message));

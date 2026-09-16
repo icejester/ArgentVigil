@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { apiFetch } from "./api_client";
 
 // Backend owns the actual refresh cadence (two tiers: fast for spot prices —
 // feeds the CoT panel's Paper Leverage cards — and slow for every other
@@ -31,7 +32,7 @@ export default function RefreshControls() {
   const [forceResult, setForceResult] = useState(null); // {at, succeeded, failed} | {at, error}
 
   useEffect(() => {
-    fetch("/api/refresh/settings")
+    apiFetch("/api/refresh/settings")
       .then((r) => r.json())
       .then((j) => setSettings(j.data ?? null))
       .catch(() => {});
@@ -40,7 +41,7 @@ export default function RefreshControls() {
   async function updateSetting(key, value) {
     setSaving(true);
     try {
-      const r = await fetch("/api/refresh/settings", {
+      const r = await apiFetch("/api/refresh/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ [key]: value }),
@@ -57,7 +58,7 @@ export default function RefreshControls() {
   async function forceUpdate() {
     setForcing(true);
     try {
-      const r = await fetch("/api/refresh/force", { method: "POST" });
+      const r = await apiFetch("/api/refresh/force", { method: "POST" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
       setForceResult({ at: Date.now(), succeeded: j.succeeded, failed: j.failed });

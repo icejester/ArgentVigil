@@ -78,7 +78,7 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
 ### Housekeeping
 
 - **Database**: one shared SQLite file, `runtime/argentvigil.db` (gitignored), owned by `backend/db.py`. There is no per-tab or per-layer database.
-- **Start / stop** (background daemons, PID-tracked, logs in `runtime/logs/`):
+- **Start / stop** (background daemons, PID-tracked, logs in `runtime/vigil/logs/`):
 
   ```bash
   bash utils/vigil.sh start            # venv bootstrap + backend :8000 + frontend :5173

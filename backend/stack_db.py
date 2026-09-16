@@ -12,10 +12,14 @@ from contextlib import contextmanager
 # tables — no NON_SOURCE_TABLES entry needed, confirmed by
 # tests/test_stack.py's own assertion of that fact.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_REPO_ROOT, "runtime", "stack.db")
+# AV_RUNTIME_DIR — same override as backend/db.py's DB_PATH, kept in sync
+# deliberately (both files read the identical env var) so a single env
+# setting relocates argentvigil.db, stack.db, and stack_images/ together.
+_RUNTIME_DIR = os.environ.get("AV_RUNTIME_DIR") or os.path.join(_REPO_ROOT, "runtime")
+DB_PATH = os.path.join(_RUNTIME_DIR, "stack.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # sqlite3.connect does not create parent dirs
 
-IMAGES_ROOT = os.path.join(_REPO_ROOT, "runtime", "stack_images")
+IMAGES_ROOT = os.path.join(_RUNTIME_DIR, "stack_images")
 os.makedirs(IMAGES_ROOT, exist_ok=True)
 
 DDL = """

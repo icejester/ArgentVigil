@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Process manager for ArgentVigil's backend/frontend as background daemons —
 # unlike dev.sh (foreground, Ctrl-C to stop, --reload), this detaches both
-# processes, tracks them by PID file, and redirects logs to runtime/logs/.
+# processes, tracks them by PID file, and redirects logs to
+# runtime/vigil/logs/.
 #
 # Usage: vigil.sh <start|stop|restart|status> [backend|frontend|all]
 #        vigil.sh test [pytest args...]
@@ -18,11 +19,30 @@
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$REPO/.venv"
-LOG_DIR="$REPO/runtime/logs"
-PID_DIR="$REPO/runtime/pids"
+# runtime/vigil/{logs,pids}/ — vigil.sh's OWN process-management state
+# (which native process is running, where its stdout goes), not
+# environment/app data. Deliberately not under runtime/data/ alongside
+# {prod,test,backup}/ — there's exactly one vigil.sh instance on this
+# machine regardless of which data dir a given backend run points at, so
+# these aren't environment-scoped the way argentvigil.db/stack.db are.
+# Renamed 2026-09-16 (were bare runtime/logs, runtime/pids) after the user
+# flagged that sitting at the runtime/ root, right next to data/, made
+# them look like they should be part of the prod/test split when they're
+# not — containers don't write here at all (confirmed live: the
+# containerized api logs to stdout, captured by `docker compose logs`,
+# and has no logs/pids concept of its own).
+LOG_DIR="$REPO/runtime/vigil/logs"
+PID_DIR="$REPO/runtime/vigil/pids"
 
 BACKEND_PORT=8000
 FRONTEND_PORT=5173
+# Prod's data lives under runtime/data/prod/ (argentvigil.db, stack.db,
+# stack_images/), not bare runtime/ — see backend/db.py's AV_RUNTIME_DIR
+# override (2026-09-16 prod/test/backup data split, at the user's explicit
+# request). runtime/data/test/ backs the containerized vigil-docker.sh
+# stack instead; runtime/data/backup/ is a manual-copy destination only,
+# nothing reads from it automatically.
+PROD_RUNTIME_DIR="$REPO/runtime/data/prod"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -99,9 +119,10 @@ start_backend() {
 
   ensure_venv
 
-  log "starting backend on :$BACKEND_PORT (log: $(log_file backend))"
+  log "starting backend on :$BACKEND_PORT (log: $(log_file backend), data: $PROD_RUNTIME_DIR)"
   (
     cd "$REPO" && \
+    export AV_RUNTIME_DIR="$PROD_RUNTIME_DIR" && \
     exec uvicorn backend.main:app --port "$BACKEND_PORT" \
       >> "$(log_file backend)" 2>&1
   ) &
@@ -198,6 +219,18 @@ run_tests() {
       ;;
   esac
   ensure_venv
+  # Real bug found live 2026-09-16: importing backend.stack_db (transitively,
+  # via backend.main) with AV_RUNTIME_DIR unset recreates runtime/stack_images/
+  # (and would recreate runtime/stack.db on first write) at import time,
+  # regardless of what any test fixture later monkeypatches — module-level
+  # os.makedirs side effects run before pytest ever gets a chance to
+  # intervene. tests/conftest.py's tmp_db/tmp_stack_db fixtures correctly
+  # redirect DB_PATH for actual test I/O, but they can't undo an import-time
+  # os.makedirs that already fired against the real runtime/ tree. Pointing
+  # AV_RUNTIME_DIR at a disposable dir before pytest even starts means that
+  # side effect, if it fires, lands somewhere harmless instead of littering
+  # prod's real runtime/ directory.
+  export AV_RUNTIME_DIR="$REPO/runtime/.pytest-import-scratch"
   cd "$REPO" && exec python -m pytest -q "$@"
 }
 

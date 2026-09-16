@@ -15,6 +15,7 @@ import { nearestRowDate } from "./date_utils";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
 import { xTicks, round1, RATIO_COLOR } from "./money_supply_shared";
+import { apiFetch } from "./api_client";
 
 // Extracted from money_supply.jsx (cleanup-spec.md Stage 3.5). Treasury
 // Auctions — bid-to-cover by security type + buyer-category mix per real
@@ -155,7 +156,7 @@ export default function TreasuryAuctionsPanel() {
   const { pinnedDate, togglePinnedDate } = usePinnedDate();
 
   useEffect(() => {
-    fetch("/api/treasury-auctions/db")
+    apiFetch("/api/treasury-auctions/db")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((json) => setAuctionsData(json.data ?? null))
       .catch(() => setAuctionsData(null));

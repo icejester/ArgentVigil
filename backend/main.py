@@ -452,10 +452,17 @@ async def _refresh_slow_tier() -> dict:
 
 app = FastAPI(lifespan=lifespan)
 
+_cors_allowed_origins_env = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
+CORS_ALLOWED_ORIGINS = (
+    [o.strip() for o in _cors_allowed_origins_env.split(",") if o.strip()]
+    if _cors_allowed_origins_env
+    else ["http://localhost:5173"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -4026,13 +4033,12 @@ async def stack_links_delete(link_id: int):
 
 
 # Photos served straight back by relative path — a LAN-only tool, no signed
-# URLs needed. Mounted before the frontend-dist catch-all below.
+# URLs needed.
 os.makedirs(stack_db.IMAGES_ROOT, exist_ok=True)
 app.mount("/stack_images", StaticFiles(directory=stack_db.IMAGES_ROOT), name="stack_images")
 
-
-# Serve built frontend; keep last so API routes take priority
-try:
-    app.mount("/", StaticFiles(directory=os.path.join(_REPO_ROOT, "frontend", "dist"), html=True), name="static")
-except Exception:
-    pass
+# No frontend-dist StaticFiles mount here (api-split-implementation-plan.md
+# Story 1.5) — the frontend now lives entirely behind its own origin (Vite
+# dev server locally, nginx in the containerized deploy per Story 1.3/1.4).
+# api:8000/ has no route for "/" anymore; hitting it directly returns a 404,
+# which is expected and correct.

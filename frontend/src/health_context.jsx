@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
+import { apiFetch } from "./api_client";
 
 // Single shared poll of /api/health/db, consumed by HeaderHealthDot AND
 // every per-sub-panel ChartStaleness badge across every tab — avoids N
@@ -15,7 +16,7 @@ export function HealthProvider({ children }) {
   const [sources, setSources] = useState({});
 
   const refresh = () => {
-    fetch("/api/health/db")
+    apiFetch("/api/health/db")
       .then((r) => r.json())
       .then((j) => setSources(j.sources ?? {}))
       .catch(() => {});

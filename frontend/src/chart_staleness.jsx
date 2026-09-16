@@ -2,6 +2,7 @@ import { useState } from "react";
 import { timeAgo } from "./data_panel";
 import { useHealthRows } from "./health_context";
 import { SOURCE_DEFINITIONS } from "./source_definitions";
+import { apiFetch } from "./api_client";
 
 // Three-tier status specific to this glyph — deliberately NOT the same
 // ok/stale/error computeStatus already ships for the Data tab/HeaderHealthDot
@@ -84,7 +85,7 @@ export default function ChartStaleness({ sourceKey, label, detail }) {
     e.stopPropagation();
     if (refreshing) return;
     setRefreshing(true);
-    Promise.all(keys.map((k) => fetch(`/api/health/refresh/${k}`, { method: "POST" })))
+    Promise.all(keys.map((k) => apiFetch(`/api/health/refresh/${k}`, { method: "POST" })))
       .then(refresh)
       .finally(() => setRefreshing(false));
   }

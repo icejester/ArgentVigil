@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { apiFetch } from "./api_client";
 
 // Research Pane, per catcor-events-spec.md. A workbench for working a
 // single claim by hand: browse/resume past sessions, assemble each turn
@@ -29,7 +30,7 @@ function fmtDateTime(iso) {
 }
 
 async function postJSON(url, body) {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -42,7 +43,7 @@ async function postJSON(url, body) {
 }
 
 async function deleteJSON(url) {
-  const res = await fetch(url, { method: "DELETE" });
+  const res = await apiFetch(url, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok || !data.success) {
     throw new Error(data.detail || `request to ${url} failed`);
@@ -51,7 +52,7 @@ async function deleteJSON(url) {
 }
 
 async function getJSON(url) {
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   const data = await res.json();
   if (!res.ok || !data.success) {
     throw new Error(data.detail || `request to ${url} failed`);
@@ -885,7 +886,7 @@ function ForgeSessionsPlaceholder() {
   const [detail, setDetail] = useState(null);
 
   useEffect(() => {
-    fetch("/api/catcor/research/forge-sessions")
+    apiFetch("/api/catcor/research/forge-sessions")
       .then((r) => r.json())
       .then(setDetail)
       .catch(() => {});
