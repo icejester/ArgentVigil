@@ -2,10 +2,12 @@
 
 Python / FastAPI service layer, split into two processes:
 **`api`** (serves every route, no scheduler by default in the containerized deploy) and
-**`collector`** (the background fetch scheduler, no HTTP server). Locally via `vigil.sh`,
-both still run in one process for a fast inner loop (`RUN_COLLECTOR_IN_PROCESS=true`,
-the default) — day to day, run it via `bash utils/vigil.sh start` / `restart backend`;
-always use `.venv`, never bare `python3`.
+**`collector`** (the background fetch scheduler, no HTTP server). Locally, via
+`utils/vigil-native.sh` (bare host processes, no Docker), both still run in one process
+for a fast inner loop (`RUN_COLLECTOR_IN_PROCESS=true`, the default) — day to day, run it
+via `bash utils/vigil-native.sh start` / `restart backend`; always use `.venv`, never bare
+`python3`. Prod itself, and every other environment, runs the real two-process split via
+`bash utils/vigil.sh up <env>` (see `environments/README.md`).
 
 This is an orientation doc. The durable, exhaustive record (per-route behavior, data
 quirks, bug history) is the repo-root `CLAUDE.md`.
@@ -15,7 +17,7 @@ quirks, bug history) is the repo-root `CLAUDE.md`.
 | Module | Role |
 | --- | --- |
 | `main.py` | FastAPI app: every route (declared on one `api_router`, mounted at both `/api/v1` — the real prefix — and a temporary bare `/api` alias), refresh/health endpoints, CORS (`CORS_ALLOWED_ORIGINS` env var, no wildcard). Has no `/` route and never serves the built frontend — that's `web`'s (nginx's) job in the containerized deploy, Vite's in local dev. Calls `collector.register_sources()` once at module-import time so `api`'s own health/data-source routes see a populated registry regardless of whether a separate `collector` process has run. |
-| `collector.py` | The scheduler (`_schedule_loop`) + every `_fetch_and_persist_*` function + `register_sources()` (the canonical `sources.register(...)` calls). Runnable standalone: `python -m backend.collector`, no FastAPI import. `main.py`'s `lifespan` runs the same scheduler in-process by default (`RUN_COLLECTOR_IN_PROCESS=true`, for `vigil.sh`/local dev); the containerized deploy runs `collector` as its own compose service with that flag `false`, and `main.py` still calls `register_sources()` independently at import time since `api`'s own routes need the registry populated in `api`'s process too. |
+| `collector.py` | The scheduler (`_schedule_loop`) + every `_fetch_and_persist_*` function + `register_sources()` (the canonical `sources.register(...)` calls). Runnable standalone: `python -m backend.collector`, no FastAPI import. `main.py`'s `lifespan` runs the same scheduler in-process by default (`RUN_COLLECTOR_IN_PROCESS=true`, for `vigil-native.sh`/local dev); the containerized deploy runs `collector` as its own compose service with that flag `false`, and `main.py` still calls `register_sources()` independently at import time since `api`'s own routes need the registry populated in `api`'s process too. |
 | `models.py` | Pydantic response models (`response_model=` on routes) — Stack/OFAC/CoT route groups so far, written against each route's real observed return shape. Money Supply/Inventory/CATCOR/Research are a natural follow-on, not yet done. |
 | `db.py` | All SQLite persistence (stdlib `sqlite3`, no ORM). Owns `runtime/argentvigil.db` (or `AV_RUNTIME_DIR`-relative, see below) — the one shared database, opened in WAL mode (`PRAGMA journal_mode=WAL` on every `get_conn()`) since `api` and `collector` are genuinely separate processes touching it concurrently in the containerized deploy. Importable without the venv (no fastapi/httpx). |
 | `sources.py` | Canonical data-source registry: one `SourceDefinition` per upstream (cadence, rate limit, table ownership, env requirements), populated by `collector.register_sources()`. The scheduler, health routes, and Data tab all read from it. |
@@ -40,9 +42,9 @@ quirks, bug history) is the repo-root `CLAUDE.md`.
 
 ## Running as two processes vs. one
 
-- **Local dev (`vigil.sh`)**: one `uvicorn backend.main:app` process, `RUN_COLLECTOR_IN_PROCESS` unset/`true` — `main.py`'s `lifespan` starts the scheduler itself, same as before the split. Fastest inner loop, debugger-attachable.
-- **Containerized deploy (`docker compose` / `vigil-docker.sh`)**: `api` (uvicorn, `RUN_COLLECTOR_IN_PROCESS=false`) and `collector` (`python -m backend.collector`) are separate containers sharing the same bind-mounted `runtime/` data directory. Killing/restarting either doesn't break the other — `api` serves stale-but-valid `/db` reads if `collector` is down; `collector` keeps fetching if `api` is down.
-- `AV_RUNTIME_DIR` env var (read by `db.py`/`stack_db.py`) selects which `runtime/data/{prod,test}` directory a given process reads/writes — set by `vigil.sh` (prod) and `docker-compose.yml` (Test AV) respectively; unset defaults to bare `runtime/`.
+- **Local dev (`vigil-native.sh`)**: one `uvicorn backend.main:app` process, `RUN_COLLECTOR_IN_PROCESS` unset/`true` — `main.py`'s `lifespan` starts the scheduler itself, same as before the split. Fastest inner loop, debugger-attachable. Bare host process, no Docker.
+- **Containerized deploy (`docker compose` / `vigil.sh`, any environment including `prod`)**: `api` (uvicorn, `RUN_COLLECTOR_IN_PROCESS=false`) and `collector` (`python -m backend.collector`) are separate containers sharing the same bind-mounted `runtime/data/<env>/` directory. Killing/restarting either doesn't break the other — `api` serves stale-but-valid `/db` reads if `collector` is down; `collector` keeps fetching if `api` is down. A `frozen`-mode environment (`UPDATE_MODE=frozen`, `environments/README.md`) skips starting `collector` entirely.
+- `AV_RUNTIME_DIR` env var (read by `db.py`/`stack_db.py`) selects which directory a given process reads/writes — `vigil-native.sh` sets it to `runtime/data/prod`; each containerized environment's `docker-compose.yml` service sets it to the fixed in-container path `/app/runtime`, which is bind-mounted from that environment's own `HOST_RUNTIME_DIR` (`environments/<name>.env`, e.g. `runtime/data/prod` for the `prod` environment, `runtime/data/test` for `test`, etc. — see `environments/README.md`); unset defaults to bare `runtime/`.
 
 ## Schema reference
 
@@ -61,6 +63,6 @@ guess — an honest gap, not silently omitted.
 
 - `pipeline/` (sibling, not in this package): stdlib-only CoT fetch/compute, run manually or via cron (`python3 pipeline/run.py`), persists through `backend/db.py`.
 - `seed_data/`: hand-maintained static content (event calendar seed, Silver Institute balance, CME rulebook PDFs).
-- `runtime/`: gitignored generated state — the database(s) and (for `vigil.sh`) logs.
+- `runtime/`: gitignored generated state — each environment's database(s) under `runtime/data/<name>/`, plus (for `vigil-native.sh` specifically) its own process logs/PIDs under `runtime/vigil/`.
 - `tests/`: pytest + respx; never touches the real DB or live upstreams. Run with `bash utils/vigil.sh test`.
 </content>

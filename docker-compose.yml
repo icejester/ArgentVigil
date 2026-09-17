@@ -8,43 +8,71 @@
 # runtime bind-mount so collector's writes are immediately visible to
 # api's /db reads.
 #
-# This is the containerized-deploy path — local development keeps using
-# `utils/vigil.sh start` (Vite dev server + uvicorn directly on the host,
-# no Docker) per Story 1.6. Both are expected to keep working, for
-# different purposes: vigil.sh is prod (host ports 8000/5173), this
-# compose stack is "Test AV" — a disposable test environment run against
-# a snapshot of prod's data, deliberately on its own ports (6977 api /
-# 6978 web, at the user's explicit request) so both can run at the same
-# time with zero manual port juggling.
+# This is the containerized-deploy path, and — as of the prod cutover — the
+# primary one: prod itself now runs as the "prod" named environment here
+# (environments/prod.env), brought up via `utils/vigil.sh up prod` (`vigil.sh`
+# used to mean bare-process local dev; that script is now `vigil-native.sh`,
+# kept only as a faster/no-Docker local inner loop — see its own header).
+# This compose stack runs N disposable-or-persistent named environments
+# (utils/vigil.sh up <env>) side by side, each on its own ports, with zero
+# manual port juggling.
 #
-# Data separation (2026-09-16, at the user's explicit request): vigil.sh's
-# native backend is prod — it owns runtime/data/prod/{argentvigil.db,
-# stack.db,stack_images/} continuously (see backend/db.py's AV_RUNTIME_DIR
-# override + utils/vigil.sh), and this compose stack must NEVER write
-# there. api instead bind-mounts runtime/data/test/, a snapshot directory
-# populated by `utils/refresh-test-db.sh` (copies prod's DB files +
-# stack_images/ into runtime/data/test/ on demand — "a copy of now," per
-# the user's own framing, refreshed by hand for the moment, not on an
-# automatic cadence). runtime/data/test/ is created empty by
-# refresh-test-db.sh if it doesn't exist; `docker compose up` before ever
-# running that script will boot api against an empty DB (same "No CoT
-# data persisted yet" behavior documented under Tab: CoT) rather than
-# touching prod — that's expected, not a bug, run the refresh script
-# first.
+# Multi-environment support (environments/*.env — see that directory's own
+# README): every value that used to be hardcoded to "Test AV" (ports,
+# HOST_RUNTIME_DIR, AI_BACKEND, VITE_AV_ENV) is a ${VAR:-default}
+# substitution, sourced from one environments/<name>.env file per
+# environment via `utils/vigil.sh`'s --env-file + --project-name flags.
+# Never invoke `docker compose` directly against this file without
+# --env-file — the bare defaults below all still point at "test" so a
+# stray direct invocation is safe (lands on the test snapshot dir, test
+# ports) rather than silently touching something else, but `vigil.sh` is
+# the supported entrypoint. AV_ENV_NAME also stitches into each
+# container's name (av-<env>-api etc.) so `docker ps`/Colima/Console.app
+# show which environment a given container belongs to at a glance, on top
+# of compose's own project-name isolation (-p av-<env>).
 #
-# HOST_RUNTIME_DIR makes the bind-mount source configurable rather than
-# hardcoded to runtime/data/test — override it (env var or .env file) to
-# point this stack at a different snapshot directory; defaults to
-# runtime/data/test if unset.
+# Data separation (2026-09-16, at the user's explicit request, predating
+# the prod cutover — see environments/prod.env's own comment for the
+# current state): each environment bind-mounts its own HOST_RUNTIME_DIR
+# (environments/<name>.env), independent of every other environment's data
+# — including "prod", which now bind-mounts the same runtime/data/prod/
+# {argentvigil.db,stack.db,stack_images/} that vigil-native.sh's bare
+# backend used to own exclusively. `vigil-native.sh` and the "prod" compose
+# environment must never run against that directory at the same time —
+# `vigil.sh up prod` checks for a running vigil-native.sh backend and
+# refuses if found (see that script's `refuse_if_vigil_native_running`),
+# but there's no check in the other direction yet. A directory that
+# doesn't exist yet is created empty by Docker's bind-mount on first `up`
+# — booting a brand-new environment before ever seeding it will show the
+# same "No CoT data persisted yet" behavior documented under Tab: CoT
+# rather than touching another environment's data — that's expected, not
+# a bug.
+#
+# Two independent per-environment axes (environments/*.env — see that
+# directory's own README), neither enforced by this file directly:
+#   REFRESH_POLICY (snapshot | protected) — whether utils/refresh-test-db.sh
+#     is allowed to overwrite this environment's HOST_RUNTIME_DIR from prod.
+#     Purely a script-level guard; docker-compose.yml doesn't read this var.
+#   UPDATE_MODE (live | frozen) — whether the collector service (below)
+#     actually starts. `collector` carries `profiles: [live]`, so it's only
+#     included when the invoking `docker compose ... up` passes
+#     `--profile live` — utils/vigil.sh resolves UPDATE_MODE from the
+#     environment file and adds that flag itself; a bare/direct `docker
+#     compose up` (no --profile) starts api+web only, i.e. behaves as
+#     "frozen" by default. `frozen` means: this environment only ever serves
+#     whatever's already in its DB — no upstream fetches at all until
+#     UPDATE_MODE is flipped back to `live` and the environment is brought
+#     up again.
 services:
   api:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    container_name: av-${AV_ENV_NAME:-test}-api
     ports:
-      - "6977:8000"
+      - "${API_PORT:-6977}:8000"
     environment:
-      - CORS_ALLOWED_ORIGINS=http://localhost:6978
+      - CORS_ALLOWED_ORIGINS=http://localhost:${WEB_PORT:-6978}
       - FRED_API_KEY=${FRED_API_KEY:-}
       - GAPI_API_KEY=${GAPI_API_KEY:-}
       - CENSUS_API_KEY=${CENSUS_API_KEY:-}
@@ -60,7 +88,7 @@ services:
       # twice (once from each process) against the same DB.
       - RUN_COLLECTOR_IN_PROCESS=false
     volumes:
-      # Bind-mounts the TEST snapshot directory, never prod's data
+      # Bind-mounts THIS ENVIRONMENT's own runtime dir, never prod's data
       # directly — see the file-level comment above for why. Confirmed
       # live 2026-09-16: an earlier version of this file bind-mounted
       # ./runtime directly, and the container's own background scheduler
@@ -68,14 +96,21 @@ services:
       # (source_health rows confirmed the container's scheduler ticks
       # landed in argentvigil.db) — no corruption resulted (a post-hoc
       # `PRAGMA integrity_check` came back "ok"), but the exposure was
-      # real and is the reason this mount points at a dedicated test
-      # snapshot dir instead, now configurable via HOST_RUNTIME_DIR.
+      # real and is the reason this mount points at a dedicated per-
+      # environment dir instead, configurable via HOST_RUNTIME_DIR.
       - ${HOST_RUNTIME_DIR:-./runtime/data/test}:/app/runtime
 
   collector:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    container_name: av-${AV_ENV_NAME:-test}-collector
+    # Only included when `up`/`down` is invoked with --profile live —
+    # see the UPDATE_MODE explanation in the file-level comment above.
+    # utils/vigil.sh adds this flag itself when the resolved
+    # environment's UPDATE_MODE=live; omitting the flag (or a bare direct
+    # `docker compose up`) means this service is never created at all.
+    profiles: ["live"]
     entrypoint: ["python", "-m", "backend.collector"]
     environment:
       - FRED_API_KEY=${FRED_API_KEY:-}
@@ -85,8 +120,8 @@ services:
       - AI_BACKEND=${AI_BACKEND:-forge}
       - AV_RUNTIME_DIR=/app/runtime
     volumes:
-      # Same bind-mount target as api, same test-snapshot source — this is
-      # what makes collector's writes visible to api's reads and vice
+      # Same bind-mount target as api, same per-environment source — this
+      # is what makes collector's writes visible to api's reads and vice
       # versa. See the file-level comment above re: never pointing this at
       # prod directly.
       - ${HOST_RUNTIME_DIR:-./runtime/data/test}:/app/runtime
@@ -96,16 +131,22 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        VITE_API_BASE_URL: "http://localhost:6977"
+        VITE_API_BASE_URL: "http://localhost:${API_PORT:-6977}"
         # Stamped into the built bundle so the UI can show a visual
-        # "you are in Test AV" indicator (purple health dot, see
-        # App.jsx/HeaderHealthDot) that survives independent of which
-        # port you happen to be looking at. vigil.sh's prod frontend has
-        # no VITE_AV_ENV set at all, which App.jsx treats as prod
-        # (absence = prod, matching every other VITE_* var's
-        # "unset = today's default behavior" convention in this repo).
-        VITE_AV_ENV: "test"
+        # non-prod indicator (purple health dot, see App.jsx/
+        # HeaderHealthDot) that survives independent of which port you
+        # happen to be looking at. App.jsx treats VITE_AV_ENV === "prod"
+        # (or absence — the pre-cutover default, matching every other
+        # VITE_* var's "unset = today's default behavior" convention) as
+        # prod; environments/prod.env sets AV_ENV_NAME=prod explicitly, so
+        # the containerized prod environment's web build gets
+        # VITE_AV_ENV=prod set directly rather than relying on absence.
+        # vigil-native.sh's bare-process frontend (Vite dev server, not
+        # this build) still has no VITE_AV_ENV set at all, so it still
+        # falls through to the absence path.
+        VITE_AV_ENV: "${AV_ENV_NAME:-test}"
+    container_name: av-${AV_ENV_NAME:-test}-web
     ports:
-      - "6978:80"
+      - "${WEB_PORT:-6978}:80"
     depends_on:
       - api

@@ -9,7 +9,7 @@
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
 
 if [ ! -x "$repo_root/.venv/bin/python" ]; then
-    echo "pre-commit: .venv missing — run 'bash utils/vigil.sh start' once to bootstrap it." >&2
+    echo "pre-commit: .venv missing — run 'bash utils/vigil.sh test' once by hand first (it bootstraps .venv on its own)." >&2
     exit 1
 fi
 

@@ -1,7 +1,7 @@
 # ArgentVigil — Frontend
 
 React 19 + Vite 5 + Recharts. No state library, no router — one page, seven tab-sections
-plus a Settings view. Dev server runs on :5173 via `bash utils/vigil.sh start` (Vite HMR
+plus a Settings view. Dev server runs on :5173 via `bash utils/vigil-native.sh start` (Vite HMR
 picks up edits automatically); `/api` and `/stack_images` are proxied to the backend on
 :8000.
 
@@ -25,8 +25,9 @@ internally, so they get both rewrites for free.
 
 - **Local dev**: `VITE_API_BASE_URL` stays unset; Vite's proxy (`vite.config.js`) forwards
   `/api` and `/stack_images` to `http://localhost:8000`.
-- **Containerized deploy ("Test AV", `docker compose` / `vigil-docker.sh`)**: frontend and
-  backend are genuinely different origins (`web`/nginx on :6978, `api` on :6977). nginx
+- **Containerized deploy** (`docker compose` / `vigil.sh` — any environment, including
+  prod itself now): frontend and backend are genuinely different origins (`web`/nginx and
+  `api` on that environment's own ports, per `environments/<name>.env`). nginx
   serves the built bundle and reverse-proxies `/stack_images/*` to `api` — `<img
   src="/stack_images/...">` tags need zero code change for this, the proxy is nginx-only.
   CORS on the backend is env-driven (`CORS_ALLOWED_ORIGINS`, no wildcard) rather than the
@@ -65,6 +66,6 @@ internally, so they get both rewrites for free.
 
 ## Building / serving
 
-- **Local dev**: Vite dev server (`vigil.sh start`), HMR, talks to the backend via its proxy — no build step needed.
+- **Local dev**: Vite dev server (`vigil-native.sh start`), HMR, talks to the backend via its proxy — no build step needed.
 - **Containerized deploy**: `npm run build` produces `frontend/dist`, served by nginx (`Dockerfile.frontend`) — the backend has no `/` route and never serves this bundle itself (the old `StaticFiles` mount was removed as part of the API split).
 </content>

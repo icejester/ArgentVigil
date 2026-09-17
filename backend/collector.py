@@ -38,7 +38,7 @@ dict/set module globals, same as it did as part of `main.py` before this
 split. `backend.main`'s own `lifespan` still starts this same collection
 work in-process by default (`RUN_COLLECTOR_IN_PROCESS`, unset/true) so a
 bare `uvicorn backend.main:app` keeps today's single-process behavior for
-local dev (`vigil.sh`) and any compose service that hasn't split
+local dev (`vigil-native.sh`) and any compose service that hasn't split
 `collector` out yet (Story 2.2). Set `RUN_COLLECTOR_IN_PROCESS=false` on
 the `api` service once `collector` runs as its own process, so the two
 don't double-fire the same sources against the same database.

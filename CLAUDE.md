@@ -1,4 +1,4 @@
-# ArgentVigil v2.23.0
+# ArgentVigil v2.24.0
 
 Silver speculative-positioning monitor with gold as comparative context. Framing is **"selling dollars, not buying metals"** — is the speculative futures crowd genuinely capitulated, or just pulling back. Not a trading system: no price targets, no prediction framing, no risk-tolerance commentary. `SPEC.MD` is a retired holdover from an earlier one-big-file era (it once covered the Stock & Flow panel spec and CATCOR feature map together) — **do not reference it**; that content now lives inline in this doc's own Tab: Inventory and Tab: CATCOR sections below, following the same one-spec-file-per-feature convention as everything else. Companion spec docs are **ephemeral story documents** — gitignored, local-only, closed-JIRA-ticket semantics: written to drive one development effort, deletable (and mostly deleted) once their stories land. Specs referenced by name throughout this doc (`deliveryBehavior-spec.md`, `dataHealth-spec.md`, `international-trade-spec.md`, `fed-balance-spec.md`, `price-spec.md`, `catcor-events-spec.md`, `squeeze-context-spec.md`, `datasources-spec.md`) may therefore no longer exist on disk — **this doc is the durable record**; a missing spec file is not missing information, never block on reading one, and never treat a still-present spec as more current than this doc (a landed spec's text is frozen at landing time). In-flight or recently-landed specs live in `specs/`. `frontend/docs/UI_STANDARDS.md` (checked in, not gitignored) covers cross-cutting interactive-UI conventions (legends, tooltips, color coding, sizing — check new interactive elements against it before inventing a new pattern); `README.md` covers the user-facing feature/data-source overview.
 
@@ -656,7 +656,7 @@ Not app code — a one-time script (per the `utils/` convention for human-run di
 
 ### A real deployment bug worth remembering: code changes need a running-process restart
 
-Twice during this feature's build, a route or proxy change was correct in source but **the running `vigil.sh`-managed backend/frontend processes were still serving the pre-change code** — confirmed live both times (a fresh `POST /api/stack/items` 405'd until `vigil.sh restart backend`; photo `<img>` tags 404'd until the Vite dev server picked up its new proxy config). The test suite validates the code in-process via pytest, which re-imports fresh on every run — it does **not** touch the long-running dev-server processes at all, so a green test suite is not evidence the running app has the change. **Always restart the relevant `vigil.sh`-managed process(es) after a backend or vite-config change, before treating a fix as done** — this isn't unique to Stack Tracker, but it's the tab where it was caught.
+Twice during this feature's build, a route or proxy change was correct in source but **the running `vigil-native.sh`-managed backend/frontend processes were still serving the pre-change code** — confirmed live both times (a fresh `POST /api/stack/items` 405'd until `vigil-native.sh restart backend`; photo `<img>` tags 404'd until the Vite dev server picked up its new proxy config). The test suite validates the code in-process via pytest, which re-imports fresh on every run — it does **not** touch the long-running dev-server processes (or a containerized environment's running containers) at all, so a green test suite is not evidence the running app has the change. **Always restart the relevant process(es) — `vigil-native.sh restart` locally, or `vigil.sh up <env>` (rebuilds) for a containerized environment — after a backend or vite-config change, before treating a fix as done** — this isn't unique to Stack Tracker, but it's the tab where it was caught.
 
 ### A real cross-tab bug the Stack tab's addition exposed: `_VALID_NAV_SECTIONS`
 
@@ -759,7 +759,9 @@ seed_data/
   silver_market_balance.json   Manually maintained annual Silver Institute balance data (Inventory tab's Market Demand section)
   cme/112.pdf, cme/113.pdf     COMEX rulebook Chapters 112 (Silver)/113 (Gold) — reference only, confirms Delivery Behavior's Last Trade Day rule
 
-runtime/            Gitignored — generated state, not source. As of the 2026-09-16 prod/test/backup split (utils/vigil.sh + utils/vigil-docker.sh above): runtime/data/prod/ (argentvigil.db + Stack Tracker's own stack.db + stack_images/ — deliberately separate SQLite file/directory, see Tab: Stack above — is vigil.sh's prod, continuously written), runtime/data/test/ (Test AV's snapshot, written by the containerized stack, refreshed on demand from prod via refresh-test-db.sh), runtime/data/backup/ (manual copies only, nothing reads from it automatically), runtime/vigil/{logs,pids}/ (vigil.sh's own process-management state — not environment-scoped, there's exactly one vigil.sh instance regardless of prod/test). backend/db.py's AV_RUNTIME_DIR env var controls which runtime/data/* subdirectory a given backend process actually reads/writes; unset it defaults to bare runtime/ (pre-split behavior, still what a from-scratch checkout gets until vigil.sh/docker-compose.yml set it explicitly).
+environments/       Committed (not gitignored) — one <name>.env file per containerized environment (prod.env, test.env, stage.env, ...), read by utils/vigil.sh (--env-file) and utils/refresh-test-db.sh. See environments/README.md for the full field reference (AV_ENV_NAME, API_PORT, WEB_PORT, HOST_RUNTIME_DIR, REFRESH_POLICY, UPDATE_MODE, AI_BACKEND) and ## Running it above. No real secrets belong in these files — API keys are resolved from the invoking shell's environment instead (see environments/README.md's "API keys / secrets" section).
+
+runtime/            Gitignored — generated state, not source. As of the 2026-09-16 prod/test/backup split, generalized into N named environments by the 2026-09-17 containerized-prod cutover (utils/vigil.sh + environments/*.env above): runtime/data/<name>/ per registered environment (argentvigil.db + Stack Tracker's own stack.db + stack_images/ — deliberately separate SQLite file/directory, see Tab: Stack above), including runtime/data/prod/ — now bind-mounted by BOTH the containerized "prod" environment (environments/prod.env) and, as a fallback that must never run concurrently with it, utils/vigil-native.sh's bare-process backend. runtime/data/backup/ (manual copies only, nothing reads from it automatically), runtime/vigil/{logs,pids}/ (vigil-native.sh's own process-management state — not environment-scoped, there's exactly one vigil-native.sh instance regardless of which environments are up). backend/db.py's AV_RUNTIME_DIR env var controls which runtime/data/* subdirectory a given backend process actually reads/writes; unset it defaults to bare runtime/ (pre-split behavior, still what a from-scratch checkout gets until vigil-native.sh/docker-compose.yml set it explicitly).
 
 pipeline/
   config.py         All tunable thresholds/constants for the CoT tab
@@ -804,10 +806,10 @@ frontend/
   vite.config.js              publicDir points at pipeline/cache (legacy); /api proxied to :8000
 
 utils/
-  vigil.sh            Process manager for backend/frontend as background daemons (start/stop/restart/status, PID-tracked, logs to runtime/vigil/logs/) plus `vigil.sh test [pytest args]` for the test suite — the standing way to run/stop/restart services, always allowed to run (see Development Notes). Backend picks up Python edits via `vigil.sh restart backend` (no --reload); frontend gets Vite HMR automatically either way. Prod's app data lives under runtime/data/prod/ (AV_RUNTIME_DIR, see backend/db.py), separate from this vigil/ process-bookkeeping dir and from runtime/data/test/ (vigil-docker.sh's containerized "Test AV" stack) and runtime/data/backup/ (manual copies only).
-  vigil-docker.sh     Brings up "Test AV" — the containerized deploy shape (docker-compose.yml) run against a snapshot of prod's data under runtime/data/test/, on its own ports (6977 api / 6978 web) so it can run alongside vigil.sh's prod with zero port collision. Starts Colima if the Docker daemon isn't reachable. The frontend's header health dot renders as a pulsing neon-magenta glow (VITE_AV_ENV build arg) instead of its normal health color whenever running as Test AV, so it's visually unmistakable which environment is on screen.
-  refresh-test-db.sh  On-demand snapshot of prod's data (runtime/data/prod/) into runtime/data/test/ — "a copy of now," refreshed by hand, no automatic cadence. Refuses to run while vigil-docker.sh's containers are up (avoids copying onto open SQLite files).
-  dev.sh              Legacy foreground runner (Ctrl-C to stop, uvicorn --reload) — superseded by vigil.sh for a single-user local app; kept only if you want auto-restart-on-save for the backend without typing `vigil.sh restart`.
+  vigil.sh            Primary process-management entrypoint (renamed from vigil-docker.sh at the 2026-09-17 containerized-prod cutover — see ## Running it). `vigil.sh up <env>`/`down <env>`/`status [env]`/`logs <env> [service]` drive any registered environments/<name>.env (including "prod" itself now) via docker compose, project-isolated (-p av-<env>) with per-environment container names (av-<env>-api etc.). Starts Colima if the Docker daemon isn't reachable. Also owns `vigil.sh test [pytest args]` for the full test suite (lifted from the old vigil.sh unchanged — pytest runs on the host regardless of Docker) — the standing way to run/stop/restart services and tests, always allowed to run (see Development Notes).
+  vigil-native.sh     The OLD vigil.sh, renamed — bare host processes (uvicorn + Vite dev server directly, no Docker), background daemons (start/stop/restart/status, PID-tracked, logs to runtime/vigil/logs/). Now a fallback/faster local-dev inner loop only, not prod by definition. Backend picks up Python edits via `vigil-native.sh restart backend` (no --reload); frontend gets Vite HMR automatically either way. Defaults to the same runtime/data/prod/ directory the containerized "prod" environment (environments/prod.env) now also bind-mounts — the two must never run at the same time (see that file's own comment for the two-writer hazard).
+  refresh-test-db.sh  On-demand snapshot of one environment's data into another named environment's HOST_RUNTIME_DIR (e.g. prod → test) — "a copy of now," refreshed by hand, no automatic cadence. Checks the target environment's REFRESH_POLICY (environments/<name>.env) and refuses on "protected"; also refuses while the target environment's own containers are up (avoids copying onto open SQLite files).
+  dev.sh              Legacy foreground runner (Ctrl-C to stop, uvicorn --reload) — superseded by vigil-native.sh for a single-user local app; kept only if you want auto-restart-on-save for the backend without typing `vigil-native.sh restart`.
   sniff-metal-charts.py, sniffer.sh   Tools for reverse-engineering metalcharts.org API responses
   gen_data_dictionary.py   Generates docs/data-dictionary.md from backend/db.py's DDL + backend/sources.py's registry + frontend/src/data_editorial.js's prose (datasources-spec.md Story #2). Requires the venv (imports backend.main to populate SOURCE_REGISTRY), not stdlib-only like pipeline/.
   gen_source_scaffold.py   Deterministic scaffold generator for onboarding a new data source (datasources-spec.md Story #4) — takes a YAML file (see example_source.yaml), emits reviewable SourceDefinition/fetch-function/DDL/route/data_editorial.js boilerplate. Never writes files directly — prints for manual review/apply, per this repo's Learning Mode standing rule. Paired with `.claude/commands/onboard-source.md`, which walks the judgment half (real response shape, quirks, cadence) that produces the YAML this script consumes.
@@ -847,24 +849,96 @@ utils/
 
 ## Running it
 
-**Two independent paths, for different purposes — both are expected to keep working.**
-`vigil.sh` (bare processes, Vite HMR, seconds-scale restarts, debugger-attachable) is the
-fast local-dev inner loop; `vigil-docker.sh`/`docker compose` (the containerized deploy
-shape — separate `api`/`web` origins, nginx, no HMR) is the outer loop that matches what
-an eventual real deployment looks like — see `api-split-implementation-plan.md` Story 1.6.
-Neither replaces the other: local Python/JS edits go through `vigil.sh` day to day; reach
-for the Docker path specifically to verify cross-origin behavior, the `/stack_images`
-nginx proxy, or anything else that only manifests when frontend and backend are genuinely
-different origins.
+**Containerized-prod cutover (2026-09-17)**: prod itself now runs containerized, as one
+named environment (`environments/prod.env`) among any number of others — this replaced
+the earlier fixed "vigil.sh is prod / vigil-docker.sh is one disposable Test AV" split.
+`utils/vigil-docker.sh` was renamed to **`utils/vigil.sh`** (the primary entrypoint now —
+`up`/`down`/`status`/`logs <env>` plus `test`, folded in from the old script since pytest
+itself has nothing to do with Docker either way); the **old** `vigil.sh` (bare host
+processes — uvicorn + Vite dev server directly, no Docker) is now **`utils/vigil-native.sh`**,
+kept only as a faster local-dev inner loop or a fallback if Docker/Colima is unavailable.
+Both are expected to keep working, but they are no longer symmetric alternatives — one is
+primary (containerized, N environments, including prod), the other is a fallback that
+happens to default to the same `runtime/data/prod/` directory the containerized `prod`
+environment now also uses. **`vigil-native.sh` and the containerized `prod` environment
+must never run at the same time** — both would write the same SQLite files concurrently,
+the exact two-writer hazard already confirmed live once during the earlier prod/test split
+(a container's scheduler wrote into prod for ~10 minutes before being caught). `vigil.sh up
+prod` checks for a running `vigil-native.sh` backend (via its PID file) and refuses if
+found; there is no check in the other direction yet — treat that as a real, open gap.
 
-### Local dev (`vigil.sh`) — the default day-to-day path
+### Environments (`environments/*.env`) — see `environments/README.md` for the full field reference
+
+Each `<name>.env` file registers one containerized environment: its own compose project
+name (`av-<name>`), container names (`av-<name>-api`/`-collector`/`-web`), ports
+(`API_PORT`/`WEB_PORT`), and bind-mounted data directory (`HOST_RUNTIME_DIR`, typically
+`runtime/data/<name>/`). Adding environment #`n` is: copy an existing file, pick two free
+ports and a runtime dir — no changes to `docker-compose.yml` or the scripts. Two
+independent per-environment axes, neither enforced by `docker-compose.yml` itself:
+
+- **`REFRESH_POLICY`** (`snapshot` | `protected`) — whether `utils/refresh-test-db.sh` may
+  overwrite this environment's data from another environment (typically prod). `prod.env`
+  itself is `protected` (nothing should "refresh prod from prod").
+- **`UPDATE_MODE`** (`live` | `frozen`) — whether the `collector` service (compose profile
+  `live`) actually starts. `live` means this environment keeps fetching from real upstreams
+  on its own schedule; `frozen` means `collector` is never started, so the environment only
+  ever serves whatever's already in its DB. Independent of `REFRESH_POLICY` — e.g. a
+  `frozen`-and-`protected` combination for a pinned reference dataset nothing may touch or
+  refresh, or `live`-and-`snapshot` for a disposable self-updating test env.
 
 ```bash
-bash utils/vigil.sh start         # everything, as background daemons (venv bootstrap + backend :8000 + frontend :5173)
-bash utils/vigil.sh restart backend   # after backend Python edits — picks up the change (no --reload running)
-bash utils/vigil.sh stop          # stop everything
-python3 pipeline/run.py           # CoT pipeline only, no server needed
-bash utils/vigil.sh test          # full test suite (253 tests, ~12s) — see ## Tests; pytest args pass through
+bash utils/vigil.sh up prod           # ensures Docker is reachable (starts Colima if needed), builds + starts prod's api + collector + web, prints the URL
+bash utils/vigil.sh up test           # any other environments/<name>.env — e.g. test, stage
+bash utils/vigil.sh down prod
+bash utils/vigil.sh status            # every av-* project currently running (or `status <env>` for just one)
+bash utils/vigil.sh logs prod api     # docker compose logs -f, Ctrl-C to stop
+bash utils/vigil.sh test              # full test suite (253 tests, ~12s) — see ## Tests; pytest args pass through, no Docker involved
+bash utils/refresh-test-db.sh test    # snapshot a source environment's data into a snapshot-mode environment's HOST_RUNTIME_DIR — checks REFRESH_POLICY first, refuses on "protected"; also refuses while that environment's own containers are up
+python3 pipeline/run.py               # CoT pipeline only, no server needed — independent of which environment(s) are up
+```
+
+Each environment brings up `api` (FastAPI, `RUN_COLLECTOR_IN_PROCESS=false`),
+`collector` (the tiered background scheduler as its own process, only when
+`UPDATE_MODE=live`), and `web` (nginx serving the built frontend + proxying
+`/stack_images/*` to `api`), per `docker-compose.yml`. The frontend's header health dot
+renders as a pulsing neon-magenta glow instead of its normal health color whenever
+`VITE_AV_ENV` (a per-environment build arg, set from `AV_ENV_NAME`) is anything other than
+`"prod"`, so it's visually unmistakable which environment is on screen at a glance —
+`prod.env` itself sets `VITE_AV_ENV=prod` explicitly now, rather than relying on the
+absence-means-prod fallback the pre-cutover design used.
+
+**Data is genuinely isolated per environment, not just port-isolated.** Each environment's
+`api`/`collector` bind-mount only that environment's own `HOST_RUNTIME_DIR` — never
+another environment's directory directly. `utils/refresh-test-db.sh <name>` is the only way
+one environment's data gets copied into a `snapshot`-mode environment's directory; running
+`vigil.sh up <name>` before ever seeding a brand-new environment boots `api` against an
+empty DB (same "No CoT data persisted yet" 500 as a from-scratch local checkout) rather
+than touching any other environment's data — expected, not a bug. **A `live`-mode
+environment's scheduler keeps running once up** — it is not a frozen fixture; real
+upstream fetches keep landing in its directory for as long as its containers run.
+
+Requires a real Docker daemon — this machine's is Colima (`vigil.sh` starts it
+automatically if not already running; sizing is hardcoded to this repo's documented dev
+settings, 4 CPU / 8GB / 60GB disk). SQLite is confirmed still in plain rollback-journal
+mode (not WAL), so `vigil-native.sh`'s native backend and any container ever bind-mounted
+to the *same* data directory at the same time is a real one-writer-many-writers hazard —
+see the cutover note above for why this now specifically applies to `runtime/data/prod/`.
+
+**API keys are resolved from the invoking shell's environment, not from any
+`environments/*.env` file.** `docker-compose.yml` reads `FRED_API_KEY`/`GAPI_API_KEY`/
+`CENSUS_API_KEY`/`ANTHROPIC_API_KEY` as `${VAR:-}` interpolations, resolved by `docker
+compose` from whatever's exported in the shell that runs `vigil.sh up <env>` — the same
+mechanism `vigil-native.sh`'s bare-process backend already relies on. A shell without these
+exported silently boots the containers with empty keys (no error) — that source's fetch
+function just quietly no-ops. See `environments/README.md`'s "API keys / secrets" section
+for the full explanation; there is no check today that catches a missing key at `up` time.
+
+### Local dev fallback (`vigil-native.sh`) — bare host processes, no Docker
+
+```bash
+bash utils/vigil-native.sh start         # backend :8000 + frontend :5173 as background daemons (venv bootstrap)
+bash utils/vigil-native.sh restart backend   # after backend Python edits — picks up the change (no --reload running)
+bash utils/vigil-native.sh stop          # stop everything
 ```
 
 The frontend talks to the backend via Vite's dev proxy (`frontend/vite.config.js`,
@@ -873,53 +947,16 @@ this path, which is `api_client.js`'s documented default (empty string → same-
 relative paths → the proxy), so nothing needs configuring locally. `backend/main.py`
 serves API routes and `/stack_images` only — it has no `/` route and never serves the
 built frontend (the `frontend/dist` `StaticFiles` mount was removed as part of the API
-split, see `api-split-implementation-plan.md` Story 1.5); `vigil.sh start`'s frontend
-process (Vite) is what serves the UI in this path, not the backend.
+split, see `api-split-implementation-plan.md` Story 1.5); `vigil-native.sh start`'s
+frontend process (Vite) is what serves the UI in this path, not the backend.
 
 Run the pipeline at least once before the frontend, since the CoT tab reads from `/api/cot/db`, which reads `cot_silver`/`cot_gold` from `runtime/argentvigil.db` — empty tables make that route return a `500` ("No CoT data persisted yet. Run pipeline/run.py first.").
 
 The exchange-inventory/FRED/spot-price data populates itself on first backend startup regardless (a one-time unconditional refresh runs in `main.py`'s `lifespan`) — the tiered background refresh only *repeats* on a schedule if explicitly enabled via `POST /api/refresh/settings` or forced via `POST /api/refresh/force`. CATCOR's event calendar and reaction backfill also run automatically on every startup — no manual trigger needed, though `/api/catcor/refresh` exists for an on-demand re-run. ALFRED calls need `FRED_API_KEY` set in whatever shell launches the backend — without it, the event calendar and price reactions still populate, but `actual_value`/`surprise_delta` stay `NULL`. Research's Anthropic backend needs `ANTHROPIC_API_KEY` only if `AI_BACKEND=anthropic` is explicitly set (default is `forge`, which needs no key but does need the `amp-forge` LAN service reachable). The LBMA fix (see Silver/Gold sections above) needs `GAPI_API_KEY` (GoldAPI.io, free tier) — without it, the `lbma_fix` source's fetch_fn logs a skip message and the rest of the app boots normally; the `XAG_LBMA`/`XAU_LBMA` settlement_price instruments just stay empty (no frontend consumer currently surfaces them anyway, see the Silver/Gold sections above).
 
-### Containerized deploy ("Test AV") — `docker compose` / `vigil-docker.sh`
-
-```bash
-bash utils/refresh-test-db.sh     # snapshot prod's runtime/data/prod/ into runtime/data/test/ — "a copy of now," on demand, no automatic cadence. Refuses to run while Test AV's containers are up.
-bash utils/vigil-docker.sh up     # ensures Docker is reachable (starts Colima if needed), docker compose up -d --build, prints the URL
-bash utils/vigil-docker.sh status # docker compose ps
-bash utils/vigil-docker.sh logs [service]   # docker compose logs -f [service]
-bash utils/vigil-docker.sh down   # docker compose down (containers only — does not stop Colima)
-```
-
-Brings up `api` (FastAPI + the tiered background scheduler, still in-process per Stage 1
-of the API split — the `collector` service split is Stage 2, not yet landed) and `web`
-(nginx serving the built frontend + proxying `/stack_images/*` to `api`), per
-`docker-compose.yml`. Deliberately on its own ports — **api :6977 / web :6978** — distinct
-from `vigil.sh`'s prod (:8000/:5173), so both stacks can run simultaneously with zero
-port collision. The frontend's header health dot renders as a pulsing neon-magenta glow
-instead of its normal health color whenever running as Test AV (`VITE_AV_ENV` build arg),
-so it's visually unmistakable which environment is on screen at a glance.
-
-**Data is genuinely isolated from prod, not just port-isolated.** `api` bind-mounts
-`runtime/data/test/` (configurable via `HOST_RUNTIME_DIR`), never `runtime/data/prod/`
-directly — `utils/refresh-test-db.sh` is the only way data gets into the test directory,
-copying prod's `argentvigil.db`/`stack.db`/`stack_images/` on demand. Running
-`vigil-docker.sh up` before ever running the refresh script boots `api` against an empty
-DB (same "No CoT data persisted yet" 500 as a from-scratch local checkout) rather than
-touching prod — expected, not a bug. **Test AV's own scheduler keeps running live once
-up** — it is not a frozen fixture; real upstream fetches keep landing in
-`runtime/data/test/` for as long as the containers run, confirmed as the intended
-behavior (not a gap) per `api-split-implementation-plan.md` Story 1.3's exit notes.
-
-Requires a real Docker daemon — this machine's is Colima (`vigil-docker.sh` starts it
-automatically if not already running; sizing is hardcoded to this repo's documented dev
-settings, 4 CPU / 8GB / 60GB disk). SQLite is confirmed still in plain rollback-journal
-mode (not WAL — that's Story 2.3), so `vigil.sh`'s native backend and any container ever
-bind-mounted to the *same* data directory at the same time is a real one-writer-many-
-writers hazard; currently safe by construction only because prod and Test AV point at
-different directories.
-
-**Always run Python through `.venv`, never bare `python3`.** `bash utils/vigil.sh start` creates
-`.venv` on first run and installs `requirements.txt` into it (`fastapi`, `uvicorn`, `httpx`,
+**Always run Python through `.venv`, never bare `python3`.** `bash utils/vigil-native.sh start`
+(or `bash utils/vigil.sh test`, which bootstraps `.venv` independently) creates `.venv` on
+first run and installs `requirements.txt` into it (`fastapi`, `uvicorn`, `httpx`,
 `python-dotenv` — none of these are on system Python). Before running any Python command
 against this repo — import checks, one-off scripts, `python -c "..."` sanity tests — run
 `source .venv/bin/activate` first, or invoke `.venv/bin/python` directly. `pipeline/` is the one
@@ -931,9 +968,9 @@ exception: it's intentionally stdlib-only by design and *can* run under bare `py
 Standing instructions for every interaction in this repo — distinct from each tab's "known gaps" (which describe upstream/data limitations, not workflow). Add to this section directly as new quirks/preferences come up.
 
 - **Always run Python through `.venv`, never bare `python3`** — see the full rule under "Running it" above. `pipeline/` is the sole stdlib-only exception.
-- **Use `utils/vigil.sh` to stop/start services** — always allowed, no need to ask first. Same for `utils/vigil-docker.sh` (the containerized "Test AV" path, see ## Running it) and `utils/refresh-test-db.sh`.
+- **Use `utils/vigil.sh` to stop/start services** — always allowed, no need to ask first. Same for `utils/vigil-native.sh` (the bare-process local-dev fallback, see ## Running it) and `utils/refresh-test-db.sh`.
 - **Bump the version number in this file's title (`# ArgentVigil vX.Y.Z`) on every feature completion** — a new spec, or any change bigger than a typo/doc tweak. Not on every edit; only when a development effort actually completes. **`README.md`'s title carries the same version and must be bumped in the same change** — `tests/test_conventions.py`'s `test_readme_version_matches_claude_md` fails the suite on drift (deliberately not a per-commit auto-increment, which would make the number meaningless against this rule's "feature completion, not every edit" semantics). A versioned pre-commit hook (`utils/githooks/pre-commit`, wired via `git config core.hooksPath utils/githooks` — per-clone, one-time; already set in this clone) runs the full suite on every commit, so drift can't be committed either; it resolves the repo root via `git rev-parse --show-toplevel`, works from any cwd, and fails with a bootstrap hint if `.venv` is missing. README structure (as of v1.27.0): three fixed top sections — BUSINESS LEVEL / TECH LEVEL / NEXT UP — plus orientation-only `backend/README.md` and `frontend/README.md`; all three stay high-level and point here for the exhaustive record, never duplicate this doc's narratives.
-- **`utils/` scripts other than `vigil.sh` are human-facing diagnostics/one-offs** (`claims/claimExtract.py`, the metalcharts sniffers, etc.) — not app code. Out of scope for the test suite; don't test, refactor, or register them as part of app work. (`gen_data_dictionary.py`/`gen_source_scaffold.py` are the documented exceptions — real tooling, see Repo layout.)
+- **`utils/` scripts other than `vigil.sh`/`vigil-native.sh` are human-facing diagnostics/one-offs** (`claims/claimExtract.py`, the metalcharts sniffers, etc.) — not app code. Out of scope for the test suite; don't test, refactor, or register them as part of app work. (`gen_data_dictionary.py`/`gen_source_scaffold.py` are the documented exceptions — real tooling, see Repo layout.)
 - **Pace manual diagnostic calls: minimum 2-3 seconds between requests to the same domain.** Some of AV's upstreams rate-limit severely (ForexFactory has locked out an IP from repeat hits; GoldAPI's monthly quota was exhausted once by investigation testing alone; Yahoo has 429'd rapid-fire probes). Applies to any ad hoc curl/scripted investigation against a live upstream — the app's own fetch loops already have their gates (`RateLimitSpec`), this rule is for hand-run diagnostics, which don't.
 
 ### TODO
