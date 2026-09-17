@@ -1,9 +1,12 @@
 # ArgentVigil containerized deploy (api-split-implementation-plan.md
-# Story 1.3). Two services for now — api (FastAPI + the tiered background
-# scheduler, still in-process per Stage 1; the collector split is Stage 2)
-# and web (nginx serving the built frontend + proxying /stack_images to
-# api). `collector` joins in Stage 2 (Story 2.2), sharing the same
-# `runtime` mount.
+# Story 1.3, collector service added in Story 2.2). Three services: api
+# (FastAPI request handlers only — RUN_COLLECTOR_IN_PROCESS=false below so
+# it does NOT also run the tiered background scheduler), collector (the
+# scheduler, as its own process — `python -m backend.collector`, no
+# FastAPI/uvicorn at all), and web (nginx serving the built frontend +
+# proxying /stack_images to api). api and collector share the same
+# runtime bind-mount so collector's writes are immediately visible to
+# api's /db reads.
 #
 # This is the containerized-deploy path — local development keeps using
 # `utils/vigil.sh start` (Vite dev server + uvicorn directly on the host,
@@ -52,6 +55,10 @@ services:
       # backend/db.py's own default so the container's behavior doesn't
       # silently change if that default ever does.
       - AV_RUNTIME_DIR=/app/runtime
+      # Story 2.2: collector is now its own service (below) — api must not
+      # also run the scheduler in-process, or every tiered fetch would fire
+      # twice (once from each process) against the same DB.
+      - RUN_COLLECTOR_IN_PROCESS=false
     volumes:
       # Bind-mounts the TEST snapshot directory, never prod's data
       # directly — see the file-level comment above for why. Confirmed
@@ -63,6 +70,25 @@ services:
       # `PRAGMA integrity_check` came back "ok"), but the exposure was
       # real and is the reason this mount points at a dedicated test
       # snapshot dir instead, now configurable via HOST_RUNTIME_DIR.
+      - ${HOST_RUNTIME_DIR:-./runtime/data/test}:/app/runtime
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    entrypoint: ["python", "-m", "backend.collector"]
+    environment:
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - GAPI_API_KEY=${GAPI_API_KEY:-}
+      - CENSUS_API_KEY=${CENSUS_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AI_BACKEND=${AI_BACKEND:-forge}
+      - AV_RUNTIME_DIR=/app/runtime
+    volumes:
+      # Same bind-mount target as api, same test-snapshot source — this is
+      # what makes collector's writes visible to api's reads and vice
+      # versa. See the file-level comment above re: never pointing this at
+      # prod directly.
       - ${HOST_RUNTIME_DIR:-./runtime/data/test}:/app/runtime
 
   web:

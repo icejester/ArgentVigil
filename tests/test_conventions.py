@@ -300,3 +300,60 @@ async def test_cors_preflight_allows_post_put_delete():
             )
             allowed = resp.headers.get("access-control-allow-methods", "")
             assert method in allowed, f"{method} missing from preflight allow-methods: {allowed}"
+
+
+# --- API versioning: every route reachable at /api/v1 (api-split Story 3.3) ---
+
+# The intended end state (api-split-implementation-plan.md Story 3.1's
+# "Done when") is that every route is reachable at /api/v1/...; the bare
+# /api/... alias is temporary (see CLAUDE.md's Standing rules "API
+# versioning" entry for the 90-day deprecation window) and still live
+# today, so this only asserts the /api/v1 half — it does NOT assert /api
+# is gone, since removing that alias is a separate, later step gated on
+# the frontend being confirmed migrated and the deprecation window having
+# passed. Update this test (assert /api/... 404s) once that removal lands.
+
+
+def _all_route_paths() -> set[str]:
+    return {route.path for route in backend.main.app.routes if hasattr(route, "path")}
+
+
+def test_every_api_route_reachable_under_v1():
+    """Every /api/... route the app registers must also exist at the
+    equivalent /api/v1/... path — the two include_router() calls in
+    main.py must stay symmetric as new routes are added to api_router."""
+    paths = _all_route_paths()
+    bare_api_paths = {p for p in paths if p.startswith("/api/") and not p.startswith("/api/v1/")}
+    missing = sorted(
+        p for p in bare_api_paths if p.replace("/api/", "/api/v1/", 1) not in paths
+    )
+    assert not missing, (
+        f"Routes reachable at a bare /api/... path but not the equivalent "
+        f"/api/v1/... path: {missing} — every route must be added to "
+        f"api_router (mounted at both prefixes), never registered directly "
+        f"on app or at only one of the two prefixes."
+    )
+
+
+def test_no_route_registered_directly_on_app_outside_router():
+    """Every real API route must live on api_router (mounted at both /api
+    and /api/v1), not declared directly on `app` at some other path — the
+    only routes app itself should own outside api_router's two mounts are
+    non-API static mounts (StaticFiles for /stack_images)."""
+    for route in backend.main.app.routes:
+        if not hasattr(route, "path"):
+            # The two app.include_router(api_router, prefix=...) calls
+            # themselves show up as routing.Include entries with no own
+            # .path — that's exactly the sanctioned "lives on api_router"
+            # shape this test exists to require, not something to flag.
+            continue
+        path = route.path
+        if path.startswith("/api/"):
+            continue
+        # Non-API: the /stack_images StaticFiles mount (and its implicit
+        # sub-paths) is the one sanctioned exception — data, not an API
+        # route, per Story 1.5's exit notes.
+        assert path.startswith("/stack_images") or path in ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"), (
+            f"Unexpected non-/api route registered directly on app: {path!r} "
+            f"— new routes belong on api_router, not directly on app."
+        )

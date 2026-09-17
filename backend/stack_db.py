@@ -73,6 +73,10 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL mode: see the matching comment in backend/db.py's get_conn — required
+    # now that api and collector are separate processes writing concurrently
+    # (api-split-implementation-plan.md Story 2.3).
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
         conn.commit()

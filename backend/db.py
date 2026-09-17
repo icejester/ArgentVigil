@@ -583,6 +583,14 @@ CREATE TABLE IF NOT EXISTS ui_settings (
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # WAL mode: journal_mode is persisted in the DB file itself once set, but
+    # this PRAGMA is cheap/idempotent, so setting it on every connection keeps
+    # a fresh DB (or one created before this line existed) covered too.
+    # Required now that api and collector are separate processes writing to
+    # the same file concurrently (api-split-implementation-plan.md Story 2.3)
+    # — WAL allows one writer + many concurrent readers, unlike the default
+    # rollback-journal mode's whole-file write lock.
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
         conn.commit()

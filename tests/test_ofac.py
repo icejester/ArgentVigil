@@ -6,6 +6,7 @@ Advanced-XML parsing against a small synthetic fixture (never the real
 import httpx
 import respx
 
+from backend import collector
 from backend import main as main_module
 
 
@@ -353,7 +354,7 @@ _SYNTHETIC_SDN_ADVANCED_XML = f"""<?xml version="1.0" standalone="yes"?>
 
 
 def test_parse_ofac_advanced_xml_extracts_individual_entity_and_vessel():
-    parsed = main_module._parse_ofac_advanced_xml(_SYNTHETIC_SDN_ADVANCED_XML.encode())
+    parsed = collector._parse_ofac_advanced_xml(_SYNTHETIC_SDN_ADVANCED_XML.encode())
     entries = parsed["entries"]
     by_uid = {e["ofac_uid"]: e for e in entries}
     assert len(entries) == 3
@@ -388,7 +389,7 @@ def test_parse_ofac_advanced_xml_extracts_aliases_addresses_and_id_documents():
     ofac_designations row never captured: every alias (not just primary),
     Location-sourced addresses reached via Feature/FeatureVersion/
     VersionLocation, and IDRegDocument entries joined by IdentityID."""
-    parsed = main_module._parse_ofac_advanced_xml(_SYNTHETIC_SDN_ADVANCED_XML.encode())
+    parsed = collector._parse_ofac_advanced_xml(_SYNTHETIC_SDN_ADVANCED_XML.encode())
 
     aliases_9640 = [a for a in parsed["aliases"] if a["ofac_uid"] == "9640"]
     assert len(aliases_9640) == 2
@@ -473,13 +474,13 @@ async def test_fetch_and_persist_ofac_designations_requires_user_agent(tmp_db, u
         return httpx.Response(200, content=body.encode())
 
     with respx.mock:
-        respx.get(url__startswith=main_module.OFAC_BASE).mock(side_effect=_callback)
-        result = await main_module._fetch_and_persist_ofac_designations()
+        respx.get(url__startswith=collector.OFAC_BASE).mock(side_effect=_callback)
+        result = await collector._fetch_and_persist_ofac_designations()
 
     assert result["new"] == 4  # 3 SDN + 1 Consolidated, disjoint uids in this fixture
     for headers in seen_headers:
         assert "user-agent" in headers
-        assert headers["user-agent"] == main_module._OFAC_USER_AGENT
+        assert headers["user-agent"] == collector._OFAC_USER_AGENT
 
     rows = {r["ofac_uid"]: r for r in tmp_db.get_ofac_designations()}
     assert rows["9640"]["list_source"] == "SDN"

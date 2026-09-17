@@ -13,6 +13,7 @@ import respx
 from fastapi import HTTPException
 from helpers import make_fake_date, yahoo_chart_payload
 
+from backend import collector
 from backend import main as main_module
 from backend.catcor import _parse_forexfactory_number
 
@@ -25,7 +26,7 @@ async def _no_sleep(_seconds):
     return None
 
 
-PRICES_URL = f"{main_module.METALCHARTS}/api/prices"
+PRICES_URL = f"{collector.METALCHARTS}/api/prices"
 
 
 def _prices_payload(is_stale: bool) -> dict:
@@ -48,8 +49,8 @@ def _prices_payload(is_stale: bool) -> dict:
 
 
 def _freeze_market_clock(monkeypatch, now_utc: datetime):
-    real = main_module._metals_market_closed
-    monkeypatch.setattr(main_module, "_metals_market_closed", lambda now=None: real(now_utc))
+    real = collector._metals_market_closed
+    monkeypatch.setattr(collector, "_metals_market_closed", lambda now=None: real(now_utc))
 
 
 SAT_NOON = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)       # Saturday — closed
@@ -60,11 +61,11 @@ FRI_LATE = datetime(2026, 7, 17, 22, 30, tzinfo=timezone.utc)      # Friday 22:3
 
 
 async def test_stale_spot_feed_when_market_closed_is_not_persisted(tmp_db, upstream_client, monkeypatch):
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
     _freeze_market_clock(monkeypatch, SAT_NOON)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
-        await main_module._fetch_and_persist_prices()
+        await collector._fetch_and_persist_prices()
     assert tmp_db.get_latest_spot_prices() == {}
 
 
@@ -72,11 +73,11 @@ async def test_stale_spot_feed_on_weekday_is_persisted_anyway(tmp_db, upstream_c
     """Confirmed live: isStale can fire on a weekday with cacheAge in the
     months (stuck upstream, not a market closure) — skipping would silently
     flatline the chart forever, so a stuck weekday feed must surface."""
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
     _freeze_market_clock(monkeypatch, MON_NOON)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
-        await main_module._fetch_and_persist_prices()
+        await collector._fetch_and_persist_prices()
     latest = tmp_db.get_latest_spot_prices()
     assert latest["XAG"]["price"] == 39.5
     assert latest["XAU"]["price"] == 3350.0
@@ -87,52 +88,52 @@ async def test_stale_spot_feed_after_sunday_globex_reopen_is_persisted(tmp_db, u
     the old skip suppressed all of Sunday UTC — so real Sunday-evening
     ticks never landed and the chart stayed empty. Post-fix, a Sunday
     23:00 UTC response persists."""
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
     _freeze_market_clock(monkeypatch, SUN_EVENING)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
-        await main_module._fetch_and_persist_prices()
+        await collector._fetch_and_persist_prices()
     assert tmp_db.get_latest_spot_prices()["XAG"]["price"] == 39.5
 
 
 async def test_stale_spot_feed_sunday_before_reopen_is_not_persisted(tmp_db, upstream_client, monkeypatch):
     """Sunday before the 22:00 UTC reopen is still a real closure — a stale
     re-serve then must not be persisted."""
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
     _freeze_market_clock(monkeypatch, SUN_MORNING)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(True)))
-        await main_module._fetch_and_persist_prices()
+        await collector._fetch_and_persist_prices()
     assert tmp_db.get_latest_spot_prices() == {}
 
 
 async def test_fresh_spot_feed_when_market_closed_is_persisted(tmp_db, upstream_client, monkeypatch):
     """The skip needs BOTH conditions — a genuinely fresh closed-market
     response (isStale false) still persists."""
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
     _freeze_market_clock(monkeypatch, SAT_NOON)
     with respx.mock:
         respx.get(PRICES_URL).mock(return_value=httpx.Response(200, json=_prices_payload(False)))
-        await main_module._fetch_and_persist_prices()
+        await collector._fetch_and_persist_prices()
     assert tmp_db.get_latest_spot_prices()["XAG"]["price"] == 39.5
 
 
 def test_metals_market_closed_boundaries():
     """Direct unit coverage of the Globex-hours approximation."""
-    assert main_module._metals_market_closed(SAT_NOON) is True
-    assert main_module._metals_market_closed(SUN_MORNING) is True
-    assert main_module._metals_market_closed(SUN_EVENING) is False
-    assert main_module._metals_market_closed(MON_NOON) is False
-    assert main_module._metals_market_closed(FRI_LATE) is True
+    assert collector._metals_market_closed(SAT_NOON) is True
+    assert collector._metals_market_closed(SUN_MORNING) is True
+    assert collector._metals_market_closed(SUN_EVENING) is False
+    assert collector._metals_market_closed(MON_NOON) is False
+    assert collector._metals_market_closed(FRI_LATE) is True
     # Friday mid-session and the 22:00 UTC boundary itself.
-    assert main_module._metals_market_closed(datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)) is False
-    assert main_module._metals_market_closed(datetime(2026, 7, 17, 22, 0, tzinfo=timezone.utc)) is True
-    assert main_module._metals_market_closed(datetime(2026, 7, 19, 22, 0, tzinfo=timezone.utc)) is False
+    assert collector._metals_market_closed(datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)) is False
+    assert collector._metals_market_closed(datetime(2026, 7, 17, 22, 0, tzinfo=timezone.utc)) is True
+    assert collector._metals_market_closed(datetime(2026, 7, 19, 22, 0, tzinfo=timezone.utc)) is False
 
 
 # --- volume-oi: no manufactured date key (2026-09 investigation) ---------
 
-VOLUME_OI_URL = f"{main_module.METALCHARTS}/api/comex/volume-oi"
+VOLUME_OI_URL = f"{collector.METALCHARTS}/api/comex/volume-oi"
 
 
 async def test_leverage_volume_persists_only_under_real_upstream_date(tmp_db, upstream_client, monkeypatch):
@@ -140,13 +141,13 @@ async def test_leverage_volume_persists_only_under_real_upstream_date(tmp_db, up
     must be keyed on whatever trading date the upstream actually reports,
     never str(date.today()), so a stale figure never gets stamped with a
     day it isn't from."""
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 9, 2)))  # Wed
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "date", make_fake_date(date(2026, 9, 2)))  # Wed
     with respx.mock:
         respx.get(VOLUME_OI_URL).mock(return_value=httpx.Response(
             200, json={"success": True, "symbol": "XAG",
                        "data": {"date": "2026-08-31", "openInterest": 104394, "volume": 43881}}))
-        await main_module._fetch_and_persist_silver_leverage()
+        await collector._fetch_and_persist_silver_leverage()
     rows = tmp_db.get_volume_series("XAG")
     assert [r["date"] for r in rows] == ["2026-08-31"]  # the upstream date, not 2026-09-02
     assert rows[0]["volume"] == 43881
@@ -156,25 +157,35 @@ async def test_leverage_volume_skips_write_when_upstream_date_absent(tmp_db, ups
     """If the upstream omits `date` entirely, skip the write rather than
     inventing a key — a later cycle catches it once the source rolls
     forward. (Not observed live, but the old fallback made it latent.)"""
-    monkeypatch.setattr(main_module, "authed_headers", _no_headers)
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 9, 2)))
+    monkeypatch.setattr(collector, "authed_headers", _no_headers)
+    monkeypatch.setattr(collector, "date", make_fake_date(date(2026, 9, 2)))
     with respx.mock:
         respx.get(VOLUME_OI_URL).mock(return_value=httpx.Response(
             200, json={"success": True, "symbol": "XAU",
                        "data": {"openInterest": 419328, "volume": 176442}}))
-        await main_module._fetch_and_persist_gold_leverage()
+        await collector._fetch_and_persist_gold_leverage()
     assert tmp_db.get_volume_series("XAU") == []
 
 
 def test_leverage_volume_sources_poll_faster_than_daily():
     """silver_leverage/gold_leverage carry their own 6h cadence, distinct
-    from the ~25h EXCHANGE_INVENTORY_INTERVAL_S their slow-tier peers use,
-    to catch the lagging volume-oi `date` roll-forward more often."""
+    from the ~25h interval their slow-tier peers (e.g. comex_silver_history)
+    use, to catch the lagging volume-oi `date` roll-forward more often.
+    The two interval constants this test used to read off main_module
+    (LEVERAGE_VOLUME_INTERVAL_S/EXCHANGE_INVENTORY_INTERVAL_S) moved into
+    collector.register_sources() as locals when the registration block
+    itself moved there (2026-09-17, fixing a real bug where collector run
+    standalone via `python -m backend.collector` never populated
+    sources.SOURCE_REGISTRY at all, since only main.py used to call
+    sources.register(...)) — asserting against the live registered values
+    directly is the more durable check anyway, since it doesn't depend on
+    those constants staying module-level attributes anywhere."""
     from backend import sources
+    daily_interval = sources.SOURCE_REGISTRY["comex_silver_history"].cadence.interval_seconds
     for key in ("silver_leverage", "gold_leverage"):
         spec = sources.SOURCE_REGISTRY[key].cadence
-        assert spec.interval_seconds == main_module.LEVERAGE_VOLUME_INTERVAL_S == 21600
-        assert spec.interval_seconds < main_module.EXCHANGE_INVENTORY_INTERVAL_S
+        assert spec.interval_seconds == 21600
+        assert spec.interval_seconds < daily_interval
 
 
 # --- Census: 204-means-unpublished + qty sentinel -> NULL -----------------
@@ -204,10 +215,10 @@ def _census_callback(request: httpx.Request) -> httpx.Response:
 
 async def test_census_skips_unpublished_months_and_nulls_qty(tmp_db, upstream_client, monkeypatch):
     monkeypatch.setenv("CENSUS_API_KEY", "test-key")
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 20)))
+    monkeypatch.setattr(collector, "date", make_fake_date(date(2026, 7, 20)))
     with respx.mock:
-        respx.get(url__startswith=main_module.CENSUS_TRADE_BASE).mock(side_effect=_census_callback)
-        await main_module._fetch_and_persist_census_trade()
+        respx.get(url__startswith=collector.CENSUS_TRADE_BASE).mock(side_effect=_census_callback)
+        await collector._fetch_and_persist_census_trade()
 
     rows = tmp_db.get_census_trade("XAG", flow="import")
     months = {(r["year"], r["month"]) for r in rows}
@@ -228,7 +239,7 @@ async def test_lbma_weekend_fetch_walks_back_to_friday(tmp_db, upstream_client, 
     Friday's fix for a weekend date instead of erroring, so the fetch date
     must be walked back to a weekday before the call ever goes out."""
     monkeypatch.setenv("GAPI_API_KEY", "test-key")
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 19)))  # Sunday
+    monkeypatch.setattr(collector, "date", make_fake_date(date(2026, 7, 19)))  # Sunday
     requested_dates: list[str] = []
 
     def _goldapi_callback(request: httpx.Request) -> httpx.Response:
@@ -236,8 +247,8 @@ async def test_lbma_weekend_fetch_walks_back_to_friday(tmp_db, upstream_client, 
         return httpx.Response(200, json={"price": 3350.25, "currency": "USD"})
 
     with respx.mock:
-        respx.get(url__startswith=main_module.GOLDAPI_BASE).mock(side_effect=_goldapi_callback)
-        await main_module._fetch_and_persist_lbma_fix()
+        respx.get(url__startswith=collector.GOLDAPI_BASE).mock(side_effect=_goldapi_callback)
+        await collector._fetch_and_persist_lbma_fix()
 
     # Every outbound request asked for Friday 2026-07-17 — never the weekend.
     assert requested_dates and all(d == "20260717" for d in requested_dates)
@@ -256,7 +267,7 @@ async def test_yahoo_daily_retries_once_on_429_then_succeeds(upstream_client, mo
         respx.get(url__startswith=main_module.YAHOO_CHART_BASE).mock(
             side_effect=[httpx.Response(429), httpx.Response(200, json=payload)]
         )
-        bars = await main_module._fetch_yahoo_contract_daily("SIU26.CMX", days=370)
+        bars = await collector._fetch_yahoo_contract_daily("SIU26.CMX", days=370)
     assert bars == {"2026-07-15": (30.0, 1000)}
 
 
@@ -267,7 +278,7 @@ async def test_yahoo_daily_raises_after_second_429(upstream_client, monkeypatch)
             side_effect=[httpx.Response(429), httpx.Response(429)]
         )
         with pytest.raises(httpx.HTTPStatusError):
-            await main_module._fetch_yahoo_contract_daily("SIU26.CMX", days=370)
+            await collector._fetch_yahoo_contract_daily("SIU26.CMX", days=370)
 
 
 async def test_yahoo_daily_404_means_no_data_not_retry(upstream_client):
@@ -275,7 +286,7 @@ async def test_yahoo_daily_404_means_no_data_not_retry(upstream_client):
         route = respx.get(url__startswith=main_module.YAHOO_CHART_BASE).mock(
             return_value=httpx.Response(404)
         )
-        bars = await main_module._fetch_yahoo_contract_daily("SIQ99.CMX", days=370)
+        bars = await collector._fetch_yahoo_contract_daily("SIQ99.CMX", days=370)
     assert bars == {}
     assert route.call_count == 1
 
@@ -302,7 +313,7 @@ async def test_yahoo_daily_close_fetcher_writes_settlement_price_both_metals(
 
     with respx.mock:
         respx.get(url__startswith=main_module.YAHOO_CHART_BASE).mock(side_effect=_yahoo_callback)
-        await main_module._fetch_and_persist_yahoo_daily_close()
+        await collector._fetch_and_persist_yahoo_daily_close()
 
     xag_rows = tmp_db.get_settlement_price_series("XAG_YAHOO_DAILY_CLOSE")
     xau_rows = tmp_db.get_settlement_price_series("XAU_YAHOO_DAILY_CLOSE")
@@ -314,9 +325,9 @@ async def test_yahoo_daily_close_fetcher_writes_settlement_price_both_metals(
 
 
 def test_delivery_sort_key_parses_symbols():
-    assert main_module._delivery_sort_key("SIN26.CMX") == (2026, 7)
-    assert main_module._delivery_sort_key("SIZ25.CMX") == (2025, 12)
-    assert main_module._delivery_sort_key("GCQ26.CMX") == (2026, 8)
+    assert collector._delivery_sort_key("SIN26.CMX") == (2026, 7)
+    assert collector._delivery_sort_key("SIZ25.CMX") == (2025, 12)
+    assert collector._delivery_sort_key("GCQ26.CMX") == (2026, 8)
 
 
 async def test_curve_spread_next_must_be_strictly_later_delivery_month(
@@ -327,7 +338,7 @@ async def test_curve_spread_next_must_be_strictly_later_delivery_month(
     picked as 'next' against a later front month — the highest-volume
     STRICTLY-LATER candidate (SIU26) wins instead, even at lower volume."""
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 20)))
+    monkeypatch.setattr(collector, "date", make_fake_date(date(2026, 7, 20)))
     fixtures = {
         "SIN26.CMX": yahoo_chart_payload({"2026-07-15": (30.0, 1000)}),   # front: top volume
         "SIZ25.CMX": yahoo_chart_payload({"2026-07-15": (29.0, 500)}),    # the Bug-2 trap: earlier month
@@ -342,7 +353,7 @@ async def test_curve_spread_next_must_be_strictly_later_delivery_month(
 
     with respx.mock:
         respx.get(url__startswith=main_module.YAHOO_CHART_BASE).mock(side_effect=_yahoo_callback)
-        await main_module._fetch_and_persist_curve_spread()
+        await collector._fetch_and_persist_curve_spread()
 
     rows = tmp_db.get_curve_spread_series("XAG")
     assert len(rows) == 1
@@ -390,36 +401,36 @@ def test_mts_fiscal_month_prior_year_block():
     # 2026-06-30 publication (report FY 2026, "1.1"="October" = FY2025 =
     # calendar 2024-10, since FY2025 is the block's own FY = report_fy - 1).
     # Scaled down to FY2015/FY2014 here for round test numbers.
-    assert main_module._mts_fiscal_month_to_calendar("October", "1.1", "2015") == (2013, 10)
-    assert main_module._mts_fiscal_month_to_calendar("December", "1.3", "2015") == (2013, 12)
+    assert collector._mts_fiscal_month_to_calendar("October", "1.1", "2015") == (2013, 10)
+    assert collector._mts_fiscal_month_to_calendar("December", "1.3", "2015") == (2013, 12)
     # January-September of FY2014 (still "1.x") are calendar 2014.
-    assert main_module._mts_fiscal_month_to_calendar("January", "1.4", "2015") == (2014, 1)
-    assert main_module._mts_fiscal_month_to_calendar("September", "1.12", "2015") == (2014, 9)
+    assert collector._mts_fiscal_month_to_calendar("January", "1.4", "2015") == (2014, 1)
+    assert collector._mts_fiscal_month_to_calendar("September", "1.12", "2015") == (2014, 9)
 
 
 def test_mts_fiscal_month_current_year_block():
     # "2.x" = the report's own current FY (record_fiscal_year itself, no -1).
-    assert main_module._mts_fiscal_month_to_calendar("October", "2.1", "2015") == (2014, 10)
-    assert main_module._mts_fiscal_month_to_calendar("March", "2.6", "2015") == (2015, 3)
+    assert collector._mts_fiscal_month_to_calendar("October", "2.1", "2015") == (2014, 10)
+    assert collector._mts_fiscal_month_to_calendar("March", "2.6", "2015") == (2015, 3)
 
 
 def test_mts_fiscal_month_unrecognized_classification_returns_none():
     # Table 1 also carries subtotal/label rows (e.g. "FY 2014", "Year-to-Date")
     # even under record_type_cd=MTH filtering in edge cases — anything that
     # isn't a real month name must be skipped, not silently mis-parsed.
-    assert main_module._mts_fiscal_month_to_calendar("Year-to-Date", "1.13", "2015") is None
-    assert main_module._mts_fiscal_month_to_calendar("FY 2014", "1.0", "2015") is None
+    assert collector._mts_fiscal_month_to_calendar("Year-to-Date", "1.13", "2015") is None
+    assert collector._mts_fiscal_month_to_calendar("FY 2014", "1.0", "2015") is None
 
 
 def test_mts_amount_parses_null_sentinel_string_as_none():
     # MTS uses the literal string "null" (not JSON null) for an absent value.
-    assert main_module._mts_amount("null") is None
-    assert main_module._mts_amount(None) is None
-    assert main_module._mts_amount("123.45") == 123.45
+    assert collector._mts_amount("null") is None
+    assert collector._mts_amount(None) is None
+    assert collector._mts_amount("123.45") == 123.45
 
 
-TREASURY_MTS_TABLE1_URL = f"{main_module.TREASURY_MTS_BASE}/mts_table_1"
-TREASURY_MTS_TABLE5_URL = f"{main_module.TREASURY_MTS_BASE}/mts_table_5"
+TREASURY_MTS_TABLE1_URL = f"{collector.TREASURY_MTS_BASE}/mts_table_1"
+TREASURY_MTS_TABLE5_URL = f"{collector.TREASURY_MTS_BASE}/mts_table_5"
 
 
 def _mts_table1_payload() -> dict:
@@ -437,8 +448,8 @@ def _mts_table1_payload() -> dict:
 def _mts_table5_payload() -> dict:
     return {
         "data": [
-            {"record_date": "2013-10-31", "classification_desc": main_module.TREASURY_INTEREST_CLASSIFICATION, "current_month_net_outly_amt": "30000000000.0"},
-            {"record_date": "2015-10-31", "classification_desc": main_module.TREASURY_INTEREST_CLASSIFICATION, "current_month_net_outly_amt": "32000000000.0"},
+            {"record_date": "2013-10-31", "classification_desc": collector.TREASURY_INTEREST_CLASSIFICATION, "current_month_net_outly_amt": "30000000000.0"},
+            {"record_date": "2015-10-31", "classification_desc": collector.TREASURY_INTEREST_CLASSIFICATION, "current_month_net_outly_amt": "32000000000.0"},
         ]
     }
 
@@ -447,7 +458,7 @@ async def test_treasury_outlays_merges_table1_and_table5_by_month(tmp_db, upstre
     with respx.mock:
         respx.get(TREASURY_MTS_TABLE1_URL).mock(return_value=httpx.Response(200, json=_mts_table1_payload()))
         respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json=_mts_table5_payload()))
-        n = await main_module._fetch_and_persist_treasury_outlays()
+        n = await collector._fetch_and_persist_treasury_outlays()
 
     # Table 1 contributed 2 real months (the Year-to-Date row was skipped);
     # both happen to already have a Table 5 interest match at the same
@@ -476,13 +487,13 @@ async def test_treasury_outlays_upsert_overwrites_prior_publication(tmp_db, upst
     with respx.mock:
         respx.get(TREASURY_MTS_TABLE1_URL).mock(return_value=httpx.Response(200, json=_mts_table1_payload()))
         respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json=_mts_table5_payload()))
-        await main_module._fetch_and_persist_treasury_outlays()
+        await collector._fetch_and_persist_treasury_outlays()
 
     revised_payload = {"data": [_mts1_row("October", "1.1", "2015", 999e9, 580e9, 280e9)]}
     with respx.mock:
         respx.get(TREASURY_MTS_TABLE1_URL).mock(return_value=httpx.Response(200, json=revised_payload))
         respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json={"data": []}))
-        await main_module._fetch_and_persist_treasury_outlays()
+        await collector._fetch_and_persist_treasury_outlays()
 
     rows = {(r["year"], r["month"]): r for r in tmp_db.get_treasury_outlays()}
     assert rows[(2013, 10)]["receipts_usd"] == pytest.approx(999e9)
@@ -540,7 +551,7 @@ async def test_treasury_outlays_by_agency_extracts_department_totals(tmp_db, ups
     })
     with respx.mock:
         respx.get(TREASURY_MTS_TABLE5_URL).mock(return_value=httpx.Response(200, json=payload))
-        n = await main_module._fetch_and_persist_treasury_outlays_by_agency()
+        n = await collector._fetch_and_persist_treasury_outlays_by_agency()
 
     assert n == 2
     rows = {r["agency"]: r for r in tmp_db.get_treasury_outlays_by_agency()}
@@ -569,7 +580,7 @@ async def test_treasury_outlays_by_agency_skips_already_persisted_months(tmp_db,
 
     with respx.mock:
         respx.get(url__startswith=TREASURY_MTS_TABLE5_URL).mock(side_effect=_callback)
-        n = await main_module._fetch_and_persist_treasury_outlays_by_agency()
+        n = await collector._fetch_and_persist_treasury_outlays_by_agency()
 
     assert call_count == 0
     assert n == 0
@@ -621,7 +632,7 @@ def _sprott_payload(pslv_oz: int = 215_405_617) -> list:
 async def test_pslv_reads_index_1_not_id_field(tmp_db, upstream_client):
     with respx.mock:
         respx.get(PSLV_URL).mock(return_value=httpx.Response(200, json=_sprott_payload()))
-        result = await main_module._fetch_and_persist_pslv()
+        result = await collector._fetch_and_persist_pslv()
 
     assert result["fund"] == "PSLV"
     assert result["total_oz"] == 215_405_617
@@ -640,7 +651,7 @@ async def test_pslv_rejects_implausible_ounce_count(tmp_db, upstream_client):
     with respx.mock:
         respx.get(PSLV_URL).mock(return_value=httpx.Response(200, json=_sprott_payload(pslv_oz=3_000_000)))
         with pytest.raises(HTTPException) as exc_info:
-            await main_module._fetch_and_persist_pslv()
+            await collector._fetch_and_persist_pslv()
 
     assert exc_info.value.status_code == 502
     assert tmp_db.get_latest_pslv() is None  # nothing persisted on rejection
@@ -657,6 +668,6 @@ async def test_pslv_502s_on_id_based_response_shape(tmp_db, upstream_client):
     with respx.mock:
         respx.get(PSLV_URL).mock(return_value=httpx.Response(200, json=[_sprott_fund_entry(34.5, 3_747_944)]))
         with pytest.raises(HTTPException) as exc_info:
-            await main_module._fetch_and_persist_pslv()
+            await collector._fetch_and_persist_pslv()
 
     assert exc_info.value.status_code == 502

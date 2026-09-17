@@ -92,13 +92,16 @@ async def stack_client(tmp_db, tmp_stack_db, tmp_stack_images):
 
 @pytest.fixture()
 async def upstream_client(monkeypatch):
-    """Hands backend.main a real AsyncClient (lifespan normally creates
-    _client; tests skip lifespan) so respx can intercept its requests."""
+    """Hands backend.collector a real AsyncClient (lifespan normally
+    creates _client via collector._client, api-split-implementation-plan.md
+    Story 2.1; tests skip lifespan) so respx can intercept its requests.
+    Every _fetch_and_persist_* function reads the module-level _client from
+    backend.collector now, not backend.main, since that's where they moved."""
     import httpx
 
-    from backend import main as main_module
+    from backend import collector
 
     client = httpx.AsyncClient()
-    monkeypatch.setattr(main_module, "_client", client)
+    monkeypatch.setattr(collector, "_client", client)
     yield client
     await client.aclose()

@@ -1,4 +1,4 @@
-# ArgentVigil v2.20.0
+# ArgentVigil v2.23.0
 
 Silver speculative-positioning monitor with gold as comparative context. Framing is **"selling dollars, not buying metals"** — is the speculative futures crowd genuinely capitulated, or just pulling back. Not a trading system: no price targets, no prediction framing, no risk-tolerance commentary. `SPEC.MD` is a retired holdover from an earlier one-big-file era (it once covered the Stock & Flow panel spec and CATCOR feature map together) — **do not reference it**; that content now lives inline in this doc's own Tab: Inventory and Tab: CATCOR sections below, following the same one-spec-file-per-feature convention as everything else. Companion spec docs are **ephemeral story documents** — gitignored, local-only, closed-JIRA-ticket semantics: written to drive one development effort, deletable (and mostly deleted) once their stories land. Specs referenced by name throughout this doc (`deliveryBehavior-spec.md`, `dataHealth-spec.md`, `international-trade-spec.md`, `fed-balance-spec.md`, `price-spec.md`, `catcor-events-spec.md`, `squeeze-context-spec.md`, `datasources-spec.md`) may therefore no longer exist on disk — **this doc is the durable record**; a missing spec file is not missing information, never block on reading one, and never treat a still-present spec as more current than this doc (a landed spec's text is frozen at landing time). In-flight or recently-landed specs live in `specs/`. `frontend/docs/UI_STANDARDS.md` (checked in, not gitignored) covers cross-cutting interactive-UI conventions (legends, tooltips, color coding, sizing — check new interactive elements against it before inventing a new pattern); `README.md` covers the user-facing feature/data-source overview.
 
@@ -7,6 +7,7 @@ This doc is organized **by app tab** — the seven nav sections below match `fro
 ## Standing architectural rules (apply to every tab below)
 
 - **Persist-on-fetch**: every route that talks to an upstream source has a `_fetch_and_persist_*` function that fetches, reshapes, and writes to SQLite; a paired `/db`-suffixed route reads the same data straight back out with no upstream call. **The frontend calls only `/db`-suffixed (or `/api/cot/db`, `/api/prices/db`) routes — it never triggers a live upstream fetch itself.** Rationale: CATCOR's and Delivery Behavior's cross-check features assume AV's database is already the real record, not a pass-through — a route that fetched live on every request would let two simultaneous reads observe two different upstream states, breaking that assumption. (Formerly documented in the retired `SPEC.MD`'s "Persist-on-Fetch Re-architecture" section — see the note on `SPEC.MD` above; this is now the canonical statement of the rule.) **Sanctioned exception, encoded as `ALLOWED_NON_DB_API` in `tests/test_conventions.py`**: user-initiated refresh *commands* (Money Supply's Refresh button → `/api/fred/money-supply/refresh` + `/api/metals/prices/refresh`, the Data tab's Re-run now → `POST /api/health/refresh/{key}`, `POST /api/refresh/force`, `/api/catcor/refresh`). These trigger a `_fetch_and_persist_*` server-side; the frontend still only ever *reads* `/db` routes afterward — the rule's real content is that no data-read path fetches upstream, not that no user action may trigger a persist.
+- **API versioning: `/api/v1` is the real prefix, `/api` is a temporary alias, deprecation window is 90 days.** (api-split-implementation-plan.md Story 3.1/3.3.) Every route lives on one `APIRouter` (`main.py`'s `api_router`, paths declared relative to `/api`, e.g. `"/silver/db/history"`) mounted twice: `app.include_router(api_router, prefix="/api/v1")` (the versioned path every route is really meant to be reached at) and `app.include_router(api_router, prefix="/api")` (a bare, unversioned alias kept only so a frontend deploy and a backend deploy don't have to land in the same change). The frontend's shared `apiFetch` helper (`frontend/src/api_client.js`) rewrites every literal `/api/...` call site to `/api/v1/...` at request time via `versionedPath()` — call sites themselves still read `/api/...` in source (that's what `tests/test_conventions.py`'s frontend-fetch scan checks), so a future `/v2` cut is a one-line change in that one helper, not a per-call-site sweep. **Deprecation policy**: once a new major version (`/api/v2`) exists and the frontend has migrated to it, the previous version's bare alias (and eventually the versioned prefix itself) gets a 90-day deprecation window from the day the new version ships before removal — announced in this doc's version-bump entry for that release, not silently dropped. `/api` (today's alias for `/v1`) should be removed, and this bullet updated to drop the alias-related language, once the frontend is confirmed on `/api/v1` everywhere in a real deployment and that 90-day window has passed; until then both prefixes stay live and this is not yet due. New routes are added to `api_router` like every existing one — never registered directly on `app`, and never at a bare unversioned path with no `/api/v1` counterpart.
 - **One shared database**: `runtime/argentvigil.db` (gitignored), owned by `backend/db.py`, `DB_PATH` computed `__file__`-relative (two directories up from `backend/db.py`, into `runtime/`). Every tab's tables live here — there is no per-tab or per-layer database file. `runtime/` contains nothing else (an earlier flat-file cache for CATCOR's ForexFactory feed was migrated into a table — see CATCOR section below).
 - **Backend package layout**: `backend/` is a real package (`backend/__init__.py`, empty, enables `from . import db` and `uvicorn backend.main:app`). `seed_data/` (manually-maintained static content) and `runtime/` (gitignored generated state) are namespace packages / non-packages sitting alongside it, not nested inside it.
 - **Tiered background refresh, per-source cadence** (`main.py`'s `lifespan`/`_schedule_loop`): a single generic scheduler dispatches every registered source per its own `CadenceSpec`, without the frontend ever calling upstream. **Fast tier** = spot prices only (the one genuinely intraday-moving figure, one shared tunable `fast_interval_s`). **Slow tier** = every other `trigger="interval"` source — as of the per-source-cadence pass, each one owns its own real `interval_seconds` reflecting its own upstream cadence, not one shared blanket interval: `EXCHANGE_INVENTORY_INTERVAL_S` (~25h — a day plus a safety margin) for most daily exchange-inventory sources (COMEX/SHFE inventory, delivery notices, PSLV, curve spread); `LEVERAGE_VOLUME_INTERVAL_S` (6h) for `silver_leverage`/`gold_leverage` specifically (their `volume-oi` upstream's `date` field lags the real day irregularly — polling 4×/day instead of 1× catches more of the roll-forwards, see the Silver/Gold LBMA/volume section below); weekly for `money_supply` and `census_trade` (the latter's own `min_gap`-based self-gating inside its fetch_fn still enforces the true ~25-day floor regardless of how often the scheduler ticks); daily for `metals_prices`; monthly for `treasury_outlays`/`treasury_outlays_by_agency`. **`lbma_fix` is the one exception, deliberately not on this list** — briefly given the same `EXCHANGE_INVENTORY_INTERVAL_S` recurring cadence during the per-source-cadence pass, then reverted to plain `manual_only` (no `fire_at_startup` either) days later after that recurring version burned through GoldAPI.io's free-tier 500 req/month quota — the original per-cycle cost estimate (2 req/fetch) missed that the fetch function's own "today not posted yet" fallback can double it to 4 req/cycle, and this data has no frontend consumer to justify continuous polling of a quota-scarce source in the first place. See the Silver/Gold sections' LBMA fix entry below for the full detail; re-evaluate a recurring cadence only if this data gets a real UI surface again. Both tiers run once, unconditionally, at server startup (`fire_at_startup=True`), then **default to enabled** (flipped from disabled-by-default in the per-source-cadence pass, since a continuously-run instance should track upstream on its own rather than go stale between manual force-refreshes) — the enabled flag persists across restarts via `ui_settings.refresh_enabled` (`db.set_refresh_enabled`/`get_refresh_enabled`, same single-row-upsert convention as the pinned-default-tab feature; previously in-memory-only, silently reverting to the hardcoded default on every restart). `POST /api/refresh/force` runs both tiers once immediately regardless of enabled state, returns real per-tier `{"succeeded","failed","errors"}` counts, and — only if at least one source actually succeeded — dispatches a `FORCE_REFRESH_EVENT` window `CustomEvent` that Inventory/CoT/CATCOR panels listen for to re-read their `/db` data immediately. CoT and Research are excluded from force-update (CoT stays pipeline-only; Research is on-demand chat, nothing to force-refresh). `frontend/src/refresh_controls.jsx`'s `RefreshControls` panel (re-mounted in the Data tab as of this pass, previously built but unrendered) exposes fast tier's enable+interval and slow tier's enable-only toggle (no shared slow interval to expose anymore) plus the force-update button; per-source cadence is hand-tuned via the Data tab's existing per-source interval override (`POST /api/data-sources/{key}/interval`), not from this panel.
@@ -444,6 +445,70 @@ Sources with no periodic fetch of their own (`catcor_calendar`'s static seed, `r
 
 A small always-visible header dot (`HeaderHealthDot` in `App.jsx`) polls `/api/health/db` every 60s independent of which tab is active — red if any tracked source is erroring, yellow if any is stale with no errors, green otherwise; links nowhere, but the ⚙️ gear icon right next to it opens Settings for the per-source drill-down (the dot is the glanceable signal, the gear is the detail view it implicitly points at).
 
+### Data source catalog (durable record, folded in from the retired `api-split-spec.md` §2)
+
+A flattened, API-shaped view of `backend/sources.py`'s `SOURCE_REGISTRY` (**27 entries** as
+of this fold-in — grew from the 12 the original spec recorded once the exchange-inventory
+sources below were folded into the formal registry, see the second table's note) cross-
+referenced against the tables each owns and the read/refresh routes that expose them. Route
+paths are the real `/api/v1/...` paths per Story 3.1's versioning migration (Standing rules'
+API versioning bullet) — the bare `/api/...` alias also still answers, per that same rule.
+Where a tab's own `CLAUDE.md` section has richer prose on a source's quirks, that section is
+the source of truth for narrative detail; this table is the lookup surface.
+
+| Source key | Captures | Cadence (trigger / interval) | Tables owned | Read route(s) | Refresh route | Notes |
+|---|---|---|---|---|---|---|
+| `spot_prices` | Live XAG/XAU spot ticks (metalcharts.org) | interval, fast tier (~60s) | `spot_price` | `GET /api/v1/prices`, `/api/v1/prices/db`, `/api/v1/prices/db/ticks` | `POST /api/v1/refresh/force` (fast tier) | Skips persist when market closed or feed stale, see `_metals_market_closed` |
+| `money_supply` | FRED M2/WALCL/CPI/H.4.1 Composition/Yields/TIC | interval (weekly), `fire_at_startup` | `fred_observations` | `GET /api/v1/fred/money-supply/db` | `GET /api/v1/fred/money-supply/refresh` | Requires `FRED_API_KEY` |
+| `metals_prices` | Yahoo daily closes, XAG/XAU | interval (daily), `fire_at_startup` | `settlement_price` (`XAG_YAHOO_DAILY_CLOSE`/`XAU_YAHOO_DAILY_CLOSE`) | `GET /api/v1/metals/prices/db`, `/db/daily-range` | `GET /api/v1/metals/prices/refresh` | Shared Yahoo fetch (`yahoo_prices.py`) |
+| `treasury_outlays` | Monthly Treasury Statement, topline | interval (monthly), `fire_at_startup` | `treasury_outlays` | `GET /api/v1/treasury-outlays/db` | via `POST /api/v1/refresh/force` (slow tier) | |
+| `treasury_outlays_by_agency` | MTS by department/agency | interval (monthly), `fire_at_startup` | `treasury_outlays_by_agency` | `GET /api/v1/treasury-outlays-by-agency/db` | via `POST /api/v1/refresh/force` | |
+| `treasury_auctions` | Treasury Auctions Query API, bid-to-cover + buyer mix | interval (daily), `fire_at_startup` | `treasury_auctions` | `GET /api/v1/treasury-auctions/db` | via `POST /api/v1/refresh/force` | Rolling 120-day window |
+| `cot_pipeline` | CFTC COT (Legacy + Disaggregated), silver + gold | `manual_only`, self-gated (min 7 days) | `cot_silver`, `cot_gold`, `cot_disaggregated`, `settlement_price` (weekly CoT-aligned), `pipeline_runs` | `GET /api/v1/cot/db` | `POST /api/v1/health/refresh/cot_pipeline`, or `python3 pipeline/run.py` | Never auto-fires; deliberate asymmetry, see Tab: CoT |
+| `lbma_fix` | GoldAPI.io LBMA gold AM / silver daily fix | `manual_only`, no `fire_at_startup` | `settlement_price` (`XAG_LBMA`/`XAU_LBMA`) | `GET /api/v1/lbma/db`, `/db/history` | `POST /api/v1/health/refresh/lbma_fix` | Reverted from recurring after quota exhaustion; no frontend consumer today |
+| `census_trade` | US Census Int'l Trade, HS 7106/7108 | interval (weekly tick, ~25-day self-gate) | `census_trade` | `GET /api/v1/census-trade/db` | via `POST /api/v1/refresh/force` (self-gated) | Requires `CENSUS_API_KEY`; `implied_qty_oz` computed at read time |
+| `ofac_sanctions` | OFAC SDN + Consolidated Advanced XML | interval (~daily), `fire_at_startup` | `ofac_designations`, `ofac_aliases`, `ofac_addresses`, `ofac_id_documents` | `GET /api/v1/ofac/db`, `/{ofac_uid}/db` | via `POST /api/v1/refresh/force` | Diff-and-persist against prior day's pull |
+| `catcor_startup` | CATCOR calendar seed (FOMC static + ALFRED CPI/NFP) + intraday/daily backfill | interval (weekly), `fire_at_startup` | `event_calendar`, `spot_price` (futures instruments), `settlement_price`, `forexfactory_calendar`, `macro_price_reaction` | `GET /api/v1/catcor/events/db` | `POST /api/v1/catcor/refresh` | |
+| `catcor_consensus_actuals` | ForexFactory consensus + ALFRED actuals | interval (~30min) | `forexfactory_calendar`, `event_calendar` | (feeds `/api/v1/catcor/events/db`) | via same tick | Once/calendar-week fetch, 429-prone |
+| `catcor_snapshot` | Price-reaction capture at event T±windows | `always_on` (60s poll) | `macro_price_reaction` | `GET /api/v1/catcor/reactions/db` | n/a — never gated/overridable | Structurally can't be disabled; missed window = permanent data loss |
+| `comex_silver_history` | COMEX silver registered/eligible/total aggregate | interval (~25h) | `inventory_aggregate` | `GET /api/v1/silver/db/history` | via `POST /api/v1/refresh/force` | |
+| `comex_silver_depositories` | COMEX silver per-vault snapshot | interval (~25h) | `inventory_depository` | `GET /api/v1/silver/db/depositories`, `/depositories/history` | via `POST /api/v1/refresh/force` | Real history only from 2026-07-01, see Tab: Inventory |
+| `comex_gold_history` | COMEX gold aggregate (parallels silver) | interval (~25h) | `gold_inventory_aggregate` | `GET /api/v1/gold/db/history` | via `POST /api/v1/refresh/force` | |
+| `comex_gold_depositories` | COMEX gold per-vault (fetched, no frontend consumer) | interval (~25h) | `gold_inventory_depository` | `GET /api/v1/gold/db/depositories`, `/depositories/history` | via `POST /api/v1/refresh/force` | Known no-op, see Tab: Inventory known gaps |
+| `delivery_notices` | COMEX silver delivery notices (issued/stopped) | interval (~25h) | `delivery_notices` | `GET /api/v1/silver/db/delivery` | via `POST /api/v1/refresh/force` | Fetched as `type=ytd`, see Tab: Inventory |
+| `gold_delivery_notices` | COMEX gold delivery notices | interval (~25h) | `gold_delivery_notices` | `GET /api/v1/gold/db/delivery` | via `POST /api/v1/refresh/force` | |
+| `silver_leverage` | Silver daily volume (leverage/OI no longer written, see Tab: CoT) | interval (6h, `LEVERAGE_VOLUME_INTERVAL_S`) | `volume_oi` | `GET /api/v1/silver/db/leverage`, `/leverage/history`, `GET /api/v1/volume/db/history` | via `POST /api/v1/refresh/force` | `open_interest`/`paper_leverage` persisted `NULL` since the CFTC-only fix |
+| `gold_leverage` | Gold daily volume (mirrors silver_leverage) | interval (6h) | `gold_volume_oi` | `GET /api/v1/gold/db/leverage`, `/leverage/history` | via `POST /api/v1/refresh/force` | |
+| `shfe_silver_history` | SHFE silver aggregate warrant stock | interval (~25h) | `shfe_inventory` | `GET /api/v1/shfe/db/history` | via `POST /api/v1/refresh/force` | No registered/eligible split, see Tab: Inventory |
+| `shfe_gold_history` | SHFE gold aggregate (mirrors silver) | interval (~25h) | `shfe_gold_inventory` | `GET /api/v1/shfe/gold/db/history` | via `POST /api/v1/refresh/force` | |
+| `shfe_warehouses` | SHFE silver per-warehouse snapshot + history | interval (~25h) | `shfe_warehouse` | `GET /api/v1/shfe/db/warehouses`, `/warehouses/history` | via `POST /api/v1/refresh/force` | |
+| `shfe_gold_warehouses` | SHFE gold per-warehouse (confirmed permanently empty upstream) | interval (~25h) | `shfe_gold_warehouse` | `GET /api/v1/shfe/gold/db/warehouses`, `/warehouses/history` | via `POST /api/v1/refresh/force` | Real `200`/`data: []`, see Tab: Inventory |
+| `futures_curve_spread` | COMEX front/next-month settlement spread, both metals | interval (~25h) | `futures_curve_spread` | `GET /api/v1/curve-spread/db` | via `POST /api/v1/refresh/force` | Per-date liquidity-ranked, see Tab: CoT's Squeeze Context |
+| `pslv` | Sprott PSLV custodial oz | interval (~25h) | `pslv_snapshot` | `GET /api/v1/pslv/db` | via `POST /api/v1/refresh/force` | Fixed-index parse into Sprott's multi-fund array |
+
+**Not in `SOURCE_REGISTRY`** — no periodic upstream fetch, so no `CadenceSpec` applies (pure
+DB reads over derived/static/user-CRUD data):
+
+| Domain | Tables | Read route(s) | Write route(s) | Notes |
+|---|---|---|---|---|
+| Delivery Behavior (derived) | reads inventory + delivery_notices + cot_disaggregated | `GET /api/v1/delivery-behavior/db` | n/a (no fetch, pure compute) | |
+| Squeeze case log | `squeeze_case_log` | `GET /api/v1/squeeze-cases/db` | none (hand-maintained) | |
+| Research (CATCOR Research Pane) | `research_sessions`, `research_messages`, `research_log` | `GET /api/v1/catcor/research/sessions*` | `POST /api/v1/catcor/research/sessions/*` | On-demand chat, not a scheduled source |
+| Stack Tracker | `stack_items`, `stack_reference_links`, `stack_item_images` (separate `stack.db`) | `GET /api/v1/stack/*/db` | `POST/PUT/DELETE /api/v1/stack/*` | Pure user CRUD, no upstream |
+| Market balance / demand composition | none (reads `seed_data/silver_market_balance.json`) | `GET /api/v1/silver/market-balance` | none | Static seed data |
+
+**Infra/settings tables** (not data sources themselves): `source_health` (fetch health, one
+row per source), `interval_overrides` (per-source cadence overrides), `pipeline_runs`,
+`ui_settings`.
+
+**Drift note from the original spec**: `api-split-spec.md`'s §2 recorded 12 registry entries
+and listed exchange inventory (COMEX/SHFE/leverage/PSLV/curve-spread) under the "not in
+registry" table, flagging their formal registration as a natural follow-on cleanup. That
+cleanup has since happened — all 15 of those sources are now real `SOURCE_REGISTRY` entries,
+reflected in the first table above rather than the second. This is the kind of drift the
+spec's own retirement (see the header note at the top of this doc) exists to prevent — this
+table, not the now-deleted spec, is the durable record going forward.
+
 ### Census International Trade (`census_trade`, per international-trade-spec.md)
 
 Documented here in the Data tab; its frontend surface is the Inventory tab's **Trade Flow** panel (see Tab: Inventory — added after the spec's original v1 backend-only scope). U.S. Census Bureau International Trade API, monthly imports/exports for HS 7106 (silver) and HS 7108 (gold, comparison-only per the standing "gold as context" rule — no gold-specific signal or panel). Answers "where does US silver supply actually come from, and is that mix shifting" with a primary-source view of trade flow (value, quantity, country-of-origin/destination) — does not attempt to reproduce USGS's net-import-reliance %, which needs domestic mine-production data AV doesn't track.
@@ -672,10 +737,12 @@ Nav wiring: added to `App.jsx`'s `SECTIONS` array and `main.py`'s `_VALID_NAV_SE
 
 ```text
 backend/
-  main.py               FastAPI app: fetch+persist functions + /db read routes for every tab above, plus /api/refresh/settings + /api/refresh/force (tiered refresh control) and /api/health/* (Data Health). Serves frontend/dist. Invoked as `uvicorn backend.main:app` (package-qualified, not cwd-relative).
+  main.py               FastAPI app: every route (all on one `api_router`, mounted at both /api/v1 and the temporary /api alias — see Standing rules' API versioning entry) + /api/v1/refresh/settings + /api/v1/refresh/force (tiered refresh control) and /api/v1/health/* (Data Health). No route for "/" — the frontend lives entirely behind its own origin (Vite dev server locally, nginx in the containerized deploy). Invoked as `uvicorn backend.main:app` (package-qualified, not cwd-relative). Calls `collector.register_sources()` once at module-import time so api's own health/data-source routes see a populated registry independent of whether collector's own process has run — see collector.py's own entry below for why this call exists in both places.
+  collector.py            The scheduler + every _fetch_and_persist_* function + `register_sources()` (the canonical `sources.register(...)` calls, all of them — moved here from main.py 2026-09-17 after a real bug: `python -m backend.collector` never imports main.py, so a standalone collector process ran with an EMPTY sources.SOURCE_REGISTRY, silently iterating zero sources forever). A plain asyncio entrypoint (`python -m backend.collector`), no FastAPI import — `run()` calls `register_sources()` at the top of its own startup, then the one-shot backfill/tier-refresh + `_schedule_loop`. main.py's lifespan runs the scheduler pieces in-process by default (RUN_COLLECTOR_IN_PROCESS=true) for single-process local dev; the containerized deploy runs collector as its own compose service with that flag set false, and calls `register_sources()` independently at import time (see main.py's entry above) since api's own routes need the registry populated in api's process too.
+  models.py               Pydantic response models — additive typing (response_model= on main.py's routes) for the Stack/OFAC/CoT route groups so far; more groups (Money Supply, Inventory, CATCOR, Research) are a natural follow-on, not yet done. Written against each route's real current return shape, never the other way around.
   db.py                 SQLite persistence (sqlite3 stdlib, no ORM) — runtime/argentvigil.db, DB_PATH computed __file__-relative, os.makedirs guard. See each tab section above for its own tables; gold has parallel tables to silver (gold_inventory_aggregate, gold_inventory_depository, gold_volume_oi) throughout.
   mc_token.py            metalcharts.org auth token fetch/cache (module-level globals, single-process only)
-  sources.py             Canonical data-source registry (datasources-spec.md Stories #1+#3) — SourceDefinition/CadenceSpec/RateLimitSpec, populated from main.py into sources.SOURCE_REGISTRY. Single source of truth for cadence/rate-limit/self-recording that main.py's _schedule_loop, POST /api/health/refresh/{source_key}, and GET /api/health/db (Tab: Data above) all read from.
+  sources.py             Canonical data-source registry — SourceDefinition/CadenceSpec/RateLimitSpec, `SOURCE_REGISTRY` populated by `collector.register_sources()` (called once each from both main.py's module scope and collector.run()). Single source of truth for cadence/rate-limit/self-recording that collector.py's `_schedule_loop`, `POST /api/v1/health/refresh/{source_key}`, and `GET /api/v1/health/db` (Tab: Data above) all read from.
   units.py               Canonical unit constants (SILVER_CONTRACT_OZ, GOLD_CONTRACT_OZ, TROY_OZ_PER_KG) — see Cross-cutting data conventions' Unit constants entry; stdlib-free, importable without the venv
   price_instruments.py    Canonical price instrument identifiers (price-architecture-spec.md) — the closed set written to spot_price/settlement_price; see Cross-cutting data conventions' Price instrument registry entry. Stdlib-free, importable without the venv, same constraint units.py carries.
   yahoo_prices.py          Canonical Yahoo Finance chart-API caller (price-architecture-spec.md's Fetch consolidation) — one fetch_yahoo_bars() used by every Yahoo call site in main.py/catcor.py, replacing four near-duplicate HTTP-call-and-parse blocks.
@@ -780,17 +847,76 @@ utils/
 
 ## Running it
 
+**Two independent paths, for different purposes — both are expected to keep working.**
+`vigil.sh` (bare processes, Vite HMR, seconds-scale restarts, debugger-attachable) is the
+fast local-dev inner loop; `vigil-docker.sh`/`docker compose` (the containerized deploy
+shape — separate `api`/`web` origins, nginx, no HMR) is the outer loop that matches what
+an eventual real deployment looks like — see `api-split-implementation-plan.md` Story 1.6.
+Neither replaces the other: local Python/JS edits go through `vigil.sh` day to day; reach
+for the Docker path specifically to verify cross-origin behavior, the `/stack_images`
+nginx proxy, or anything else that only manifests when frontend and backend are genuinely
+different origins.
+
+### Local dev (`vigil.sh`) — the default day-to-day path
+
 ```bash
 bash utils/vigil.sh start         # everything, as background daemons (venv bootstrap + backend :8000 + frontend :5173)
 bash utils/vigil.sh restart backend   # after backend Python edits — picks up the change (no --reload running)
 bash utils/vigil.sh stop          # stop everything
 python3 pipeline/run.py           # CoT pipeline only, no server needed
-bash utils/vigil.sh test          # full test suite (83 tests, ~8s) — see ## Tests; pytest args pass through
+bash utils/vigil.sh test          # full test suite (253 tests, ~12s) — see ## Tests; pytest args pass through
 ```
+
+The frontend talks to the backend via Vite's dev proxy (`frontend/vite.config.js`,
+`/api`/`/stack_images` → `http://localhost:8000`) — `VITE_API_BASE_URL` stays unset for
+this path, which is `api_client.js`'s documented default (empty string → same-origin
+relative paths → the proxy), so nothing needs configuring locally. `backend/main.py`
+serves API routes and `/stack_images` only — it has no `/` route and never serves the
+built frontend (the `frontend/dist` `StaticFiles` mount was removed as part of the API
+split, see `api-split-implementation-plan.md` Story 1.5); `vigil.sh start`'s frontend
+process (Vite) is what serves the UI in this path, not the backend.
 
 Run the pipeline at least once before the frontend, since the CoT tab reads from `/api/cot/db`, which reads `cot_silver`/`cot_gold` from `runtime/argentvigil.db` — empty tables make that route return a `500` ("No CoT data persisted yet. Run pipeline/run.py first.").
 
 The exchange-inventory/FRED/spot-price data populates itself on first backend startup regardless (a one-time unconditional refresh runs in `main.py`'s `lifespan`) — the tiered background refresh only *repeats* on a schedule if explicitly enabled via `POST /api/refresh/settings` or forced via `POST /api/refresh/force`. CATCOR's event calendar and reaction backfill also run automatically on every startup — no manual trigger needed, though `/api/catcor/refresh` exists for an on-demand re-run. ALFRED calls need `FRED_API_KEY` set in whatever shell launches the backend — without it, the event calendar and price reactions still populate, but `actual_value`/`surprise_delta` stay `NULL`. Research's Anthropic backend needs `ANTHROPIC_API_KEY` only if `AI_BACKEND=anthropic` is explicitly set (default is `forge`, which needs no key but does need the `amp-forge` LAN service reachable). The LBMA fix (see Silver/Gold sections above) needs `GAPI_API_KEY` (GoldAPI.io, free tier) — without it, the `lbma_fix` source's fetch_fn logs a skip message and the rest of the app boots normally; the `XAG_LBMA`/`XAU_LBMA` settlement_price instruments just stay empty (no frontend consumer currently surfaces them anyway, see the Silver/Gold sections above).
+
+### Containerized deploy ("Test AV") — `docker compose` / `vigil-docker.sh`
+
+```bash
+bash utils/refresh-test-db.sh     # snapshot prod's runtime/data/prod/ into runtime/data/test/ — "a copy of now," on demand, no automatic cadence. Refuses to run while Test AV's containers are up.
+bash utils/vigil-docker.sh up     # ensures Docker is reachable (starts Colima if needed), docker compose up -d --build, prints the URL
+bash utils/vigil-docker.sh status # docker compose ps
+bash utils/vigil-docker.sh logs [service]   # docker compose logs -f [service]
+bash utils/vigil-docker.sh down   # docker compose down (containers only — does not stop Colima)
+```
+
+Brings up `api` (FastAPI + the tiered background scheduler, still in-process per Stage 1
+of the API split — the `collector` service split is Stage 2, not yet landed) and `web`
+(nginx serving the built frontend + proxying `/stack_images/*` to `api`), per
+`docker-compose.yml`. Deliberately on its own ports — **api :6977 / web :6978** — distinct
+from `vigil.sh`'s prod (:8000/:5173), so both stacks can run simultaneously with zero
+port collision. The frontend's header health dot renders as a pulsing neon-magenta glow
+instead of its normal health color whenever running as Test AV (`VITE_AV_ENV` build arg),
+so it's visually unmistakable which environment is on screen at a glance.
+
+**Data is genuinely isolated from prod, not just port-isolated.** `api` bind-mounts
+`runtime/data/test/` (configurable via `HOST_RUNTIME_DIR`), never `runtime/data/prod/`
+directly — `utils/refresh-test-db.sh` is the only way data gets into the test directory,
+copying prod's `argentvigil.db`/`stack.db`/`stack_images/` on demand. Running
+`vigil-docker.sh up` before ever running the refresh script boots `api` against an empty
+DB (same "No CoT data persisted yet" 500 as a from-scratch local checkout) rather than
+touching prod — expected, not a bug. **Test AV's own scheduler keeps running live once
+up** — it is not a frozen fixture; real upstream fetches keep landing in
+`runtime/data/test/` for as long as the containers run, confirmed as the intended
+behavior (not a gap) per `api-split-implementation-plan.md` Story 1.3's exit notes.
+
+Requires a real Docker daemon — this machine's is Colima (`vigil-docker.sh` starts it
+automatically if not already running; sizing is hardcoded to this repo's documented dev
+settings, 4 CPU / 8GB / 60GB disk). SQLite is confirmed still in plain rollback-journal
+mode (not WAL — that's Story 2.3), so `vigil.sh`'s native backend and any container ever
+bind-mounted to the *same* data directory at the same time is a real one-writer-many-
+writers hazard; currently safe by construction only because prod and Test AV point at
+different directories.
 
 **Always run Python through `.venv`, never bare `python3`.** `bash utils/vigil.sh start` creates
 `.venv` on first run and installs `requirements.txt` into it (`fastapi`, `uvicorn`, `httpx`,
@@ -805,7 +931,7 @@ exception: it's intentionally stdlib-only by design and *can* run under bare `py
 Standing instructions for every interaction in this repo — distinct from each tab's "known gaps" (which describe upstream/data limitations, not workflow). Add to this section directly as new quirks/preferences come up.
 
 - **Always run Python through `.venv`, never bare `python3`** — see the full rule under "Running it" above. `pipeline/` is the sole stdlib-only exception.
-- **Use `utils/vigil.sh` to stop/start services** — always allowed, no need to ask first.
+- **Use `utils/vigil.sh` to stop/start services** — always allowed, no need to ask first. Same for `utils/vigil-docker.sh` (the containerized "Test AV" path, see ## Running it) and `utils/refresh-test-db.sh`.
 - **Bump the version number in this file's title (`# ArgentVigil vX.Y.Z`) on every feature completion** — a new spec, or any change bigger than a typo/doc tweak. Not on every edit; only when a development effort actually completes. **`README.md`'s title carries the same version and must be bumped in the same change** — `tests/test_conventions.py`'s `test_readme_version_matches_claude_md` fails the suite on drift (deliberately not a per-commit auto-increment, which would make the number meaningless against this rule's "feature completion, not every edit" semantics). A versioned pre-commit hook (`utils/githooks/pre-commit`, wired via `git config core.hooksPath utils/githooks` — per-clone, one-time; already set in this clone) runs the full suite on every commit, so drift can't be committed either; it resolves the repo root via `git rev-parse --show-toplevel`, works from any cwd, and fails with a bootstrap hint if `.venv` is missing. README structure (as of v1.27.0): three fixed top sections — BUSINESS LEVEL / TECH LEVEL / NEXT UP — plus orientation-only `backend/README.md` and `frontend/README.md`; all three stay high-level and point here for the exhaustive record, never duplicate this doc's narratives.
 - **`utils/` scripts other than `vigil.sh` are human-facing diagnostics/one-offs** (`claims/claimExtract.py`, the metalcharts sniffers, etc.) — not app code. Out of scope for the test suite; don't test, refactor, or register them as part of app work. (`gen_data_dictionary.py`/`gen_source_scaffold.py` are the documented exceptions — real tooling, see Repo layout.)
 - **Pace manual diagnostic calls: minimum 2-3 seconds between requests to the same domain.** Some of AV's upstreams rate-limit severely (ForexFactory has locked out an IP from repeat hits; GoldAPI's monthly quota was exhausted once by investigation testing alone; Yahoo has 429'd rapid-fire probes). Applies to any ad hoc curl/scripted investigation against a live upstream — the app's own fetch loops already have their gates (`RateLimitSpec`), this rule is for hand-run diagnostics, which don't.

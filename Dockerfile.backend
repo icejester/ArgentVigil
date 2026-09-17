@@ -14,6 +14,17 @@ COPY backend/ backend/
 COPY pipeline/ pipeline/
 COPY seed_data/ seed_data/
 
+# Unbuffered stdout/stderr — collector.py has no HTTP server of its own, so its
+# prints/tracebacks are the only visibility `docker compose logs collector` has.
+# Without this, Python fully buffers stdout when it isn't a TTY, so a hung or
+# crashed collector process shows zero log output even while genuinely stuck
+# (api-split-implementation-plan.md Story 2.2's flagged-but-unfixed gap — a
+# real hang on 2026-09-16/17 took ~20min of /proc forensics to diagnose
+# because of this; confirmed live that the running collector process was
+# hung at 0% CPU with no source_health writes for 17h, and its very first
+# print (emitted before any await) never appeared in `docker compose logs`).
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 8000
 
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

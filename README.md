@@ -1,4 +1,4 @@
-# ArgentVigil v2.20.0
+# ArgentVigil v2.23.0
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -84,8 +84,18 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
   bash utils/vigil.sh start            # venv bootstrap + backend :8000 + frontend :5173
   bash utils/vigil.sh restart backend  # after backend Python edits
   bash utils/vigil.sh stop
-  bash utils/vigil.sh test             # full test suite (241 tests, ~11s), pytest args pass through
+  bash utils/vigil.sh test             # full test suite (253 tests, ~12s), pytest args pass through
   python3 pipeline/run.py              # CoT pipeline — run once before first frontend use
+  ```
+
+- **Containerized deploy ("Test AV")** — a separate, optional path for exercising the
+  real deploy shape (frontend and backend on genuinely different origins, nginx, no HMR),
+  independent of `vigil.sh`'s local-dev loop above; both are meant to keep working:
+
+  ```bash
+  bash utils/refresh-test-db.sh   # snapshot prod's data into runtime/data/test/ (on demand)
+  bash utils/vigil-docker.sh up   # docker compose up — api :6977, web :6978
+  bash utils/vigil-docker.sh down
   ```
 
 - **Python**: always through `.venv` (`vigil.sh start` creates it) — `pipeline/` is the sole stdlib-only exception.
