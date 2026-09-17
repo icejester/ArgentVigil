@@ -20,6 +20,7 @@ import DeliveryBehaviorPanel from "./delivery_behavior_panel";
 import TradeFlowPanel from "./trade_flow_panel";
 import { VAULT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import { apiFetch } from "./api_client";
 import { nearestRowDate, xTicks } from "./date_utils";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
@@ -1417,7 +1418,7 @@ export default function ComexInventoryDashboard() {
 
     async function get(url, setter, transform) {
       try {
-        const r = await fetch(url);
+        const r = await apiFetch(url);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const json = await r.json();
         setter(transform ? transform(json) : json);

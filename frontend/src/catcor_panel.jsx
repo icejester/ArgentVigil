@@ -11,6 +11,7 @@ import {
 } from "recharts";
 import { CATCOR_EVENT_COLORS } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import { apiFetch } from "./api_client";
 
 const WINDOWS = ["T-30m", "T+5m", "T+30m", "T+2h"];
 const DEFAULT_WINDOW = "T+30m";
@@ -322,8 +323,8 @@ export default function CatcorPanel({ onOpenResearchSession }) {
     setError(null);
     try {
       const [eventsRes, reactionsRes] = await Promise.all([
-        fetch("/api/catcor/events/db"),
-        fetch("/api/catcor/reactions/db"),
+        apiFetch("/api/catcor/events/db"),
+        apiFetch("/api/catcor/reactions/db"),
       ]);
       if (!eventsRes.ok) throw new Error(`HTTP ${eventsRes.status}`);
       if (!reactionsRes.ok) throw new Error(`HTTP ${reactionsRes.status}`);
@@ -347,7 +348,7 @@ export default function CatcorPanel({ onOpenResearchSession }) {
   async function handleRefresh() {
     setRefreshing(true);
     try {
-      const res = await fetch("/api/catcor/refresh", { method: "POST" });
+      const res = await apiFetch("/api/catcor/refresh", { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchAll();
     } catch (e) {

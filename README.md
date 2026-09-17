@@ -1,4 +1,4 @@
-# ArgentVigil v2.20.0
+# ArgentVigil v2.24.0
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -77,18 +77,35 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
 
 ### Housekeeping
 
-- **Database**: one shared SQLite file, `runtime/argentvigil.db` (gitignored), owned by `backend/db.py`. There is no per-tab or per-layer database.
-- **Start / stop** (background daemons, PID-tracked, logs in `runtime/logs/`):
+- **Database**: one shared SQLite file per environment (`argentvigil.db`, gitignored, owned by `backend/db.py`), under that environment's own `runtime/data/<name>/` directory — see `environments/README.md`. There is no per-tab or per-layer database.
+- **Primary path — containerized, N named environments** (`environments/*.env`, including `prod` itself as of the containerized-prod cutover):
 
   ```bash
-  bash utils/vigil.sh start            # venv bootstrap + backend :8000 + frontend :5173
-  bash utils/vigil.sh restart backend  # after backend Python edits
-  bash utils/vigil.sh stop
-  bash utils/vigil.sh test             # full test suite (241 tests, ~11s), pytest args pass through
-  python3 pipeline/run.py              # CoT pipeline — run once before first frontend use
+  bash utils/vigil.sh up prod        # build + start prod's api + collector + web
+  bash utils/vigil.sh down prod
+  bash utils/vigil.sh status         # every av-* project currently running
+  bash utils/vigil.sh logs prod api
+  bash utils/vigil.sh test           # full test suite (253 tests, ~12s), pytest args pass through
+  bash utils/refresh-test-db.sh test # snapshot prod's data into a snapshot-mode env (on demand)
+  python3 pipeline/run.py            # CoT pipeline — run once before first frontend use
   ```
 
-- **Python**: always through `.venv` (`vigil.sh start` creates it) — `pipeline/` is the sole stdlib-only exception.
+  See `environments/README.md` for the full field reference (ports, `REFRESH_POLICY`,
+  `UPDATE_MODE`) and how to add a new environment.
+
+- **Local dev fallback — bare host processes, no Docker** (`utils/vigil-native.sh`,
+  formerly this repo's `vigil.sh`) — faster inner loop for local Python/JS edits, or a
+  fallback if Docker/Colima itself is unavailable. Must never run against
+  `runtime/data/prod/` at the same time as the containerized `prod` environment above
+  (see `environments/prod.env`'s own comment for the two-writer hazard this would cause):
+
+  ```bash
+  bash utils/vigil-native.sh start            # venv bootstrap + backend :8000 + frontend :5173
+  bash utils/vigil-native.sh restart backend  # after backend Python edits
+  bash utils/vigil-native.sh stop
+  ```
+
+- **Python**: always through `.venv` (`vigil.sh test` or `vigil-native.sh start` creates it) — `pipeline/` is the sole stdlib-only exception.
 - **API keys** (all optional at boot; a missing key leaves that source's table empty, nothing crashes): `FRED_API_KEY` (Money Supply, CATCOR actuals), `GAPI_API_KEY` (LBMA fix), `CENSUS_API_KEY` (trade flow), `ANTHROPIC_API_KEY` (Research, only if `AI_BACKEND=anthropic` — default is the local `forge` backend).
 - **Versioning**: this README and `CLAUDE.md` carry the same `vX.Y.Z` in their titles, bumped together on feature completion (not per commit); `tests/test_conventions.py` fails on drift.
 - **Pre-commit hook**: `utils/githooks/pre-commit` runs the full test suite (~11s) on every commit — including the version-binding guard. Per-clone, one-time setup: `git config core.hooksPath utils/githooks`. Bypass deliberately with `git commit --no-verify`.

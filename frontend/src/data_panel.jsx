@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { DATA_EDITORIAL } from "./data_editorial";
 import RefreshControls from "./refresh_controls";
+import { apiFetch } from "./api_client";
 
 const COT_MIN_REFRESH_DAYS = 7;
 
@@ -76,7 +77,7 @@ function FetchStatusRow({ sourceKey, meta, healthRow, onRefreshed }) {
   const handleRefresh = () => {
     if (refreshing || cotGated) return;
     setRefreshing(true);
-    fetch(`/api/health/refresh/${sourceKey}`, { method: "POST" })
+    apiFetch(`/api/health/refresh/${sourceKey}`, { method: "POST" })
       .then(() => onRefreshed())
       .finally(() => setRefreshing(false));
   };
@@ -160,7 +161,7 @@ function IntervalEditControl({ sourceKey, currentSeconds, onSaved }) {
     }
     setSaving(true);
     setError(null);
-    fetch(`/api/data-sources/${sourceKey}/interval`, {
+    apiFetch(`/api/data-sources/${sourceKey}/interval`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ interval_seconds: parsed }),
@@ -319,7 +320,7 @@ function TieredLoopSummary({ health }) {
   const [settings, setSettings] = useState(null);
 
   useEffect(() => {
-    fetch("/api/refresh/settings")
+    apiFetch("/api/refresh/settings")
       .then((r) => r.json())
       .then((j) => setSettings(j.data ?? j))
       .catch(() => setSettings(null));
@@ -366,14 +367,14 @@ export default function DataPanel() {
   const [operationalBySourceKey, setOperationalBySourceKey] = useState({});
 
   const fetchHealth = useCallback(() => {
-    fetch("/api/health/db")
+    apiFetch("/api/health/db")
       .then((r) => r.json())
       .then((j) => setHealth(j.sources ?? {}))
       .catch(() => {});
   }, []);
 
   const fetchOperational = useCallback(() => {
-    fetch("/api/data-sources/db")
+    apiFetch("/api/data-sources/db")
       .then((r) => r.json())
       .then((j) => setOperationalBySourceKey(j.sources ?? {}))
       .catch(() => {});

@@ -11,6 +11,7 @@ import SanctionsPanel from "./sanctions_panel";
 import SettingsView from "./settings_panel";
 import { HealthProvider, useHealthRows } from "./health_context";
 import { PinnedDateProvider } from "./pinned_date_context";
+import { apiFetch } from "./api_client";
 
 // Nav tab set. MUST stay in lockstep with backend main.py's
 // _VALID_NAV_SECTIONS allowlist — tests/test_conventions.py's
@@ -29,6 +30,17 @@ const SECTIONS = [
   { key: "sanctions", label: "OFAC" },
 ];
 
+// AV_ENV (2026-09-16, at the user's explicit request) — a visual indicator,
+// other than the port number, for "am I looking at Test AV or prod." Read
+// from VITE_AV_ENV, baked in at frontend build time (see
+// Dockerfile.frontend/docker-compose.yml's `web` service, which sets it to
+// "test"); absent/unset means prod, matching every other VITE_* var's
+// "unset = today's default behavior" convention in this repo — vigil.sh's
+// native frontend build never sets it, so prod is never accidentally
+// mislabeled by an env var it doesn't know exists.
+const AV_ENV = import.meta.env.VITE_AV_ENV || "prod";
+const IS_TEST_ENV = AV_ENV !== "prod";
+
 // Small passive-visibility dot (Story #7) — red if any tracked source is
 // erroring, yellow if any is stale with no errors, green otherwise. Links
 // nowhere; the Data tab nav button is already one click away for the
@@ -40,6 +52,17 @@ const SECTIONS = [
 // rather than its own independent 60s poll of /api/health/db, since
 // per-sub-panel ChartStaleness badges now poll the same route too and a
 // second independent poll here would be pure duplication.
+//
+// Test-environment override (2026-09-16, made deliberately loud at the
+// user's explicit request — "annoyingly bright," "painfully clear I'm in
+// test," after an initial quieter purple was rejected as too easy to miss):
+// in Test AV, this dot is bigger, pulsing neon magenta
+// (.header-health-dot--test, index.css), regardless of underlying data
+// health — the point is "you are in test," a stronger signal than whether
+// test's own snapshot data happens to be stale (it usually is, by design —
+// it's a point-in-time copy). Real health is still computed and shown in
+// the tooltip text, just not as the dot's color/size, so a genuinely
+// erroring test source isn't hidden either.
 function HeaderHealthDot() {
   const { rows } = useHealthRows(null);
   if (rows.length === 0) return null;
@@ -48,6 +71,14 @@ function HeaderHealthDot() {
     const rowStatus = computeStatus(row, row.expected_interval_s);
     if (rowStatus === "error") worst = "error";
     else if (rowStatus === "stale" && worst !== "error") worst = "stale";
+  }
+  if (IS_TEST_ENV) {
+    return (
+      <span
+        className="header-health-dot header-health-dot--test"
+        title={`TEST AV (env: ${AV_ENV}) — data health: ${worst}`}
+      />
+    );
   }
   const color = worst === "error" ? "#e0555c" : worst === "stale" ? "#d9a441" : "#4caf76";
   return <span className="header-health-dot" style={{ background: color }} title={`Data health: ${worst}`} />;
@@ -146,7 +177,7 @@ function HeaderTicker() {
     const poll = () => {
       Promise.all(
         ["XAG", "XAU"].map((key) =>
-          fetch(`/api/prices/db/ticks?series_id=${key}&hours=${TICKER_SPARKLINE_HOURS}`)
+          apiFetch(`/api/prices/db/ticks?series_id=${key}&hours=${TICKER_SPARKLINE_HOURS}`)
             .then((r) => r.json())
             .then((j) => [key, j.data ?? []])
         )
@@ -207,7 +238,7 @@ export default function App() {
   // (backend/db.py's ui_settings table), not a per-browser localStorage
   // value, so it's consistent across devices/reloads.
   useEffect(() => {
-    fetch("/api/ui/pinned-section")
+    apiFetch("/api/ui/pinned-section")
       .then((r) => r.json())
       .then((j) => {
         const pinned = j.data?.pinned_section ?? null;
@@ -223,7 +254,7 @@ export default function App() {
     e.stopPropagation();
     const next = pinnedSection === sectionKey ? null : sectionKey;
     setPinnedSection(next);
-    fetch("/api/ui/pinned-section", {
+    apiFetch("/api/ui/pinned-section", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ section: next }),

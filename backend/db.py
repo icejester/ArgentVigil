@@ -9,7 +9,17 @@ from .price_instruments import GC_F_WEEKLY, GLD_CLOSE, SESSION_DAILY, SI_F_WEEKL
 from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_REPO_ROOT, "runtime", "argentvigil.db")
+# AV_RUNTIME_DIR overrides where the SQLite file lives — defaults to
+# runtime/ unchanged (today's behavior) so nothing breaks for anyone not
+# setting it. Added 2026-09-16 for the prod/test/backup data split under
+# runtime/data/<env>/ — vigil-native.sh sets this to runtime/data/prod when
+# starting its bare-process prod fallback; docker-compose.yml's api/collector
+# services set it to the fixed in-container path /app/runtime, bind-mounted
+# from each environment's own HOST_RUNTIME_DIR (environments/<name>.env) —
+# runtime/data/prod for the "prod" environment, runtime/data/test for
+# "test", etc. See environments/README.md.
+_RUNTIME_DIR = os.environ.get("AV_RUNTIME_DIR") or os.path.join(_REPO_ROOT, "runtime")
+DB_PATH = os.path.join(_RUNTIME_DIR, "argentvigil.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # sqlite3.connect does not create parent dirs
 
 DDL = """
@@ -576,6 +586,14 @@ CREATE TABLE IF NOT EXISTS ui_settings (
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # WAL mode: journal_mode is persisted in the DB file itself once set, but
+    # this PRAGMA is cheap/idempotent, so setting it on every connection keeps
+    # a fresh DB (or one created before this line existed) covered too.
+    # Required now that api and collector are separate processes writing to
+    # the same file concurrently (api-split-implementation-plan.md Story 2.3)
+    # — WAL allows one writer + many concurrent readers, unlike the default
+    # rollback-journal mode's whole-file write lock.
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
         conn.commit()

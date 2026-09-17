@@ -4,6 +4,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
 } from "recharts";
 import { VAULT_COLORS } from "./palette";
+import { apiFetch } from "./api_client";
 
 // Stack Tracker (specs/stackTracker-spec.md) — a personal CRUD inventory of
 // physical silver/gold holdings, backed entirely by runtime/stack.db +
@@ -72,14 +73,14 @@ const UNIT_WEIGHT_QUICK_PICKS = [
 ];
 
 async function getJSON(url) {
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   const data = await res.json();
   if (!res.ok || !data.success) throw new Error(data.detail || `request to ${url} failed`);
   return data.data;
 }
 
 async function postJSON(url, body) {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -90,7 +91,7 @@ async function postJSON(url, body) {
 }
 
 async function putJSON(url, body) {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -101,14 +102,14 @@ async function putJSON(url, body) {
 }
 
 async function deleteJSON(url) {
-  const res = await fetch(url, { method: "DELETE" });
+  const res = await apiFetch(url, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok || !data.success) throw new Error(data.detail || `request to ${url} failed`);
   return data.data;
 }
 
 async function postForm(url, formData) {
-  const res = await fetch(url, { method: "POST", body: formData });
+  const res = await apiFetch(url, { method: "POST", body: formData });
   const data = await res.json();
   if (!res.ok || !data.success) throw new Error(data.detail || `request to ${url} failed`);
   return data.data;
@@ -846,7 +847,7 @@ function StackCharts({
       return;
     }
     const qs = params.length ? `?${params.join("&")}` : "";
-    fetch(`/api/stack/value-history/db${qs}`)
+    apiFetch(`/api/stack/value-history/db${qs}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((j) => {
         if (!cancelled) setValueHistory(j.data ?? []);

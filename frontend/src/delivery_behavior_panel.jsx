@@ -13,6 +13,7 @@ import {
 } from "recharts";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { nearestRowDate } from "./date_utils";
+import { apiFetch } from "./api_client";
 
 // Same shape/cutoffs as comex_inventory.jsx's own filterBySFWindow — kept as
 // a local copy rather than a shared import, matching this codebase's
@@ -345,7 +346,7 @@ function useDeliveryBehavior(metal) {
   const fetchAll = useCallback(async () => {
     setError(null);
     try {
-      const res = await fetch(`/api/delivery-behavior/db?metal=${metal}`);
+      const res = await apiFetch(`/api/delivery-behavior/db?metal=${metal}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       setData(json.data ?? null);

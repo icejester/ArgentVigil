@@ -1,0 +1,2780 @@
+"""Standalone collector entrypoint (api-split-implementation-plan.md Story
+2.1) — `python -m backend.collector` runs the tiered background scheduler
+independently of uvicorn/FastAPI.
+
+This module owns every `_fetch_and_persist_*` function, `_schedule_loop`,
+`_refresh_fast_tier`/`_refresh_slow_tier`, `_backfill_if_needed`, and the
+shared mutable state the scheduler and `backend/main.py`'s API routes both
+touch (`_client`, `_refresh_settings`, `_interval_overrides`,
+`_startup_fired`) — moved here from `backend/main.py` where they used to
+be interleaved with ~84 route handlers throughout a single ~4,000-line
+file (confirmed at the time: fetch functions and their sibling routes
+alternated line-by-line in many places, several fetch functions called
+each other, and two — `fred_money_supply_refresh`/`metals_prices_refresh`
+— were literally `@app.get(...)`-decorated route handlers AND the real
+fetch logic in one function). `backend/main.py` now imports this module
+(`from . import collector`) for its `sources.register(...)` calls, its
+on-demand routes (`POST /api/refresh/force`, `POST
+/api/health/refresh/{key}`, `GET /api/prices`, `POST
+/api/catcor/refresh`, research chat's `_client` use), and its thin
+wrapper routes for the two former route/fetch hybrids above — every
+`fetch_fn=` reference in `main.py`'s registry now points either directly
+at a function here (`collector._fetch_and_persist_...`) or at a small
+`main.py`-local wrapper that calls one.
+
+Shared mutable state lives here, not in `main.py`, because both the
+scheduler (this module) and several `api`-only routes read/write it
+(`_refresh_settings`, `_interval_overrides` — see `main.py`'s
+`POST /api/refresh/settings` and `POST /api/data-sources/{key}/interval`).
+`main.py` reaches into `collector.<name>` for those; `_refresh_tasks`
+(tracking the in-process scheduler `asyncio.Task` for cancellation on
+shutdown) stays in `main.py` instead, since it's specifically about
+`lifespan`'s own in-process task-lifecycle bookkeeping, not collection
+logic itself.
+
+Importing this module is cheap and side-effect-free (no server starts, no
+port binds) — it only defines functions/constants and a couple of plain
+dict/set module globals, same as it did as part of `main.py` before this
+split. `backend.main`'s own `lifespan` still starts this same collection
+work in-process by default (`RUN_COLLECTOR_IN_PROCESS`, unset/true) so a
+bare `uvicorn backend.main:app` keeps today's single-process behavior for
+local dev (`vigil-native.sh`) and any compose service that hasn't split
+`collector` out yet (Story 2.2). Set `RUN_COLLECTOR_IN_PROCESS=false` on
+the `api` service once `collector` runs as its own process, so the two
+don't double-fire the same sources against the same database.
+
+Explicitly excluded, permanently: Stack Tracker (`stack_items`/
+`stack_reference_links`/`stack_item_images`, `stack.db`). Confirmed via
+`backend/sources.py`'s registry (grepped for "stack" — no hits) and
+CLAUDE.md's own Tab: Stack section ("No backend/sources.py registration...
+Stack Tracker has no upstream fetch at all, it's pure user CRUD") — there
+is no `stack_*` fetch_fn in SOURCE_REGISTRY for this module to run, by
+design. Stack Tracker's tables are mutated only by `api`'s own request
+handlers, unaffected by this split.
+"""
+
+import asyncio
+import os
+import signal
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timedelta, timezone
+
+import httpx
+from fastapi import HTTPException
+
+from . import catcor
+from . import db
+from . import sources
+from . import stack_db
+from .mc_token import authed_headers
+from .sources import CadenceSpec, RateLimitSpec, SourceDefinition
+from .price_instruments import (
+    LBMA_BY_METAL,
+    LBMA_SESSION_BY_METAL,
+    XAG_SPOT,
+    XAU_SPOT,
+    YAHOO_DAILY_CLOSE_BY_METAL,
+)
+from .units import GOLD_CONTRACT_OZ, SILVER_CONTRACT_OZ, TROY_OZ_PER_KG
+from .yahoo_prices import bars_to_daily_dict, bars_to_daily_rows, fetch_yahoo_bars
+from pipeline import run as pipeline_run
+from pipeline.config import (
+    FRED_FETCH_YEARS,
+    FRED_SERIES_CPI,
+    FRED_SERIES_DFII10,
+    FRED_SERIES_DGS2,
+    FRED_SERIES_DGS3MO,
+    FRED_SERIES_DGS5,
+    FRED_SERIES_DGS10,
+    FRED_SERIES_DGS30,
+    FRED_SERIES_M2,
+    FRED_SERIES_RRPONTSYD,
+    FRED_SERIES_T10Y2Y,
+    FRED_SERIES_TIC_COUNTRIES,
+    FRED_SERIES_TIC_GRAND_TOTAL,
+    FRED_SERIES_WALCL,
+    FRED_SERIES_WLCFLPCL,
+    FRED_SERIES_WRESBAL,
+    FRED_SERIES_WSHOMCB,
+    FRED_SERIES_WSHOSHO,
+    FRED_SERIES_WSHOTSL,
+    METAL_PRICE_FETCH_YEARS,
+    XAG_TICKER,
+    XAU_TICKER,
+)
+
+METALCHARTS = "https://metalcharts.org"
+FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+CENSUS_TRADE_BASE = "https://api.census.gov/data/timeseries/intltrade"
+# HS 7106 (silver, unwrought/semi-manufactured/powder) / HS 7108 (gold,
+# non-monetary — comparison-only per CLAUDE.md's "gold as context" rule).
+CENSUS_TRADE_HS_CODES = {"XAG": "7106", "XAU": "7108"}
+# Confirmed live (2025-01, 2024-06, both flows, both metals): imports and
+# exports use different field names for quantity — GEN_QY1_MO/CON_QY1_MO
+# (imports) vs. QTY_1_MO (exports) — sharing UNIT_QY1 for the unit code.
+# Both are always "0"/"-" today (Census reports no qty for these HS codes).
+CENSUS_TRADE_FLOWS = {
+    "import": {
+        "path": "imports/hs",
+        "commodity_param": "I_COMMODITY",
+        "value_general_field": "GEN_VAL_MO",
+        "value_consumption_field": "CON_VAL_MO",
+        "qty_field": "GEN_QY1_MO",
+    },
+    "export": {
+        "path": "exports/hs",
+        "commodity_param": "E_COMMODITY",
+        "value_general_field": "ALL_VAL_MO",
+        "value_consumption_field": None,
+        "qty_field": "QTY_1_MO",
+    },
+}
+CENSUS_TRADE_MONTHS_PER_FETCH = 3  # cheap self-heal against late revisions between gate-interval runs
+
+TREASURY_MTS_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/mts"
+# Same host/no-key posture as TREASURY_MTS_BASE, sibling path under
+# accounting/od (Auctions Query). Confirmed live: 11,063+ rows back to
+# 1979-11-15, ~100 fields/record, "null"-string sentinels for unsettled
+# results (same convention _mts_amount already handles for MTS).
+TREASURY_AUCTIONS_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
+# Real per-record lifecycle: announced ~1 week before auction_date (results
+# NULL), settles a few days after. A rolling trailing window catches both
+# newly-announced auctions and lets already-fetched-but-not-yet-settled
+# rows get their results filled in on a later run (see
+# upsert_treasury_auctions_rows' COALESCE). 120 days comfortably covers
+# announcement lead time + settlement lag with margin, without re-pulling
+# the full 11,000+-row history on every fetch.
+TREASURY_AUCTIONS_WINDOW_DAYS = 120
+
+
+_MONTH_NAME_TO_NUM = {
+    "October": 10, "November": 11, "December": 12,
+    "January": 1, "February": 2, "March": 3, "April": 4, "May": 5,
+    "June": 6, "July": 7, "August": 8, "September": 9,
+}
+
+
+def _mts_fiscal_month_to_calendar(classification_desc: str, sequence_number_cd: str, record_fiscal_year: str) -> tuple[int, int] | None:
+    """Returns (calendar_year, calendar_month) for one Table 1 MTH row, or
+    None if classification_desc isn't a recognized month name (some MTH
+    rows are edge cases outside the normal 12-month cycle, per Table 1's
+    own documented caveat about hierarchy/subtotal rows)."""
+    month = _MONTH_NAME_TO_NUM.get(classification_desc.strip())
+    if month is None:
+        return None
+    report_fy = int(record_fiscal_year)
+    block_fy = report_fy - 1 if sequence_number_cd.startswith("1.") else report_fy
+    # U.S. federal fiscal year FY starts October of the PRIOR calendar year —
+    # Oct/Nov/Dec belong to calendar year (FY - 1), Jan-Sep belong to FY itself.
+    calendar_year = block_fy - 1 if month >= 10 else block_fy
+    return calendar_year, month
+
+
+TREASURY_INTEREST_CLASSIFICATION = "Total--Interest on the Public Debt"
+
+
+def _mts_amount(raw) -> float | None:
+    """MTS amount fields are strings, using the literal string "null" (not
+    JSON null) for an absent value — confirmed live."""
+    if raw is None or raw == "null":
+        return None
+    return float(raw)
+
+
+METAL_PRICE_TICKERS = {"XAG": XAG_TICKER, "XAU": XAU_TICKER}
+
+
+_client: httpx.AsyncClient | None = None
+
+
+# Tiered background refresh: fast tier = genuinely intraday data (spot
+# prices, the one source with a real shared tunable interval); slow tier =
+# every other trigger="interval" source, each now registered with its own
+# real interval_seconds reflecting its own upstream cadence (~25h for the
+# 14 daily exchange-inventory sources, weekly/monthly for the FRED/Treasury/
+# LBMA/Census sources — see each SourceDefinition's own comment) rather
+# than one shared _refresh_settings value. "slow_enabled" is now a single
+# master on/off switch for every interval-triggered source outside the
+# fast tier, not a shared interval to tune — there's no longer one number
+# that applies to all of them. Both default ON: fast tier because spot
+# prices are cheap and genuinely move intraday (unchanged); slow tier
+# because the user runs AV continuously and expects local data to track
+# upstream on its own, not go stale between manual force-refreshes.
+# fast_enabled/slow_enabled are seeded from ui_settings.refresh_enabled in
+# lifespan (persisted — a restart no longer silently reverts the user's
+# choice, unlike before this change, when this whole dict was in-memory
+# only). fast_interval_s stays a real tunable; there's no slow_interval_s
+# anymore, since each slow-tier source owns its own cadence now.
+_refresh_settings = {
+    "fast_interval_s": 60,
+    "fast_enabled": True,
+    "slow_enabled": True,
+}
+
+
+# Tracks which trigger="manual_only", fire_at_startup=True sources have
+# already had their one automatic boot-time fire — _schedule_loop consults
+# this so a one-shot source fires exactly once at startup and never again
+# automatically (still reachable afterward only via
+# POST /api/health/refresh/{key}, same as any other manual_only source).
+_startup_fired: set[str] = set()
+# Per-source interval overrides — a mutable side-table _schedule_loop
+# consults BEFORE falling back to a SourceDefinition's own
+# cadence.interval_seconds, same pattern _refresh_settings already
+# establishes for the blanket fast/slow tier knobs (not a mutation of
+# CadenceSpec/SourceDefinition themselves, which stay genuinely frozen —
+# see backend/sources.py's own docstring on why that immutability is load
+# -bearing). Seeded from db.get_interval_overrides() in lifespan, kept in
+# sync with the DB by POST /api/data-sources/{key}/interval.
+_interval_overrides: dict[str, int] = {}
+
+
+async def _fetch_and_persist_lbma_fix_startup():
+    """lbma_fix's fetch_fn. LBMA fix updates 1-2x/day (per metal) — too
+    slow for either tiered loop, so this is fire_at_startup=True plus
+    manual force-refresh via the Data tab's per-source button, not a
+    recurring interval (lbma_fix's CadenceSpec.trigger is "manual_only").
+    Silently skips if GAPI_API_KEY isn't set, same as CATCOR's ALFRED
+    calls silently degrade without FRED_API_KEY — this is a nice-to-have
+    layer, not a hard requirement to boot the app. Does NOT call
+    db.record_fetch_attempt itself — self_recording is False on this
+    source, so _schedule_loop's own wrapper is the single recorder (the
+    old standalone _lbma_fix_startup recorded internally AND would have
+    been double-recorded by the generic wrapper if folded in naively)."""
+    if "GAPI_API_KEY" not in os.environ:
+        print("[lbma] GAPI_API_KEY not set — skipping LBMA fix fetch")
+        return
+    await _fetch_and_persist_lbma_fix()
+
+
+async def _catcor_startup():
+    """catcor_startup's fetch_fn. One-shot on every startup (plus a
+    weekly re-fire, per its CadenceSpec) to reseed the event calendar,
+    pull Yahoo intraday ticks, and backfill any missing reactions. Cheap
+    on repeat runs — backfill_reactions/capture_snapshot are idempotent
+    (skip windows that already have a reaction row), so this is safe
+    whether the app was offline 14 minutes or 14 days. Internal per-step
+    try/except-and-continue (steps 2-6) / abort-on-step-1-failure
+    structure is unchanged from before this function became a registered
+    fetch_fn — every exception here is caught and printed, never
+    re-raised, so _schedule_loop's outer wrapper will record a coarse
+    "success" in source_health whenever step 1 doesn't throw, even if
+    steps 2-6 individually failed. Accepted tradeoff (confirmed) — the
+    individual step failures are still visible in stdout/logs, just not
+    reflected in source_health's per-source status."""
+    try:
+        n = catcor.seed_events()
+        print(f"[catcor] seeded {n} events")
+    except Exception as e:
+        print(f"[catcor] warning: seed_events failed: {e}")
+        return
+
+    try:
+        # Live CPI/NFP release dates from ALFRED, replacing what used to be
+        # a hand-maintained, easily-stale CPI_RELEASES/NFP_RELEASES list in
+        # catcor_events_seed.py. Its own try/except (not folded into step
+        # 1's abort-on-failure) since it needs FRED_API_KEY and the static
+        # FOMC seed above does not — a missing key here shouldn't stop FOMC
+        # from being seeded.
+        n_alfred = await catcor.seed_events_from_alfred(_client)
+        print(f"[catcor] seeded {n_alfred} events from ALFRED release dates")
+    except Exception as e:
+        print(f"[catcor] warning: seed_events_from_alfred failed: {e}")
+
+    try:
+        await catcor.backfill_intraday_ticks(_client)
+    except Exception as e:
+        print(f"[catcor] warning: backfill_intraday_ticks failed: {e}")
+
+    try:
+        # CATCOR's own daily-close fallback used to be a dedicated
+        # backfill_daily_closes() pull; now shares
+        # _fetch_and_persist_yahoo_daily_close with Money Supply and the
+        # leverage panel's price chart (price-architecture-spec.md's Fetch
+        # consolidation) — one real daily-close series, not three.
+        await _fetch_and_persist_yahoo_daily_close()
+    except Exception as e:
+        print(f"[catcor] warning: _fetch_and_persist_yahoo_daily_close failed: {e}")
+
+    try:
+        # Fetch consensus first: fetch_and_persist_actuals computes
+        # surprise_delta immediately if consensus is already on the row.
+        await catcor.fetch_and_persist_consensus(_client)
+    except Exception as e:
+        print(f"[catcor] warning: fetch_and_persist_consensus failed: {e}")
+
+    try:
+        await catcor.fetch_and_persist_actuals(_client)
+    except Exception as e:
+        print(f"[catcor] warning: fetch_and_persist_actuals failed: {e}")
+
+    try:
+        catcor.backfill_reactions()
+    except Exception as e:
+        print(f"[catcor] warning: backfill_reactions failed: {e}")
+
+
+CATCOR_CONSENSUS_INTERVAL_S = 1800  # how often to re-check for newly-in-window events; catcor.py caches the actual ForexFactory fetch per calendar week, so most of these ticks do zero network I/O
+
+
+async def _catcor_snapshot_tick():
+    """catcor_snapshot's fetch_fn — snapshot capture needs a tight
+    interval (real T+5m precision requires it). Registered with
+    trigger="always_on" in SOURCE_REGISTRY, which the generic scheduler
+    (_schedule_loop) fires unconditionally, never gated by an enabled
+    flag, since a missed snapshot window is a real, permanent data loss
+    (no tick existed at that instant), unlike fast/slow tier data which
+    is always re-fetchable on the next cycle."""
+    for event_id, window in catcor.due_snapshots():
+        catcor.capture_snapshot(event_id, window)
+
+
+async def _catcor_consensus_tick():
+    """catcor_consensus_actuals' fetch_fn — ForexFactory consensus +
+    ALFRED actuals. catcor.fetch_and_persist_consensus caches the raw
+    ForexFactory response per calendar week (confirmed live that repeat
+    hits trip its rate limit — 429 — so the actual network fetch happens
+    at most once a week; every other call here is a cache read matching
+    already-fetched entries against event_calendar). ALFRED actuals are
+    cheap/infrequent by nature (one real print per event per month) and
+    share this tick rather than getting their own, since there's no
+    benefit to checking more often than consensus does anyway."""
+    await catcor.fetch_and_persist_consensus(_client)
+    await catcor.fetch_and_persist_actuals(_client)
+
+
+async def _schedule_loop():
+    """Single generic scheduler replacing the old _fast_tier_loop /
+    _slow_tier_loop / _event_tier_loop / _consensus_tier_loop, AND
+    replacing the separate hand-written asyncio.create_task(...) calls
+    lifespan used to make for money_supply/metals_prices/lbma_fix/
+    census_trade/catcor_startup — every source, including former
+    "startup-only" ones, is now dispatched from this one loop. Ticks
+    every second and, per source in sources.SOURCE_REGISTRY, fires
+    fetch_fn when its CadenceSpec says it's due:
+      - trigger == "always_on": fires every interval_seconds, unconditionally.
+      - trigger == "interval": fires every interval_seconds (or
+        _interval_overrides[key] if a per-source override has been set —
+        see POST /api/data-sources/{key}/interval), but only if
+        enabled_flag is None or _refresh_settings[enabled_flag] is true.
+      - trigger == "manual_only": never ticked here on a recurring basis —
+        reached only via POST /api/health/refresh/{key} — UNLESS
+        fire_at_startup=True, in which case it fires exactly once,
+        ~1s after boot, tracked via _startup_fired so it's never
+        auto-fired again afterward.
+    A source with fire_at_startup=True (regardless of trigger) is seeded
+    into last_fired far enough in the past that it's immediately due on
+    the very first tick — every other source keeps the original "wait a
+    full interval before first fire" behavior (matching the old per-tier
+    loops, which all slept before their first fire, avoiding a startup
+    burst stacked directly on top of lifespan's own one-shot startup
+    calls: _backfill_if_needed, _refresh_fast_tier, _refresh_slow_tier)."""
+    start = datetime.now(timezone.utc)
+    last_fired: dict[str, datetime] = {
+        key: (start - timedelta(seconds=_interval_overrides.get(key, source.cadence.interval_seconds) or 0) - timedelta(seconds=1))
+        if source.cadence.fire_at_startup else start
+        for key, source in sources.SOURCE_REGISTRY.items()
+    }
+    while True:
+        await asyncio.sleep(1)
+        now = datetime.now(timezone.utc)
+        for key, source in sources.SOURCE_REGISTRY.items():
+            cadence = source.cadence
+            is_startup_only_fire = cadence.trigger == "manual_only" and cadence.fire_at_startup
+            if cadence.trigger not in ("always_on", "interval") and not is_startup_only_fire:
+                continue
+            if is_startup_only_fire and key in _startup_fired:
+                continue
+            if cadence.trigger == "interval" and cadence.enabled_flag is not None:
+                if not _refresh_settings.get(cadence.enabled_flag, False):
+                    continue
+            # Interval overrides checked BEFORE the source's own registered
+            # default — see _interval_overrides' own module-level comment
+            # for why this is a side-table, not a CadenceSpec mutation.
+            interval = _interval_overrides.get(key, cadence.interval_seconds)
+            if interval is None and not is_startup_only_fire:
+                continue
+            if is_startup_only_fire:
+                _startup_fired.add(key)
+            else:
+                due_at = last_fired.get(key)
+                if due_at is not None and (now - due_at).total_seconds() < interval:
+                    continue
+                last_fired[key] = now
+            try:
+                await source.fetch_fn()
+                if not source.self_recording:
+                    db.record_fetch_attempt(key, success=True)
+            except Exception as e:
+                print(f"[schedule] warning ({key}): {e}")
+                if not source.self_recording:
+                    db.record_fetch_attempt(key, success=False, error=str(e))
+
+
+# _fetch_and_persist_delivery defaults to type="mtd", but confirmed live
+# against metalcharts.org that type="ytd" returns a superset (~85 days back
+# to the start of the year vs. mtd's handful of days-in-month) at no extra
+# cost — using ytd here means delivery_notices actually accumulates useful
+# history instead of resetting to a few days every month, which is what the
+# Delivery Behavior reclassification signal (backend/delivery_behavior.py)
+# needs to have any real coverage. Module-level (not a closure inside
+# _refresh_slow_tier) so _SOURCE_REGISTRY can reference it directly.
+async def _fetch_and_persist_delivery_ytd():
+    return await _fetch_and_persist_delivery(type="ytd")
+
+
+async def _refresh_fast_tier() -> dict:
+    """Used by lifespan's one-shot startup call and by POST /api/refresh/force
+    — not by _schedule_loop, which fires each source on its own cadence
+    independently. Reads sources.sources_by_tier("fast") (derived from each
+    SourceDefinition's CadenceSpec.enabled_flag == "fast_enabled") rather
+    than a separate hardcoded registry, so this can't drift from what
+    _schedule_loop itself fires."""
+    succeeded, failed, errors = 0, 0, []
+    for source_key, source in sources.sources_by_tier("fast").items():
+        try:
+            await source.fetch_fn()
+            db.record_fetch_attempt(source_key, success=True)
+            succeeded += 1
+        except Exception as e:
+            print(f"[refresh:fast] warning ({source_key}): {e}")
+            db.record_fetch_attempt(source_key, success=False, error=str(e))
+            failed += 1
+            errors.append(f"{source_key}: {e}")
+    return {"succeeded": succeeded, "failed": failed, "errors": errors}
+
+
+async def _refresh_slow_tier() -> dict:
+    """See _refresh_fast_tier's docstring — same reasoning, "slow" tier."""
+    succeeded, failed, errors = 0, 0, []
+    for source_key, source in sources.sources_by_tier("slow").items():
+        try:
+            await source.fetch_fn()
+            db.record_fetch_attempt(source_key, success=True)
+            succeeded += 1
+        except Exception as e:
+            print(f"[refresh:slow] warning ({source_key}): {e}")
+            db.record_fetch_attempt(source_key, success=False, error=str(e))
+            failed += 1
+            errors.append(f"{source_key}: {e}")
+    return {"succeeded": succeeded, "failed": failed, "errors": errors}
+
+
+def _parse_aggregate_row(row: dict) -> dict:
+    reg = row.get("registered") or None
+    elig = row.get("eligible") or None
+    # Zero means "not reported that day" — store as NULL so charts gap cleanly
+    if reg == 0:
+        reg = None
+    if elig == 0:
+        elig = None
+    return {
+        "date": row["date"],
+        "total": row.get("total") or None,
+        "registered": reg,
+        "eligible": elig,
+        "reg_eligible_ratio": (reg / elig) if (reg and elig) else None,
+    }
+
+
+async def _backfill_if_needed():
+    if db.count_aggregate() == 0:
+        try:
+            hdrs = await authed_headers(_client)
+            resp = await _client.get(
+                f"{METALCHARTS}/api/comex/inventory",
+                params={"symbol": "XAG", "range": "ALL"},
+                headers=hdrs,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
+            db.upsert_aggregate_rows(rows)
+        except Exception as e:
+            print(f"[backfill] warning: {e}")
+    if db.count_gold_aggregate() == 0:
+        try:
+            hdrs = await authed_headers(_client)
+            resp = await _client.get(
+                f"{METALCHARTS}/api/comex/inventory",
+                params={"symbol": "XAU", "range": "ALL"},
+                headers=hdrs,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
+            db.upsert_gold_aggregate_rows(rows)
+        except Exception as e:
+            print(f"[backfill] warning (gold): {e}")
+
+
+async def _fetch_and_persist_silver_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAG", "range": range},
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
+    db.upsert_aggregate_rows(rows)
+    return rows
+
+
+def _depository_rows(raw: list[dict]) -> list[dict]:
+    today = str(date.today())
+    return [
+        {
+            "date": today,
+            "depository": r["depository"],
+            "registered": r.get("registered"),
+            "eligible": r.get("eligible"),
+            "total": r.get("total"),
+            "prev_registered": r.get("prevRegistered"),
+            "prev_eligible": r.get("prevEligible"),
+            "prev_total": r.get("prevTotal"),
+        }
+        for r in raw
+    ]
+
+
+async def _fetch_and_persist_silver_depositories() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAG", "type": "depositories"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("data", [])
+    db.upsert_depository_rows(_depository_rows(raw))
+    return raw
+
+
+async def _fetch_and_persist_silver_leverage() -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/volume-oi",
+        params={"symbol": "XAG"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    row = raw.get("data") or {}
+    if not isinstance(row, dict):
+        row = {}
+    reg_row = db.get_aggregate_history(limit=1)
+    latest_reg = reg_row[0]["registered"] if reg_row else None
+    oi = row.get("openInterest") or row.get("open_interest")
+    vol = row.get("volume")
+    # OI is in contracts (5,000 oz each); registered is in oz. Still
+    # computed here for the live /api/silver/leverage debug route's own
+    # response shape, but — since a 2026-07 investigation confirmed this
+    # metalcharts.org OI figure runs a stable ~15% below CFTC's real
+    # open_interest_all for the same contract/date, not a substitutable
+    # equivalent — it's no longer persisted. Leverage math everywhere
+    # else (the /db routes, the history chart) is CFTC-only now; see
+    # db._leverage_backfill_from_cot's docstring for the full reasoning.
+    oi_oz = oi * SILVER_CONTRACT_OZ if oi else None
+    paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
+    enriched = {**row, "paper_leverage": paper_leverage}
+    # Persist volume ONLY under the real trading date the upstream reports.
+    # No str(date.today()) fallback: this endpoint's `date` lags the real
+    # calendar day (confirmed live), so stamping "today" onto a stale
+    # figure manufactures a date key for a value that isn't from that day
+    # — the "never manufacture a reading" convention applies to the key,
+    # not just the value. If `date` is missing, skip the write; a later
+    # cycle catches it once the source rolls forward.
+    upstream_date = row.get("date")
+    if vol and upstream_date:
+        db.upsert_volume_oi_row({
+            "date": upstream_date,
+            "open_interest": None,
+            "volume": vol,
+            "paper_leverage": None,
+        })
+    return {"enriched": enriched, "raw": raw}
+
+
+async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAU", "range": range},
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = [_parse_aggregate_row(r) for r in data.get("data", [])]
+    db.upsert_gold_aggregate_rows(rows)
+    return rows
+
+
+async def _fetch_and_persist_gold_depositories() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/inventory",
+        params={"symbol": "XAU", "type": "depositories"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("data", [])
+    db.upsert_gold_depository_rows(_depository_rows(raw))
+    return raw
+
+
+async def _fetch_and_persist_gold_leverage() -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/volume-oi",
+        params={"symbol": "XAU"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    row = raw.get("data") or {}
+    if not isinstance(row, dict):
+        row = {}
+    reg_row = db.get_gold_aggregate_history(limit=1)
+    latest_reg = reg_row[0]["registered"] if reg_row else None
+    oi = row.get("openInterest") or row.get("open_interest")
+    vol = row.get("volume")
+    # OI is in contracts (100 oz each for gold); registered is in oz.
+    # Still computed here for the live /api/gold/leverage debug route's
+    # own response shape, but no longer persisted — see
+    # _fetch_and_persist_silver_leverage's comment for the full reasoning
+    # (CFTC-only leverage math now, metalcharts.org's OI confirmed ~15%
+    # off from CFTC's real open_interest_all on every date checked).
+    oi_oz = oi * GOLD_CONTRACT_OZ if oi else None
+    paper_leverage = (oi_oz / latest_reg) if (oi_oz and latest_reg) else None
+    enriched = {**row, "paper_leverage": paper_leverage}
+    # No str(date.today()) fallback — see _fetch_and_persist_silver_leverage's
+    # comment: stamping "today" onto this lagging feed manufactures a date
+    # key. Skip the write if `date` is absent; a later cycle picks it up.
+    upstream_date = row.get("date")
+    if vol and upstream_date:
+        db.upsert_gold_volume_oi_row({
+            "date": upstream_date,
+            "open_interest": None,
+            "volume": vol,
+            "paper_leverage": None,
+        })
+    return {"enriched": enriched, "raw": raw}
+
+
+async def _fetch_and_persist_delivery(type: str = "mtd") -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/delivery-notices",
+        params={"symbol": "XAG", "type": type},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    data = raw.get("data") or []
+    if isinstance(data, dict):
+        data = [data]
+    rows = [
+        {
+            "date": r.get("date", str(date.today())),
+            "type": type,
+            "daily_issued": r.get("dailyIssued"),
+            "daily_stopped": r.get("dailyStopped"),
+        }
+        for r in data
+        if isinstance(r, dict) and (r.get("dailyIssued") is not None or r.get("dailyStopped") is not None)
+    ]
+    if rows:
+        db.upsert_delivery_rows(rows)
+    return raw
+
+
+# Mirrors _fetch_and_persist_delivery — confirmed live 2026-07-22 that
+# metalcharts.org's delivery-notices endpoint fully supports symbol=XAU (96
+# real rows, matching CME's own official MetalsIssuesAndStopsReport.pdf
+# exactly for a spot-checked date). Gold's registered/eligible/total side
+# (gold_inventory_aggregate) has always been populated; only the delivery-
+# notices half was ever silver-only, an incomplete build rather than a real
+# upstream or structural gold-vault difference — see
+# RECLASSIFICATION_SUPPORTED_METALS in delivery_behavior.py, extended to XAU
+# in the same change that added this function.
+async def _fetch_and_persist_gold_delivery(type: str = "mtd") -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/comex/delivery-notices",
+        params={"symbol": "XAU", "type": type},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    data = raw.get("data") or []
+    if isinstance(data, dict):
+        data = [data]
+    rows = [
+        {
+            "date": r.get("date", str(date.today())),
+            "type": type,
+            "daily_issued": r.get("dailyIssued"),
+            "daily_stopped": r.get("dailyStopped"),
+        }
+        for r in data
+        if isinstance(r, dict) and (r.get("dailyIssued") is not None or r.get("dailyStopped") is not None)
+    ]
+    if rows:
+        db.upsert_gold_delivery_rows(rows)
+    return raw
+
+
+# Same ytd-over-mtd reasoning as _fetch_and_persist_delivery_ytd above —
+# ytd accumulates real coverage instead of resetting to a handful of days
+# every month, which is what the Delivery Behavior reclassification signal
+# needs. Module-level so _SOURCE_REGISTRY can reference it directly.
+async def _fetch_and_persist_gold_delivery_ytd():
+    return await _fetch_and_persist_gold_delivery(type="ytd")
+
+
+async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AG", "range": range},
+        headers=hdrs,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = []
+    for row in raw.get("data", []):
+        kg = row.get("total")
+        rows.append({
+            "date": row["date"],
+            "total_kg": kg,
+            # SHFE silver is in kg; convert to troy oz
+            "total_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+        })
+    db.upsert_shfe_rows(rows)
+    return rows
+
+
+async def _fetch_and_persist_shfe_gold_history(range: str = "ALL") -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AU", "range": range},
+        headers=hdrs,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = []
+    for row in raw.get("data", []):
+        kg = row.get("total")
+        rows.append({
+            "date": row["date"],
+            "total_kg": kg,
+            # SHFE gold is in kg; convert to troy oz
+            "total_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+        })
+    db.upsert_shfe_gold_rows(rows)
+    return rows
+
+
+async def _fetch_and_persist_shfe_warehouses() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AG", "type": "warehouses"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = raw.get("data", [])
+    today = str(date.today())
+    persisted = []
+    enriched = []
+    for r in rows:
+        kg = r.get("warrant", 0)
+        chg_kg = r.get("warrantChange", 0)
+        enriched.append({
+            **r,
+            "warrant_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+            "warrant_change_oz": round(chg_kg * TROY_OZ_PER_KG, 0) if chg_kg else None,
+        })
+        persisted.append({
+            "date": r.get("date", today),
+            "warehouse": r["warehouse"],
+            "warrant_kg": kg,
+            "warrant_change_kg": chg_kg,
+        })
+    db.upsert_shfe_warehouse_rows(persisted)
+    return enriched
+
+
+async def _fetch_and_persist_shfe_gold_warehouses() -> list[dict]:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/shfe/inventory",
+        params={"symbol": "AU", "type": "warehouses"},
+        headers=hdrs,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    rows = raw.get("data", [])
+    today = str(date.today())
+    persisted = []
+    enriched = []
+    for r in rows:
+        kg = r.get("warrant", 0)
+        chg_kg = r.get("warrantChange", 0)
+        enriched.append({
+            **r,
+            "warrant_oz": round(kg * TROY_OZ_PER_KG, 0) if kg else None,
+            "warrant_change_oz": round(chg_kg * TROY_OZ_PER_KG, 0) if chg_kg else None,
+        })
+        persisted.append({
+            "date": r.get("date", today),
+            "warehouse": r["warehouse"],
+            "warrant_kg": kg,
+            "warrant_change_kg": chg_kg,
+        })
+    db.upsert_shfe_gold_warehouse_rows(persisted)
+    return enriched
+
+
+async def _fetch_and_persist_pslv() -> dict:
+    resp = await _client.get(
+        "https://sprott.com/api/FinancialData/v1/BullionCalculatorData",
+        headers={"Accept": "application/json"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    # Confirmed live 2026-08-28: Sprott's own response no longer carries a
+    # usable per-fund identifier — every entry's "id" field is now 0 (this
+    # used to be a real, distinct value; id=4998 was PSLV's). This was a
+    # real bug, not a transient outage: the old id-based filter silently
+    # matched zero entries, so every fetch since Sprott's own change 502'd.
+    # There is no query param, header, or metadata endpoint that identifies
+    # a fund in this payload — confirmed by inspecting Sprott's own bullion
+    # calculator page source, which resolves PSLV the exact same way this
+    # fix does: a hardcoded FIXED ARRAY POSITION, not any field in the data
+    # itself. Sprott's real fund lineup, in the order their own page reads
+    # it (data[0..5] are the financial-metrics entries; data[6..11] are the
+    # matching {last, tradeDate, tradeTime} quote objects in the same
+    # order): 0=PHYS (gold), 1=PSLV (silver), 2=SPPP (platinum/palladium),
+    # 3=CEF (gold+silver), 4=SPUT (uranium), 5=COP (copper).
+    PSLV_INDEX = 1
+    financial_entries = [e for e in payload if isinstance(e, dict) and "nav" in e]
+    if len(financial_entries) <= PSLV_INDEX:
+        raise HTTPException(502, f"Sprott response has {len(financial_entries)} fund entries, expected at least {PSLV_INDEX + 1} — PSLV's fixed position may have shifted")
+    row = financial_entries[PSLV_INDEX]
+    # Sanity guard: PSLV's real scale is on the order of 100M-400M oz of
+    # silver — if Sprott ever reorders this array again, a wrong index
+    # would otherwise silently persist a DIFFERENT fund's data under the
+    # "PSLV" label with no visible error. Fail loudly instead.
+    total_oz = row.get("totalOunces1")
+    if not (total_oz and 100_000_000 <= total_oz <= 400_000_000):
+        raise HTTPException(
+            502,
+            f"Sprott response's index-{PSLV_INDEX} entry has totalOunces1={total_oz!r}, "
+            "outside PSLV's plausible real range (100M-400M oz) — Sprott's fund ordering "
+            "may have changed again; refusing to persist a possibly-wrong fund as PSLV.",
+        )
+    result = {
+        "fund": "PSLV",
+        "custodian": "Royal Canadian Mint",
+        "location": "Ottawa, Canada",
+        "date": row.get("dateTimeStamp", "")[:10],
+        "total_oz": row["totalOunces1"],
+        "nav_per_unit": row["nav"],
+        "total_nav": row["totalNav"],
+        "units": row["units"],
+    }
+    db.upsert_pslv_row(result)
+    return result
+
+
+def _spot_entry_fields(entry) -> tuple[float | None, float | None]:
+    if isinstance(entry, dict):
+        return entry.get("price"), entry.get("changePercent24h")
+    return entry, None
+
+
+# COMEX metals trade on CME Globex Sunday 22:00 UTC through Friday 22:00
+# UTC (there's a daily 22:00-23:00 UTC maintenance halt too, but a stale
+# cache re-serve during that one hour is harmless — not worth encoding).
+# This is deliberately still an approximation, not a real holiday-aware
+# trading calendar (CLAUDE.md: "Weekend/business-day handling — three
+# deliberate variants"): it only fixes the coarse "all of Sat AND all of
+# Sun UTC" skip, which was suppressing real Sunday-evening ticks once
+# Globex reopened. A US market holiday (e.g. Thanksgiving) will still let
+# a stale re-serve through — accepted, same as the FND/LTD date math.
+def _metals_market_closed(now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    wd = now.weekday()  # Mon=0 .. Sun=6
+    if wd == 5:  # Saturday — closed all day
+        return True
+    if wd == 6:  # Sunday — closed until the 22:00 UTC Globex reopen
+        return now.hour < 22
+    if wd == 4:  # Friday — closes at 22:00 UTC
+        return now.hour >= 22
+    return False
+
+
+async def _fetch_and_persist_prices() -> dict:
+    hdrs = await authed_headers(_client)
+    resp = await _client.get(
+        f"{METALCHARTS}/api/prices",
+        headers=hdrs,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    # metalcharts.org's own top-level isStale flag (sibling of "data", not
+    # per-metal) marks its underlying twelvedata-ws feed as a stale cache
+    # re-serve — confirmed live over a weekend market closure that it kept
+    # returning isStale=true with a live-looking "timestamp" field and a
+    # cacheAge in the hours, while slowly drifting the price by rounding/
+    # re-sampling jitter on their end. Skipping persistence when stale
+    # (rather than writing it anyway) means the tick series/chart goes flat
+    # when the real market is closed instead of showing fake movement that
+    # never actually traded — but that's only the right call for a real
+    # weekend closure. Confirmed live that isStale can also fire on a
+    # weekday with a cacheAge of months (metalcharts.org's own upstream feed
+    # stuck, not a market closure) — skipping indefinitely in that case would
+    # silently flatline the chart forever with no visible signal anything's
+    # wrong. So: skip only when the metals market is genuinely closed
+    # (_metals_market_closed — Globex hours, not just "is it Sat/Sun UTC",
+    # which was wrongly suppressing real Sunday-evening ticks after the
+    # 22:00 UTC reopen); on a weekday/trading session, persist anyway and
+    # let a stuck upstream surface directly in the chart.
+    if isinstance(data, dict) and data.get("isStale") and _metals_market_closed():
+        return data
+    payload = data.get("data", data) if isinstance(data, dict) else {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for series_id, instrument in (("XAG", XAG_SPOT), ("XAU", XAU_SPOT)):
+        entry = payload.get(series_id) if isinstance(payload, dict) else None
+        price, pct = _spot_entry_fields(entry)
+        if price is not None:
+            rows.append({
+                "instrument": instrument,
+                "ts": now_iso,
+                "price": price,
+                "change_pct_24h": pct,
+            })
+    if rows:
+        db.append_spot_price_ticks(rows)
+    return data
+
+
+GOLDAPI_BASE = "https://www.goldapi.io/api"
+# GoldAPI.io's bare /api/{SYMBOL}/{CURRENCY} endpoint is a FOREXCOM spot
+# feed (confirmed live) — NOT LBMA. Only the date-suffixed historical
+# endpoint (/api/{SYMBOL}/{CURRENCY}/{YYYYMMDD}) returns exchange="LBMA".
+# "Today's" fix is therefore fetched via that same date-suffixed path with
+# today's date, not the bare endpoint. Confirmed live that gold and silver
+# both come back stamped 10:30:00Z regardless of metal — that does NOT
+# match silver's real fix time (LBMA Silver Price is set at 12:00 London,
+# not 10:30), so the date field is treated as "which calendar day this fix
+# is for," not a trustworthy per-metal fix-moment timestamp. GoldAPI.io
+# also exposes only one price/day for gold — no distinct AM vs PM fix
+# field — so gold's PM fix is not available from this source; gold is
+# persisted under session="AM" (best-effort) and silver under
+# session="daily" (see price_instruments.LBMA_SESSION_BY_METAL).
+_LBMA_METAL_SYMBOLS = ("XAU", "XAG")
+
+
+async def _fetch_goldapi_fix(symbol: str, api_key: str, for_date: date) -> dict:
+    resp = await _client.get(
+        f"{GOLDAPI_BASE}/{symbol}/USD/{for_date.strftime('%Y%m%d')}",
+        headers={"x-access-token": api_key},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _fetch_and_persist_lbma_fix() -> dict:
+    if "GAPI_API_KEY" not in os.environ:
+        raise HTTPException(500, "GAPI_API_KEY environment variable is not set")
+    api_key = os.environ["GAPI_API_KEY"]
+    today = date.today()
+    results = {}
+    for symbol in _LBMA_METAL_SYMBOLS:
+        # GoldAPI.io's historical endpoint confirmed live to have no data
+        # for "today" until some lag later in the day (returns
+        # {"error": "No data available..."} — no "price" key at all, not
+        # just null) — fall back to the most recent real business day so
+        # the badge/history always reflects the most recent real fix
+        # instead of going empty for part of each day.
+        #
+        # A real bug caught live (2026-07): GoldAPI.io does NOT error for a
+        # WEEKEND date the way it does for "today, not yet published" — it
+        # silently returns Friday's real fix under a non-null "price" field,
+        # re-timestamped as if it were Saturday's/Sunday's own fix (no LBMA
+        # fix is ever actually set on a weekend). The original fallback only
+        # retried once, on "price is None," which weekends never trigger —
+        # so a fetch that happened to run on a Saturday/Sunday would have
+        # silently persisted Friday's real number mislabeled with a
+        # weekend's date. No contaminated rows were found in lbma_fix by
+        # the time this was caught (pure luck of when the backend happened
+        # to restart), but the bug was real and latent. Fixed by walking
+        # `for_date` back to the nearest real weekday BEFORE ever calling
+        # GoldAPI, not by trying to detect the silent-carry-forward after
+        # the fact (which would require guessing whether two consecutive
+        # real prices are "coincidentally equal" vs "the same forward-
+        # filled response" — the weekday check is unambiguous, that
+        # inference isn't).
+        fetch_date = today
+        while fetch_date.weekday() >= 5:
+            fetch_date -= timedelta(days=1)
+        payload = await _fetch_goldapi_fix(symbol, api_key, fetch_date)
+        fetched_date = fetch_date
+        if payload.get("price") is None:
+            fetched_date = fetch_date - timedelta(days=1)
+            while fetched_date.weekday() >= 5:
+                fetched_date -= timedelta(days=1)
+            payload = await _fetch_goldapi_fix(symbol, api_key, fetched_date)
+        price = payload.get("price")
+        if price is not None:
+            db.upsert_settlement_price_rows(LBMA_BY_METAL[symbol], [{
+                "date": str(fetched_date),
+                "session": LBMA_SESSION_BY_METAL[symbol],
+                "price": price,
+            }])
+        results[symbol] = payload
+    return results
+
+
+# Front-month vs. next-month futures curve spread (Squeeze Context Story
+# #1, see squeeze-context-spec.md). Yahoo's chart API returns a price for
+# EVERY calendar-month contract symbol, including thin/illiquid ones, and
+# which months are genuinely liquid does NOT match the textbook COMEX
+# delivery-cycle description — confirmed live (2026-07): silver's real
+# near-term depth was Sep (SIU26.CMX, vol=14,445) and Dec (SIZ26.CMX,
+# vol=1,123) only, while the textbook "Mar/May/Jul/Sep/Dec" cycle's Jul
+# (SIN26.CMX) showed just vol=5; gold's real depth was Aug (GCQ26.CMX,
+# vol=22,196) and Dec (GCZ26.CMX, vol=1,429), while Jul/Sep/Oct/Nov were
+# all <200. A hand-maintained "active months" list was tried first and
+# abandoned — same reasoning delivery_behavior.py's own module docstring
+# gives for why FND/LTD are computed per-month on demand rather than off a
+# small fixed list: COMEX's real listed/liquid months don't fit one. This
+# resolves front/next by fetching a spread of near-term candidate months
+# and picking the two with the highest real reported volume, every time,
+# rather than trusting a static list to stay accurate.
+_FUTURES_MONTH_CODE = {
+    1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
+    7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z",
+}
+CURVE_SPREAD_CANDIDATE_MONTHS_AHEAD = 8   # how many upcoming calendar months to probe for liquidity
+CURVE_SPREAD_CANDIDATE_MONTHS_BEHIND = 14 # >CURVE_SPREAD_FETCH_DAYS/30, so per-date backfill ranking
+                                           # (see _fetch_and_persist_curve_spread) has every symbol that
+                                           # could have been genuinely front/next at any date in that window
+                                           # — a real gap in an earlier version, which only swept forward
+                                           # from today and silently missed already-thinning contracts
+                                           # (e.g. SIN26.CMX/Jul26) that were the true front month months ago.
+CURVE_SPREAD_FETCH_DAYS = 370      # >1y so a fresh slow-tier row always has a full trailing year
+
+
+_MONTH_CODE_TO_NUM = {v: k for k, v in _FUTURES_MONTH_CODE.items()}
+
+
+def _candidate_contract_symbols(metal: str, today: date, months_ahead: int, months_behind: int) -> list[str]:
+    root = "SI" if metal == "XAG" else "GC"
+    symbols = []
+    year, month = today.year, today.month
+    for _ in range(months_behind):
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    for _ in range(months_ahead + months_behind):
+        symbols.append(f"{root}{_FUTURES_MONTH_CODE[month]}{year % 100:02d}.CMX")
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
+    return symbols
+
+
+def _delivery_sort_key(symbol: str) -> tuple[int, int]:
+    """(year, month) parsed from a Yahoo .CMX futures symbol, e.g.
+    'SIN26.CMX' -> (2026, 7) — lets ranking enforce real delivery order,
+    not just raw volume rank. Assumes 2-digit years land in 2000-2099,
+    fine for this codebase's near-term contract horizon."""
+    month_code = symbol[2]
+    year = 2000 + int(symbol[3:5])
+    return (year, _MONTH_CODE_TO_NUM[month_code])
+
+
+async def _fetch_yahoo_contract_daily(ticker: str, days: int) -> dict[str, tuple[float, float]]:
+    """Daily (close, volume) pairs keyed by YYYY-MM-DD for a single futures
+    contract symbol — real daily volume is what makes per-historical-date
+    liquidity ranking possible, see module note above. Thin wrapper over
+    yahoo_prices.fetch_yahoo_bars (the shared caller/retry/404 logic,
+    price-architecture-spec.md's Fetch consolidation) + bars_to_daily_dict."""
+    bars = await fetch_yahoo_bars(_client, ticker, interval="1d", range_=f"{days}d")
+    return bars_to_daily_dict(bars)
+
+
+async def _fetch_and_persist_curve_spread() -> dict:
+    """Front/next-month resolution is liquidity-ranked PER HISTORICAL DATE,
+    not just for today — a real mislabeling bug caught after inspecting the
+    persisted data (confirmed live 2026-07): the original version ranked
+    liquidity once for today, then backfilled those two symbols' entire
+    trailing-year price history under that single label. Since which
+    contract is genuinely front/next changes as contracts approach and pass
+    their own delivery window (confirmed live: during the real January 2026
+    silver squeeze, the actually-liquid front month was SIN26.CMX/Jul26,
+    not SIU26.CMX/Sep26, which is what today's ranking would have wrongly
+    applied retroactively), a fixed label across the whole backfill window
+    was itself wrong — not the underlying Yahoo prices, which are real,
+    independently-traded, and carry real daily volume. This fetches each
+    candidate symbol's full daily (close, volume) history once, then re-
+    ranks front/next independently for every date in that history using
+    that date's own real volume."""
+    today = date.today()
+    results = {}
+    for metal in ("XAG", "XAU"):
+        candidates = _candidate_contract_symbols(
+            metal, today, CURVE_SPREAD_CANDIDATE_MONTHS_AHEAD, CURVE_SPREAD_CANDIDATE_MONTHS_BEHIND
+        )
+        fetched: dict[str, dict[str, tuple[float, float]]] = {}
+        for symbol in candidates:
+            bars = await _fetch_yahoo_contract_daily(symbol, CURVE_SPREAD_FETCH_DAYS)
+            if bars:
+                fetched[symbol] = bars
+
+        all_dates = sorted(set(d for bars in fetched.values() for d in bars))
+        rows = []
+        for d in all_dates:
+            # Rank every candidate symbol with real volume on THIS date by
+            # volume, highest = front. "Next" is the highest-volume REMAINING
+            # candidate whose delivery month is strictly later than front's —
+            # a real second bug caught during verification: pure volume
+            # ranking with no delivery-order check could pair an about-to-
+            # expire contract's trailing volume (e.g. SIZ25.CMX/Dec25, still
+            # winding down) against a newer front month (e.g. SIN26.CMX/
+            # Jul26) and call the EARLIER contract "next," producing a
+            # spurious negative spread that wasn't real backwardation, just
+            # a chronologically-backwards pairing.
+            day_ranked = sorted(
+                (
+                    (symbol, bars[d][0], bars[d][1])
+                    for symbol, bars in fetched.items()
+                    if d in bars and bars[d][1] > 0
+                ),
+                key=lambda t: t[2],
+                reverse=True,
+            )
+            if len(day_ranked) < 2:
+                continue
+            front_symbol, front_price, _ = day_ranked[0]
+            front_delivery = _delivery_sort_key(front_symbol)
+            later_candidates = [
+                c for c in day_ranked[1:] if _delivery_sort_key(c[0]) > front_delivery
+            ]
+            if not later_candidates:
+                continue
+            next_symbol, next_price, _ = later_candidates[0]
+            # Nulls over zeros: only compute a real spread when both legs
+            # reported a real price that day (standing convention).
+            spread_pct = (
+                (next_price - front_price) / front_price
+                if front_price and next_price else None
+            )
+            row = {
+                "metal": metal,
+                "date": d,
+                "front_month_symbol": front_symbol,
+                "front_month_price": front_price,
+                "next_month_symbol": next_symbol,
+                "next_month_price": next_price,
+                "curve_spread_pct": spread_pct,
+            }
+            db.upsert_curve_spread_row(row)
+            rows.append(row)
+        results[metal] = rows
+    return results
+
+
+def _census_trade_months(n: int) -> list[str]:
+    """Last n calendar months as 'YYYY-MM' strings, most recent first."""
+    months = []
+    y, m = date.today().year, date.today().month
+    for _ in range(n):
+        months.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return months
+
+
+async def _fetch_and_persist_census_trade() -> dict:
+    if "CENSUS_API_KEY" not in os.environ:
+        raise HTTPException(500, "CENSUS_API_KEY environment variable is not set")
+    api_key = os.environ["CENSUS_API_KEY"]
+    results = {}
+    for metal, hs_code in CENSUS_TRADE_HS_CODES.items():
+        for flow, spec in CENSUS_TRADE_FLOWS.items():
+            get_fields = ["CTY_CODE", "CTY_NAME", spec["value_general_field"]]
+            if spec["value_consumption_field"]:
+                get_fields.append(spec["value_consumption_field"])
+            get_fields += [spec["qty_field"], "UNIT_QY1"]
+            rows_for_flow = []
+            # Confirmed live: Census's publication lag is ~2 months, not 1 —
+            # both the current calendar month and the immediately-prior one
+            # return HTTP 204 (empty body, not an error) until released.
+            # Fetch a wider window so CENSUS_TRADE_MONTHS_PER_FETCH real
+            # months still land even after skipping unpublished ones.
+            for month in _census_trade_months(CENSUS_TRADE_MONTHS_PER_FETCH + 2):
+                resp = await _client.get(
+                    f"{CENSUS_TRADE_BASE}/{spec['path']}",
+                    params={
+                        "get": ",".join(get_fields),
+                        spec["commodity_param"]: hs_code,
+                        "time": month,
+                        "key": api_key,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                if resp.status_code == 204 or not resp.content:
+                    continue  # not yet published for this month
+                payload = resp.json()
+                header, *data_rows = payload
+                col_idx = {name: i for i, name in enumerate(header)}
+                for r in data_rows:
+                    qty_raw = r[col_idx[spec["qty_field"]]]
+                    unit_raw = r[col_idx["UNIT_QY1"]]
+                    # Confirmed live: HS 7106/7108 always report qty "0" /
+                    # unit "-" (Census's not-applicable sentinel) — persist
+                    # as NULL rather than a misleading 0/"-" pair.
+                    qty = None if qty_raw in (None, "0", "-") else float(qty_raw)
+                    qty_unit = None if unit_raw in (None, "-") else unit_raw
+                    con_val = None
+                    if spec["value_consumption_field"]:
+                        con_val = int(r[col_idx[spec["value_consumption_field"]]])
+                    rows_for_flow.append({
+                        "metal": metal,
+                        "flow": flow,
+                        "hs_code": hs_code,
+                        "cty_code": r[col_idx["CTY_CODE"]],
+                        "cty_name": r[col_idx["CTY_NAME"]],
+                        "year": int(month[:4]),
+                        "month": int(month[5:7]),
+                        "value_general_usd": int(r[col_idx[spec["value_general_field"]]]),
+                        "value_consumption_usd": con_val,
+                        "qty": qty,
+                        "qty_unit": qty_unit,
+                    })
+            if rows_for_flow:
+                db.upsert_census_trade_rows(rows_for_flow)
+            results[f"{metal}_{flow}"] = len(rows_for_flow)
+    return results
+
+
+CENSUS_TRADE_MIN_REFRESH_DAYS = 25  # Census releases monthly — no point re-pulling more often; also feeds census_trade's CadenceSpec.min_gap below, single source of truth for the number
+
+
+async def _refresh_census_trade():
+    """census_trade's fetch_fn — a rate-limit gate wrapping the real fetch,
+    same shape as _refresh_cot_pipeline. Gates on wall-clock time since the
+    LAST FETCH ATTEMPT (source_health.last_attempt_at), not on the
+    persisted data's own age — confirmed live that Census's real
+    publication lag is ~2 months (both the current calendar month and the
+    immediately-prior one return HTTP 204 until released), so "latest
+    persisted month is under 25 days old" is never true in practice and
+    would make the gate a permanent no-op, unlike cot_pipeline's CFTC data
+    (published within ~3 days of its as-of date, so report age closely
+    tracks fetch recency there) — see census_trade's CadenceSpec, which
+    sets gate_on="last_attempt_at" for exactly this reason, vs.
+    cot_pipeline's gate_on="persisted_data_age". Records a 'skipped'
+    attempt rather than a failure when gated. census_trade's
+    SourceDefinition.self_recording=True (like cot_pipeline), so this
+    records its own success too — the generic health_refresh route must
+    not overwrite a genuine 'skipped' with a blanket 'success' once this
+    returns normally either way."""
+    health = db.get_source_health("census_trade")
+    if health and health.get("last_attempt_at"):
+        last_attempt = datetime.fromisoformat(health["last_attempt_at"])
+        days_since = (datetime.now(timezone.utc) - last_attempt).days
+        if days_since < CENSUS_TRADE_MIN_REFRESH_DAYS:
+            db.record_fetch_attempt(
+                "census_trade",
+                success=False,
+                skipped=True,
+                error="Last fetch attempt is less than 25 days old — skipped to respect Census's monthly release cadence.",
+            )
+            return
+    await _fetch_and_persist_census_trade()
+    db.record_fetch_attempt("census_trade", success=True)
+
+
+async def _fetch_and_persist_census_trade_startup():
+    """census_trade's fetch_fn. Monthly, not daily — too slow for either
+    tiered loop, so this is fire_at_startup=True (gated by _refresh_census_trade's
+    own min_gap) plus manual force-refresh via the Data tab's per-source
+    button, same as LBMA. Silently skips if CENSUS_API_KEY isn't set — a
+    nice-to-have layer, not a hard boot requirement. self_recording=True
+    on this source (unchanged) — _refresh_census_trade already records its
+    own skip/success internally, and the except clause below records
+    failure, so _schedule_loop's outer wrapper must not double-record."""
+    if "CENSUS_API_KEY" not in os.environ:
+        print("[census_trade] CENSUS_API_KEY not set — skipping Census trade fetch")
+        return
+    try:
+        await _refresh_census_trade()
+    except Exception as e:
+        print(f"[census_trade] warning: {e}")
+        db.record_fetch_attempt("census_trade", success=False, error=str(e))
+
+
+OFAC_BASE = "https://sanctionslistservice.ofac.treas.gov/api/download"
+# Confirmed live 2026-08-25/26: no auth/key required, but a User-Agent
+# header IS required (a bare request without one gets a 403) — official
+# Treasury infrastructure, not a paywalled API. httpx follows the 302 ->
+# signed S3 URL by default (AsyncClient's default follow_redirects
+# behavior), no special handling needed for that hop.
+_OFAC_USER_AGENT = "ArgentVigil/1.0 (silver/gold positioning monitor; sanctions timeline feature)"
+
+# Real designation dates require the ADVANCED file variants (sdn_advanced.xml
+# / cons_advanced.xml), not the plain sdn.xml/consolidated.xml this feature
+# originally shipped with. Confirmed live 2026-08-26, correcting an earlier
+# wrong conclusion: the plain files genuinely have no per-entity designation
+# date anywhere in their schema (only a document-level Publish_Date), but
+# the Advanced variants carry a real one via SanctionsEntry/EntryEvent/Date
+# (EntryEventTypeID=1 = "Created" — the entity's real addition date, going
+# back decades in real data, e.g. 1984/1986 dates confirmed on real live
+# entries) joined to DistinctParty by ProfileID/FixedRef. This is a
+# genuinely different, much more normalized schema (~126MB sdn_advanced.xml
+# vs ~29MB sdn.xml) — party identity, sanctions-list-membership/dates, and
+# ID-lookup dictionaries are three separate top-level sections joined by
+# ID, not one flat <sdnEntry> per party. Confirmed live that sdn_advanced.xml
+# is NOT just "SDN with more detail" — it contains SanctionsEntry rows for
+# ListID 1550 (SDN), 91512 (Consolidated), 91507 (Sectoral Sanctions), and
+# 91243 (Non-SDN Palestinian Legislative Council) all in one file. Also
+# confirmed live that cons_advanced.xml is NOT redundant with it despite
+# that overlap — 388 of cons_advanced.xml's 481 distinct ProfileIDs do not
+# appear in sdn_advanced.xml at all (list-membership rows that only exist
+# in one file or the other), so both are still fetched and merged.
+# Confirmed live 2026-08-26: the Advanced XML files use a DIFFERENT
+# namespace than the plain sdn.xml/consolidated.xml this feature originally
+# parsed (".../exports/XML") — a real bug caught in verification before
+# this ever touched production data: every _ofac_tag(...) lookup below
+# silently matched zero elements against the real file (ElementTree's tag
+# matching is namespace-strict, and root.iter()/find() with the wrong
+# namespace return nothing, not an error), so a first cut of this rework
+# "succeeded" with 0 entries parsed. The real root element's namespace is
+# ".../exports/ADVANCED_XML", confirmed directly against a live-fetched
+# sdn_advanced.xml's own root tag.
+_OFAC_XML_NS = "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/ADVANCED_XML"
+
+
+async def _fetch_ofac_xml(filename: str) -> bytes:
+    # Confirmed live 2026-08-25: httpx.AsyncClient() defaults to
+    # follow_redirects=False (unlike requests), and this app's shared
+    # _client (main.py's lifespan) doesn't override that globally — a real
+    # bug caught live as a "302 Found" exception on the very first startup
+    # fetch, since OFAC's download endpoint always 302s to a short-lived
+    # signed S3 URL. follow_redirects=True is passed per-call here rather
+    # than mutating _client's shared config for every other source's calls.
+    resp = await _client.get(
+        f"{OFAC_BASE}/{filename}",
+        headers={"User-Agent": _OFAC_USER_AGENT},
+        timeout=120,  # sdn_advanced.xml is ~126MB, confirmed live — plain sdn.xml's 60s timeout isn't enough margin
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _ofac_tag(name: str) -> str:
+    return f"{{{_OFAC_XML_NS}}}{name}"
+
+
+# PartySubTypeValues -> PartyType, confirmed live against real
+# sdn_advanced.xml: PartySubType ID=1/2 ARE their own unambiguous labels
+# ("Vessel"/"Aircraft" per PartySubTypeValues' own text), but PartySubType
+# ID=3/4 are both labeled "Unknown" there — the real Individual/Entity
+# distinction only exists one level up, via that PartySubType's own
+# PartyTypeID attribute (PartySubType ID="3" PartyTypeID="2" -> Entity,
+# PartySubType ID="4" PartyTypeID="1" -> Individual, confirmed live against
+# PartyTypeValues' own ID=1 "Individual"/ID=2 "Entity" labels). Resolving
+# entity_type therefore needs BOTH lookup dicts, not just the PartySubType
+# ID alone, unlike the vessel/aircraft case where PartySubType ID alone is
+# already unambiguous.
+_OFAC_PARTY_SUBTYPE_TO_ENTITY_TYPE = {"1": "vessel", "2": "aircraft"}
+_OFAC_PARTY_TYPE_ID_TO_ENTITY_TYPE = {"1": "individual", "2": "entity"}
+
+
+def _ofac_parse_reference_dicts(root):
+    """Builds the small ID->label lookup dicts this schema needs:
+    - detail_reference: DetailReference ID -> text (vessel type/flag values
+      that arrive as a DetailReferenceID pointer rather than inline text,
+      confirmed live e.g. DetailReference 705 = "Tug").
+    - subtype_to_party_type: PartySubType ID -> its own PartyTypeID
+      attribute, needed to resolve entity_type for Individual/Entity rows
+      (see _OFAC_PARTY_SUBTYPE_TO_ENTITY_TYPE's own comment for why
+      PartySubType ID alone isn't enough for those two, unlike Vessel/
+      Aircraft).
+    - country_values: Country ID -> name (CountryValues), used to resolve
+      both address country and ID-document issuing country.
+    - locpart_types: LocPartType ID -> label (ADDRESS1/ADDRESS2/ADDRESS3/
+      CITY/STATE-PROVINCE/POSTAL CODE — confirmed live against
+      LocPartTypeValues), needed to parse Locations' typed address parts.
+    - id_doc_types: IDRegDocType ID -> label (Passport/SSN/Cedula No./etc,
+      IDRegDocTypeValues), needed to parse IDRegDocument elements.
+    - legal_basis_values: LegalBasis ID -> text (e.g. "Executive Order
+      14024 (Russia)"), needed to resolve an EntryEvent's own LegalBasisID
+      into the human-readable string persisted as ofac_designations.
+      legal_basis. Confirmed live 2026-08-27 that LegalBasis's own
+      SanctionsProgramID link back to SanctionsProgramValues is NOT usable
+      — every LegalBasis row in real data points at SanctionsProgramID=1
+      ("Unknown"), regardless of what program it's actually authority for
+      — so this is resolved per-designation via EntryEvent, not joined
+      through SanctionsProgram at all."""
+    detail_reference = {}
+    for el in root.iter(_ofac_tag("DetailReference")):
+        rid = el.get("ID")
+        if rid:
+            detail_reference[rid] = (el.text or "").strip()
+
+    subtype_to_party_type = {}
+    for el in root.iter(_ofac_tag("PartySubType")):
+        sid = el.get("ID")
+        party_type_id = el.get("PartyTypeID")
+        if sid and party_type_id:
+            subtype_to_party_type[sid] = party_type_id
+
+    country_values = {}
+    for el in root.iter(_ofac_tag("Country")):
+        cid = el.get("ID")
+        if cid and el.text:
+            country_values[cid] = el.text.strip()
+
+    locpart_types = {}
+    for el in root.iter(_ofac_tag("LocPartType")):
+        lid = el.get("ID")
+        if lid and el.text:
+            locpart_types[lid] = el.text.strip()
+
+    id_doc_types = {}
+    for el in root.iter(_ofac_tag("IDRegDocType")):
+        did = el.get("ID")
+        if did and el.text:
+            id_doc_types[did] = el.text.strip()
+
+    legal_basis_values = {}
+    for el in root.iter(_ofac_tag("LegalBasis")):
+        lbid = el.get("ID")
+        if lbid and el.text:
+            legal_basis_values[lbid] = el.text.strip()
+
+    return detail_reference, subtype_to_party_type, country_values, locpart_types, id_doc_types, legal_basis_values
+
+
+def _ofac_parse_distinct_parties(root, detail_reference: dict, subtype_to_party_type: dict) -> dict:
+    """Parses every <DistinctParty> into {profile_id: {entity_name,
+    entity_type, vessel_flag, vessel_type}}, keyed by Profile/@ID (same
+    value as FixedRef on the DistinctParty itself and as SanctionsEntry's
+    own ProfileID — confirmed live these three are the same number for a
+    given entity, e.g. MAR AZUL is FixedRef=4238/Profile ID=4238/
+    SanctionsEntry ProfileID=4238).
+
+    entity_type: PartySubTypeID=1/2 resolve directly to vessel/aircraft
+    (unambiguous on their own). PartySubTypeID=3/4 resolve via the
+    subtype_to_party_type lookup built in _ofac_parse_reference_dicts (a
+    real bug caught in testing: PartySubType 3 and 4 are BOTH labeled
+    "Unknown" in PartySubTypeValues, so blindly defaulting to "entity" for
+    both of them — an earlier version of this function did — silently
+    misclassified every real Individual as "entity" too; the correct
+    distinction only exists one level up, via that PartySubType's own
+    PartyTypeID attribute).
+
+    entity_name: primary DocumentedName's assembled NamePartValue text
+    (Alias Primary="true" -> DocumentedName -> DocumentedNamePart ->
+    NamePartValue; falls back to the first Alias present if no Alias is
+    marked Primary, which happens for some real entries).
+
+    vessel_flag/vessel_type: read from Feature/FeatureVersion, matched by
+    FeatureTypeID (3 = Vessel Flag, 2 = VESSEL TYPE, confirmed live
+    against FeatureTypeValues) — value comes from FeatureVersion's own
+    VersionDetail element, which is EITHER inline text (vessel_flag: "Cuba")
+    OR a DetailReferenceID pointer needing the detail_reference lookup
+    (vessel_type on the same real entry: DetailReferenceID=705 -> "Tug").
+    Only populated for entity_type == "vessel", per the plain-file version's
+    own convention."""
+    by_profile: dict[str, dict] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        if not profile_id:
+            continue
+
+        subtype_id = profile_el.get("PartySubTypeID")
+        entity_type = _OFAC_PARTY_SUBTYPE_TO_ENTITY_TYPE.get(subtype_id)
+        if entity_type is None:
+            party_type_id = subtype_to_party_type.get(subtype_id)
+            entity_type = _OFAC_PARTY_TYPE_ID_TO_ENTITY_TYPE.get(party_type_id)
+
+        entity_name = None
+        identity_el = profile_el.find(_ofac_tag("Identity"))
+        aliases = identity_el.findall(_ofac_tag("Alias")) if identity_el is not None else []
+        primary_alias = next((a for a in aliases if a.get("Primary") == "true"), None)
+        chosen_alias = primary_alias if primary_alias is not None else (aliases[0] if len(aliases) > 0 else None)
+        if chosen_alias is not None:
+            doc_name = chosen_alias.find(_ofac_tag("DocumentedName"))
+            if doc_name is not None:
+                parts = [
+                    (pv.text or "").strip()
+                    for pv in doc_name.iter(_ofac_tag("NamePartValue"))
+                    if pv.text
+                ]
+                if parts:
+                    entity_name = " ".join(parts)
+
+        vessel_flag = None
+        vessel_type = None
+        if entity_type == "vessel":
+            for feature in profile_el.iter(_ofac_tag("Feature")):
+                feature_type_id = feature.get("FeatureTypeID")
+                if feature_type_id not in ("2", "3"):
+                    continue
+                version = feature.find(_ofac_tag("FeatureVersion"))
+                if version is None:
+                    continue
+                detail = version.find(_ofac_tag("VersionDetail"))
+                if detail is None:
+                    continue
+                value = (detail.text or "").strip() or None
+                if value is None:
+                    ref_id = detail.get("DetailReferenceID")
+                    value = detail_reference.get(ref_id)
+                if feature_type_id == "3":
+                    vessel_flag = value
+                elif feature_type_id == "2":
+                    vessel_type = value
+
+        by_profile[profile_id] = {
+            "entity_name": entity_name or "(unnamed)",
+            "entity_type": entity_type,
+            "vessel_flag": vessel_flag,
+            "vessel_type": vessel_type,
+        }
+    return by_profile
+
+
+_OFAC_ALIAS_TYPE_LABELS = {
+    # AliasTypeValues ID -> label, confirmed live these 4 are the only
+    # values that exist in this data (2026-08-26 verification). "Name" (1403)
+    # is the primary/legal name entry, not really an "alias" in the colloquial
+    # sense, but it's the same Alias element shape so it's captured here too
+    # rather than special-cased out — the detail view can label it plainly.
+    "1400": "A.K.A.",
+    "1401": "F.K.A.",
+    "1402": "N.K.A.",
+    "1403": "Name",
+}
+
+
+def _ofac_parse_aliases(root) -> dict:
+    """Parses every <Alias> under every Profile's Identity into
+    {profile_id: [{"name", "is_primary", "alias_type"}, ...]} — ALL
+    aliases, not just the one _ofac_parse_distinct_parties picks for
+    entity_name (confirmed live an entity can carry many: A.K.A./F.K.A./
+    N.K.A. entries plus the primary Name). alias_type resolves via
+    _OFAC_ALIAS_TYPE_LABELS from the Alias element's own AliasTypeID
+    attribute; name is assembled the same way entity_name is (DocumentedName
+    -> DocumentedNamePart -> NamePartValue, space-joined)."""
+    by_profile: dict[str, list[dict]] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        if not profile_id:
+            continue
+        identity_el = profile_el.find(_ofac_tag("Identity"))
+        if identity_el is None:
+            continue
+        aliases = []
+        for alias_el in identity_el.findall(_ofac_tag("Alias")):
+            doc_name = alias_el.find(_ofac_tag("DocumentedName"))
+            if doc_name is None:
+                continue
+            parts = [
+                (pv.text or "").strip()
+                for pv in doc_name.iter(_ofac_tag("NamePartValue"))
+                if pv.text
+            ]
+            if not parts:
+                continue
+            aliases.append({
+                "name": " ".join(parts),
+                "is_primary": alias_el.get("Primary") == "true",
+                "alias_type": _OFAC_ALIAS_TYPE_LABELS.get(alias_el.get("AliasTypeID")),
+            })
+        if aliases:
+            by_profile[profile_id] = aliases
+    return by_profile
+
+
+# FeatureTypeID for a Location-carrying Feature, confirmed live against
+# FeatureTypeValues during vessel-detail research (id 25 = "Location").
+_OFAC_LOCATION_FEATURE_TYPE_ID = "25"
+
+
+def _ofac_parse_locations(root, country_values: dict, locpart_types: dict) -> dict:
+    """Parses the top-level <Locations> section into {location_id: {
+    "address1", "address2", "address3", "city", "state_province",
+    "postal_code", "country", "id_doc_ids": [...]}}.
+
+    Confirmed live (2026-08-26) this is a genuinely separate top-level
+    section from DistinctParties, not nested under a Profile — addresses
+    are reached from a Profile via Feature/FeatureVersion/
+    FeatureVersionReference (FeatureTypeID=25) pointing at a Location's own
+    @ID, resolved by the caller (_ofac_parse_addresses_by_profile) rather
+    than here, since this function's only job is building the flat
+    location_id -> address-fields map once.
+
+    Each LocationPart is typed via LocPartTypeID (resolved through
+    locpart_types -> ADDRESS1/ADDRESS2/ADDRESS3/CITY/STATE-PROVINCE/
+    POSTAL CODE) rather than having its own fixed tag name; country comes
+    from LocationCountry's own CountryID, resolved via country_values.
+    Confirmed live most real addresses are partial (country-only is
+    common) — any part not present stays None, per nulls-over-zeros, never
+    an empty string standing in for "not present."
+
+    id_doc_ids: any IDRegDocumentReference children of this Location,
+    confirmed live a real (if minority — 183 of 22,667 total ID documents
+    in a full SDN pull) attachment path, collected here so
+    _ofac_parse_id_documents can pick them up as a secondary source
+    alongside the primary IdentityID-direct join."""
+    locpart_label_to_field = {
+        "ADDRESS1": "address1",
+        "ADDRESS2": "address2",
+        "ADDRESS3": "address3",
+        "CITY": "city",
+        "STATE/PROVINCE": "state_province",
+        "POSTAL CODE": "postal_code",
+    }
+    by_location: dict[str, dict] = {}
+    for loc in root.iter(_ofac_tag("Location")):
+        location_id = loc.get("ID")
+        if not location_id:
+            continue
+        fields = {"address1": None, "address2": None, "address3": None, "city": None, "state_province": None, "postal_code": None, "country": None}
+        for part in loc.findall(_ofac_tag("LocationPart")):
+            label = locpart_types.get(part.get("LocPartTypeID"))
+            field = locpart_label_to_field.get(label)
+            if field is None:
+                continue
+            value_el = part.find(_ofac_tag("LocationPartValue"))
+            text = value_el.findtext(_ofac_tag("Value")) if value_el is not None else None
+            if text and text.strip():
+                fields[field] = text.strip()
+        country_el = loc.find(_ofac_tag("LocationCountry"))
+        if country_el is not None:
+            fields["country"] = country_values.get(country_el.get("CountryID"))
+        id_doc_ids = [
+            ref.get("IDRegDocumentID")
+            for ref in loc.findall(_ofac_tag("IDRegDocumentReference"))
+            if ref.get("IDRegDocumentID")
+        ]
+        fields["id_doc_ids"] = id_doc_ids
+        by_location[location_id] = fields
+    return by_location
+
+
+def _ofac_parse_addresses_by_profile(root, locations: dict) -> dict:
+    """Resolves each Profile's Location-typed Feature(s) into that
+    profile's own address rows, via Feature/FeatureVersion/VersionLocation
+    -> Location/@ID -> the locations map built by _ofac_parse_locations.
+
+    Confirmed live (2026-08-26, correcting a wrong guess made during initial
+    implementation) the real join element is <VersionLocation LocationID=".."/>
+    under FeatureVersion — NOT a FeatureVersionReference element (that name
+    does exist in this schema, but attached to Location pointing back at the
+    FeatureVersion that cited it, the reverse direction from what's needed
+    here; using it would have silently resolved zero addresses). Verified
+    end-to-end against a real entry: Feature ID=150025/FeatureTypeID=25,
+    FeatureVersion ID=200025, VersionLocation LocationID=25, which resolves
+    to a real Location 25 (Havana, Cuba). Returns {profile_id:
+    [address_fields, ...]} (an entity can have more than one address on
+    file)."""
+    by_profile: dict[str, list[dict]] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        if not profile_id:
+            continue
+        addresses = []
+        for feature in profile_el.iter(_ofac_tag("Feature")):
+            if feature.get("FeatureTypeID") != _OFAC_LOCATION_FEATURE_TYPE_ID:
+                continue
+            for version in feature.findall(_ofac_tag("FeatureVersion")):
+                version_location = version.find(_ofac_tag("VersionLocation"))
+                if version_location is None:
+                    continue
+                location_id = version_location.get("LocationID")
+                location = locations.get(location_id)
+                if location is not None:
+                    addresses.append({k: v for k, v in location.items() if k != "id_doc_ids"})
+        if addresses:
+            by_profile[profile_id] = addresses
+    return by_profile
+
+
+def _ofac_parse_id_documents(root, country_values: dict, id_doc_types: dict, locations: dict) -> dict:
+    """Parses every <IDRegDocument> into {profile_id: [{"id_type",
+    "id_number", "issuing_country"}, ...]}.
+
+    Confirmed live (2026-08-26) the PRIMARY join is direct: IDRegDocument
+    carries its own IdentityID attribute pointing straight at a Profile's
+    Identity/@ID (22,667 real documents in a full SDN pull use this path).
+    A secondary, minority path also exists — Location elements can carry an
+    IDRegDocumentReference (183 instances confirmed live) — collected via
+    the locations map's own id_doc_ids (see _ofac_parse_locations) and
+    resolved back to a profile through _ofac_parse_addresses_by_profile's
+    same Feature/FeatureVersion chain would require a second pass; since
+    the Location-mediated instances are a small minority and every
+    IDRegDocument already carries IdentityID regardless of which path
+    references it, joining on IdentityID alone captures both — a
+    Location-attached document still has a real IdentityID pointing to the
+    same identity, confirmed live (id 8264/8311/8438/etc. from Location
+    entries all resolved to real, non-null IdentityID values on inspection).
+    profile_id is resolved by mapping Identity/@ID back to its owning
+    Profile via identity_to_profile (built once here from the same
+    DistinctParty walk other parse functions use)."""
+    identity_to_profile: dict[str, str] = {}
+    for party in root.iter(_ofac_tag("DistinctParty")):
+        profile_el = party.find(_ofac_tag("Profile"))
+        if profile_el is None:
+            continue
+        profile_id = profile_el.get("ID")
+        identity_el = profile_el.find(_ofac_tag("Identity"))
+        if profile_id and identity_el is not None and identity_el.get("ID"):
+            identity_to_profile[identity_el.get("ID")] = profile_id
+
+    by_profile: dict[str, list[dict]] = {}
+    for doc in root.iter(_ofac_tag("IDRegDocument")):
+        identity_id = doc.get("IdentityID")
+        profile_id = identity_to_profile.get(identity_id)
+        if profile_id is None:
+            continue
+        id_number = doc.findtext(_ofac_tag("IDRegistrationNo"))
+        entry = {
+            "id_type": id_doc_types.get(doc.get("IDRegDocTypeID")),
+            "id_number": (id_number or "").strip() or None,
+            "issuing_country": country_values.get(doc.get("IssuedBy-CountryID")),
+        }
+        by_profile.setdefault(profile_id, []).append(entry)
+    return by_profile
+
+
+_OFAC_LIST_ID_TO_LABEL = {
+    "1550": "SDN",
+    "91512": "Consolidated",
+    "91507": "Consolidated",  # Sectoral Sanctions Identifications List
+    "91243": "Consolidated",  # Non-SDN Palestinian Legislative Council List
+    "92052": "Consolidated",
+    "91868": "Consolidated",
+    "91763": "Consolidated",
+}
+
+
+def _ofac_parse_sanctions_entries(root, legal_basis_values: dict) -> dict:
+    """Parses every <SanctionsEntry> into {profile_id: {designation_date,
+    legal_basis, program_tags, list_source}}.
+
+    designation_date: EntryEvent's own Date (Year/Month/Day), filtered to
+    EntryEventTypeID == "1" ("Created" per EntryEventTypeValues — confirmed
+    live this is the only EntryEventType value that exists in this data at
+    all) — the real per-entity designation date this whole rework exists
+    to surface, confirmed live going back to at least 1984 on real entries.
+    A profile can have more than one SanctionsEntry (multiple lists); this
+    keeps the EARLIEST real Created date across all of a profile's entries,
+    since "when was this entity first designated" is the honest read, not
+    whichever entry happened to parse last.
+
+    legal_basis: that SAME EntryEvent's own LegalBasisID attribute, resolved
+    via legal_basis_values into a real, mostly-populated human-readable
+    string (e.g. "Executive Order 14024 (Russia)" — confirmed live ~92% of
+    real EntryEvent LegalBasisID uses resolve to something real rather than
+    the dictionary's own "Unknown" placeholder, which is persisted as None
+    per nulls-over-zeros rather than the literal string). Tracked alongside
+    designation_date on the SAME earliest-EntryEvent-wins basis — they come
+    from the same element, so whichever EntryEvent supplies the kept
+    designation_date also supplies the kept legal_basis. Confirmed live
+    2026-08-27 this is NOT reachable via SanctionsProgram — LegalBasis's own
+    SanctionsProgramID link in OFAC's real data always points at
+    SanctionsProgramID=1 ("Unknown"), regardless of the legal basis's real
+    subject, so there is no working program-level detail page to surface;
+    this per-designation field is the closest real substitute.
+
+    program_tags: SanctionsMeasure elements with SanctionsTypeID == "1"
+    ("Program" per SanctionsTypeValues) carry the program name in their own
+    Comment element (confirmed live, e.g. <Comment>CUBA</Comment>) — this
+    schema does NOT link program tags via a separate ID table the way the
+    plain files' <program> elements do, so Comment text is the real program
+    name, not just documentation.
+
+    list_source: mapped from ListID via _OFAC_LIST_ID_TO_LABEL. A profile
+    appearing under more than one ListID (real, confirmed live) keeps
+    whichever list_source was seen first — same one-value-per-profile
+    simplification this table's schema already assumes (list_source is a
+    single TEXT column, not an array)."""
+    by_profile: dict[str, dict] = {}
+    for entry in root.iter(_ofac_tag("SanctionsEntry")):
+        profile_id = entry.get("ProfileID")
+        if not profile_id:
+            continue
+        list_id = entry.get("ListID")
+        list_source = _OFAC_LIST_ID_TO_LABEL.get(list_id, "Consolidated")
+
+        designation_date = None
+        legal_basis = None
+        for event in entry.iter(_ofac_tag("EntryEvent")):
+            if event.get("EntryEventTypeID") != "1":
+                continue
+            date_el = event.find(_ofac_tag("Date"))
+            if date_el is None:
+                continue
+            year = date_el.findtext(_ofac_tag("Year"))
+            month = date_el.findtext(_ofac_tag("Month"))
+            day = date_el.findtext(_ofac_tag("Day"))
+            if not (year and month and day):
+                continue
+            candidate = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+            if designation_date is None or candidate < designation_date:
+                designation_date = candidate
+                event_legal_basis = legal_basis_values.get(event.get("LegalBasisID"))
+                legal_basis = event_legal_basis if event_legal_basis and event_legal_basis != "Unknown" else None
+
+        program_tags = []
+        for measure in entry.iter(_ofac_tag("SanctionsMeasure")):
+            if measure.get("SanctionsTypeID") != "1":
+                continue
+            comment = measure.find(_ofac_tag("Comment"))
+            if comment is not None and comment.text and comment.text.strip():
+                program_tags.append(comment.text.strip())
+
+        existing = by_profile.get(profile_id)
+        if existing is None:
+            by_profile[profile_id] = {
+                "designation_date": designation_date,
+                "legal_basis": legal_basis,
+                "program_tags": program_tags,
+                "list_source": list_source,
+            }
+        else:
+            if designation_date and (existing["designation_date"] is None or designation_date < existing["designation_date"]):
+                existing["designation_date"] = designation_date
+                existing["legal_basis"] = legal_basis
+            existing["program_tags"] = list(dict.fromkeys(existing["program_tags"] + program_tags))
+    return by_profile
+
+
+def _parse_ofac_advanced_xml(xml_bytes: bytes) -> dict:
+    """Parses one OFAC Advanced XML document (sdn_advanced.xml or
+    cons_advanced.xml — same schema) into AV's own row shapes, joining
+    every section (reference dictionaries, DistinctParty identity/vessel
+    detail, aliases, Locations/addresses, IDRegDocuments, SanctionsEntry
+    dates/programs/list) by ProfileID/FixedRef (or, for ID documents,
+    IdentityID resolved back to ProfileID — see _ofac_parse_id_documents).
+    Supersedes the original plain sdnList (sdn.xml/consolidated.xml) parse
+    — see this module's own OFAC_BASE comment for why the plain files were
+    replaced (no per-entity designation date exists in that schema at all).
+    A profile with no SanctionsEntry at all (shouldn't happen in real data,
+    but not assumed) is skipped — an entity with no list-membership record
+    isn't a real designation to persist (this also means its aliases/
+    addresses/id documents are dropped along with it, consistent with the
+    parent table's own scope).
+
+    Returns {"entries": [...], "aliases": [...], "addresses": [...],
+    "id_documents": [...]} — the latter three as flat lists (each dict
+    already carrying its own "ofac_uid" key) ready for
+    db.replace_ofac_entity_detail, rather than nested under each entry, so
+    the caller can merge two files' worth of detail the same simple way it
+    already merges entries (a dict-by-uid update, or here a plain list
+    extend since child rows have no single-value-per-uid constraint to
+    collide on)."""
+    root = ET.fromstring(xml_bytes)
+    detail_reference, subtype_to_party_type, country_values, locpart_types, id_doc_types, legal_basis_values = _ofac_parse_reference_dicts(root)
+    parties = _ofac_parse_distinct_parties(root, detail_reference, subtype_to_party_type)
+    sanctions = _ofac_parse_sanctions_entries(root, legal_basis_values)
+    aliases_by_profile = _ofac_parse_aliases(root)
+    locations = _ofac_parse_locations(root, country_values, locpart_types)
+    addresses_by_profile = _ofac_parse_addresses_by_profile(root, locations)
+    id_documents_by_profile = _ofac_parse_id_documents(root, country_values, id_doc_types, locations)
+
+    entries = []
+    aliases = []
+    addresses = []
+    id_documents = []
+    for profile_id, sanction_info in sanctions.items():
+        party_info = parties.get(profile_id)
+        if party_info is None:
+            continue
+        entries.append({
+            "ofac_uid": profile_id,
+            "entity_name": party_info["entity_name"],
+            "entity_type": party_info["entity_type"],
+            "program_tags": sanction_info["program_tags"],
+            "list_source": sanction_info["list_source"],
+            "designation_date": sanction_info["designation_date"],
+            "legal_basis": sanction_info["legal_basis"],
+            "vessel_flag": party_info["vessel_flag"],
+            "vessel_type": party_info["vessel_type"],
+        })
+        for a in aliases_by_profile.get(profile_id, []):
+            aliases.append({"ofac_uid": profile_id, **a})
+        for addr in addresses_by_profile.get(profile_id, []):
+            addresses.append({"ofac_uid": profile_id, **addr})
+        for doc in id_documents_by_profile.get(profile_id, []):
+            id_documents.append({"ofac_uid": profile_id, **doc})
+
+    return {"entries": entries, "aliases": aliases, "addresses": addresses, "id_documents": id_documents}
+
+
+async def _fetch_and_persist_ofac_designations() -> dict:
+    sdn_bytes = await _fetch_ofac_xml("sdn_advanced.xml")
+    cons_bytes = await _fetch_ofac_xml("cons_advanced.xml")
+    # Confirmed live 2026-08-26: cons_advanced.xml's ProfileIDs are NOT a
+    # subset of sdn_advanced.xml's (388 of 481 are exclusive to it) — both
+    # are parsed and merged, later-wins on a duplicate ofac_uid (shouldn't
+    # happen in practice since a given profile_id is scoped to one file's
+    # own numbering in real data, but dict-merge is the simple, safe
+    # behavior if it ever does). Detail lists (aliases/addresses/
+    # id_documents) are plain-extended rather than dict-merged — a
+    # duplicate uid appearing in both files would just mean its detail rows
+    # get replaced twice in db.replace_ofac_entity_detail's own delete-then-
+    # reinsert (harmless, since that function already de-dupes by uid via a
+    # set before deleting).
+    sdn_parsed = _parse_ofac_advanced_xml(sdn_bytes)
+    cons_parsed = _parse_ofac_advanced_xml(cons_bytes)
+
+    by_uid = {e["ofac_uid"]: e for e in sdn_parsed["entries"]}
+    by_uid.update({e["ofac_uid"]: e for e in cons_parsed["entries"]})
+    entries = list(by_uid.values())
+
+    result = db.diff_and_persist_ofac_designations(entries, date.today().isoformat())
+    db.replace_ofac_entity_detail(
+        aliases=sdn_parsed["aliases"] + cons_parsed["aliases"],
+        addresses=sdn_parsed["addresses"] + cons_parsed["addresses"],
+        id_documents=sdn_parsed["id_documents"] + cons_parsed["id_documents"],
+    )
+    return result
+
+
+async def _fetch_and_persist_ofac_designations_startup():
+    """ofac_sanctions' fetch_fn. No env var required (OFAC's bulk download
+    needs no key) — this wrapper exists purely for naming consistency with
+    every other registered source's _startup-suffixed fetch_fn, not because
+    there's a credential gate to check. self_recording=False (unlike
+    census_trade/cot_pipeline) — no internal gate/skip logic that would
+    conflict with _schedule_loop's/_refresh_slow_tier's own generic
+    success/failure recording, so this deliberately does NOT call
+    db.record_fetch_attempt itself; it just logs and re-raises on failure
+    so the caller's own try/except records the real outcome."""
+    result = await _fetch_and_persist_ofac_designations()
+    print(f"[ofac_sanctions] new={result['new']} delisted={result['delisted']} unchanged={result['unchanged']}")
+
+
+async def _fetch_and_persist_treasury_outlays() -> int:
+    """fed-spend-spec.md Story #1. No API key required. Two independent
+    MTS tables fetched and merged by (year, month): Table 1 for
+    receipts/outlays/deficit (real month reconstructed from
+    classification_desc + sequence_number_cd, see
+    _mts_fiscal_month_to_calendar), Table 5 for the
+    "Total--Interest on the Public Debt" row specifically (a genuinely
+    one-row-per-real-month figure in that table, unlike Table 1's
+    republished-hierarchy shape — confirmed live, see fed-spend-spec.md).
+    Real API coverage starts 2015-03 (NOT October 1980 as originally
+    assumed pre-investigation — fiscaldata.treasury.gov's API itself only
+    reaches back that far; deeper history lives only in Treasury's legacy
+    PDF archive, not this API). A single page[size]=10000 request covers
+    each table's full real history in one call (confirmed live: 2520 rows
+    Table 1 MTH, 136 rows Table 5's interest line — both comfortably under
+    that page size), so no pagination loop is needed."""
+    resp1 = await _client.get(
+        f"{TREASURY_MTS_BASE}/mts_table_1",
+        params={"filter": "record_type_cd:eq:MTH", "sort": "record_date", "page[size]": "10000"},
+        timeout=20,
+    )
+    resp1.raise_for_status()
+    by_month: dict[tuple[int, int], dict] = {}
+    for r in resp1.json().get("data", []):
+        parsed = _mts_fiscal_month_to_calendar(
+            r["classification_desc"], r["sequence_number_cd"], r["record_fiscal_year"]
+        )
+        if parsed is None:
+            continue
+        # Rows arrive sorted by record_date ascending — a later publication's
+        # restatement of the same real month overwrites the earlier one,
+        # same "latest publication wins" convention as the upsert itself.
+        by_month[parsed] = {
+            "receipts_usd": _mts_amount(r.get("current_month_gross_rcpt_amt")),
+            "outlays_usd": _mts_amount(r.get("current_month_gross_outly_amt")),
+            "deficit_usd": _mts_amount(r.get("current_month_dfct_sur_amt")),
+        }
+
+    resp5 = await _client.get(
+        f"{TREASURY_MTS_BASE}/mts_table_5",
+        params={
+            "filter": f"classification_desc:eq:{TREASURY_INTEREST_CLASSIFICATION}",
+            "sort": "record_date",
+            "page[size]": "10000",
+        },
+        timeout=20,
+    )
+    resp5.raise_for_status()
+    for r in resp5.json().get("data", []):
+        # Table 5 has no fiscal-year-block ambiguity for this classification
+        # — confirmed live, one real row per record_date, each already the
+        # single real month's own figure (current_month_net_outly_amt),
+        # not a YTD total. record_date is that publication's own month-end.
+        record_date = r["record_date"]
+        key = (int(record_date[:4]), int(record_date[5:7]))
+        by_month.setdefault(key, {})["interest_usd"] = _mts_amount(r.get("current_month_net_outly_amt"))
+
+    # Merge forward against whatever's already persisted for each touched
+    # month, so a fetch where one table's response happens not to include a
+    # given month (both tables are queried independently) never nulls out a
+    # field the other table already established in an earlier fetch — same
+    # "don't let a partial write erase a real prior value" concern that
+    # motivated census_trade's own partial-column ON CONFLICT DO UPDATE.
+    existing = {(r["year"], r["month"]): r for r in db.get_treasury_outlays()}
+    rows = []
+    for (y, m), v in by_month.items():
+        prior = existing.get((y, m), {})
+        rows.append({
+            "year": y,
+            "month": m,
+            "receipts_usd": v.get("receipts_usd", prior.get("receipts_usd")),
+            "outlays_usd": v.get("outlays_usd", prior.get("outlays_usd")),
+            "deficit_usd": v.get("deficit_usd", prior.get("deficit_usd")),
+            "interest_usd": v.get("interest_usd", prior.get("interest_usd")),
+        })
+    if rows:
+        db.upsert_treasury_outlays_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_treasury_outlays_startup():
+    """treasury_outlays' fetch_fn — no API key, so unlike lbma_fix/
+    census_trade there's no env-var skip branch; a real upstream failure
+    still shouldn't crash boot, so it's caught and recorded the same way."""
+    try:
+        await _fetch_and_persist_treasury_outlays()
+        db.record_fetch_attempt("treasury_outlays", success=True)
+    except Exception as e:
+        print(f"[treasury_outlays] warning: {e}")
+        db.record_fetch_attempt("treasury_outlays", success=False, error=str(e))
+
+
+# ~3yr per ongoing fetch — see fetch fn docstring for why this is bounded.
+# A one-time manual backfill (outside this bounded fetch, run once against
+# runtime/argentvigil.db directly) extended real persisted coverage back as
+# far as it will go — confirmed live that MTS Table 5 AS A WHOLE has zero
+# real data before 2015-03-31 (every record_date before that returns a real
+# HTTP 200 with an empty data array, not an error) — a harder, table-wide
+# floor than treasury_outlays' own 2013-10 floor (Table 1), and the same
+# floor already documented for the interest-on-debt figure in Story #1.
+# This constant still caps what any FUTURE fire_at_startup/manual-refresh
+# run will fetch going forward, so a fresh/cleared DB will only recover the
+# most recent 36 months automatically; the deeper 2015-2023 history won't
+# regenerate itself without re-running that one-off backfill.
+TREASURY_OUTLAYS_BY_AGENCY_MONTHS = 36
+
+
+async def _fetch_and_persist_treasury_outlays_by_agency() -> int:
+    """fed-spend-spec.md Story #0 Tier 2 — per-department/agency monthly
+    outlays, MTS Table 5. Confirmed live: level-1 rows with
+    record_type_cd="C" are department/agency headers (their own value is
+    always null — a label row, not a figure); each has exactly one direct
+    child (same record_type_cd="C", classification_desc starting
+    "Total--") carrying that department's real reported monthly total —
+    Treasury's own total, not a client-side sum of that department's
+    sub-programs. Stable 29-department list confirmed across both a 2015
+    and a 2026 publication.
+
+    Fetches one full record_date at a time (unlike treasury_outlays'
+    single filtered pull across all history) since Table 5's per-date
+    parent/child linkage requires the WHOLE table for that date to
+    resolve — no record_type_cd=MTH-style single-shot filter exists for
+    Table 5 the way Table 1 has. Deliberately bounded to the most recent
+    TREASURY_OUTLAYS_BY_AGENCY_MONTHS real months (re-derived from
+    treasury_outlays' own already-fetched year/month rows — Table 1 must
+    run first) rather than full history: full history is ~150 sequential
+    requests, real per-restart latency/load against a free public API
+    with no documented rate limit for a source that's fire_at_startup on
+    every backend restart. Already-persisted months are skipped (a cheap
+    check against what's on disk, no request spent), so history
+    accumulates forward across restarts rather than being bounded
+    forever — a restart 3 years from now still only re-fetches its own
+    trailing 36 months, not the ever-growing full history."""
+    months = db.get_treasury_outlays()[-TREASURY_OUTLAYS_BY_AGENCY_MONTHS:]
+    already = {(r["year"], r["month"]) for r in db.get_treasury_outlays_by_agency()}
+    total_rows = 0
+    for m in months:
+        if (m["year"], m["month"]) in already:
+            continue
+        record_date = f"{m['year']:04d}-{m['month']:02d}-{_last_day_of_month(m['year'], m['month']):02d}"
+        resp = await _client.get(
+            f"{TREASURY_MTS_BASE}/mts_table_5",
+            params={"filter": f"record_date:eq:{record_date}", "page[size]": "2000"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            continue
+        by_id = {r["classification_id"]: r for r in data}
+        by_parent: dict[str, list[dict]] = {}
+        for r in data:
+            by_parent.setdefault(r["parent_id"], []).append(r)
+        rows = []
+        for dept in data:
+            if dept["sequence_level_nbr"] != "1" or dept["record_type_cd"] != "C":
+                continue
+            children = by_parent.get(dept["classification_id"], [])
+            total_row = next(
+                (c for c in children if c["record_type_cd"] == "C" and c["classification_desc"].startswith("Total--")),
+                None,
+            )
+            if total_row is None:
+                continue
+            agency = dept["classification_desc"].rstrip(":").strip()
+            rows.append({
+                "year": m["year"],
+                "month": m["month"],
+                "agency": agency,
+                "outlay_usd": _mts_amount(total_row.get("current_month_net_outly_amt")),
+            })
+        if rows:
+            db.upsert_treasury_outlays_by_agency_rows(rows)
+            total_rows += len(rows)
+    return total_rows
+
+
+def _last_day_of_month(year: int, month: int) -> int:
+    if month == 12:
+        return 31
+    return (date(year, month + 1, 1) - timedelta(days=1)).day
+
+
+async def _fetch_and_persist_treasury_outlays_by_agency_startup():
+    try:
+        await _fetch_and_persist_treasury_outlays_by_agency()
+        db.record_fetch_attempt("treasury_outlays_by_agency", success=True)
+    except Exception as e:
+        print(f"[treasury_outlays_by_agency] warning: {e}")
+        db.record_fetch_attempt("treasury_outlays_by_agency", success=False, error=str(e))
+
+
+_TREASURY_AUCTION_API_FIELDS = [
+    "cusip", "security_type", "security_term", "auction_date", "issue_date", "maturity_date",
+    "high_yield", "high_discnt_rate", "high_investment_rate", "bid_to_cover_ratio",
+    "offering_amt", "total_tendered", "total_accepted",
+    "indirect_bidder_tendered", "indirect_bidder_accepted",
+    "direct_bidder_tendered", "direct_bidder_accepted",
+    "primary_dealer_tendered", "primary_dealer_accepted",
+    "soma_tendered", "soma_accepted", "soma_holdings",
+]
+
+
+async def _fetch_and_persist_treasury_auctions() -> int:
+    """Treasuries-picture expansion — bid-to-cover, buyer-category
+    breakdown (indirect/direct/primary-dealer/SOMA), and high yield per
+    auction. Confirmed live against the real API (see TREASURY_AUCTIONS_BASE
+    comment): a `fields` filter narrows the ~100-field response to just
+    what this app persists, and `auction_date:gte:` bounds the pull to a
+    rolling trailing window (TREASURY_AUCTIONS_WINDOW_DAYS) rather than the
+    full 11,000+-row history. NOTE: an earlier version of this filtered on
+    'record_date' instead — that field does not exist on this endpoint at
+    all (confirmed live: a 400 "Invalid Query Param" error, caught only
+    once actually run against the real API rather than assumed from an
+    earlier successful call that happened to sort-by, but never filter-by,
+    that field name). auction_date is the correct anchor: it's stable for a
+    given security's whole announce→settle lifecycle, so a row newly
+    announced near the trailing edge of the window is still caught, and an
+    already-fetched-but-unsettled row from earlier in the window gets
+    re-fetched (and its nulls filled in via upsert's COALESCE) on every
+    subsequent run until it settles. Every numeric field is the literal
+    string "null" for an unsettled result, same confirmed convention
+    _mts_amount already handles for MTS Table 1/5, so it's reused here
+    rather than a second parallel helper.
+    """
+    since = str(date.today() - timedelta(days=TREASURY_AUCTIONS_WINDOW_DAYS))
+    resp = await _client.get(
+        TREASURY_AUCTIONS_BASE,
+        params={
+            "filter": f"auction_date:gte:{since}",
+            "fields": ",".join(_TREASURY_AUCTION_API_FIELDS),
+            "page[size]": "1000",
+            "sort": "-auction_date",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    rows = []
+    for r in data:
+        rows.append({
+            "cusip": r["cusip"],
+            "auction_date": r["auction_date"],
+            "security_type": r.get("security_type"),
+            "security_term": r.get("security_term"),
+            "issue_date": r.get("issue_date"),
+            "maturity_date": r.get("maturity_date"),
+            "high_yield": _mts_amount(r.get("high_yield")),
+            "high_discnt_rate": _mts_amount(r.get("high_discnt_rate")),
+            "high_investment_rate": _mts_amount(r.get("high_investment_rate")),
+            "bid_to_cover_ratio": _mts_amount(r.get("bid_to_cover_ratio")),
+            "offering_amt": _mts_amount(r.get("offering_amt")),
+            "total_tendered": _mts_amount(r.get("total_tendered")),
+            "total_accepted": _mts_amount(r.get("total_accepted")),
+            "indirect_bidder_tendered": _mts_amount(r.get("indirect_bidder_tendered")),
+            "indirect_bidder_accepted": _mts_amount(r.get("indirect_bidder_accepted")),
+            "direct_bidder_tendered": _mts_amount(r.get("direct_bidder_tendered")),
+            "direct_bidder_accepted": _mts_amount(r.get("direct_bidder_accepted")),
+            "primary_dealer_tendered": _mts_amount(r.get("primary_dealer_tendered")),
+            "primary_dealer_accepted": _mts_amount(r.get("primary_dealer_accepted")),
+            "soma_tendered": _mts_amount(r.get("soma_tendered")),
+            "soma_accepted": _mts_amount(r.get("soma_accepted")),
+            "soma_holdings": _mts_amount(r.get("soma_holdings")),
+        })
+    if rows:
+        db.upsert_treasury_auctions_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_treasury_auctions_tick():
+    try:
+        n = await _fetch_and_persist_treasury_auctions()
+        db.record_fetch_attempt("treasury_auctions", success=True)
+        return n
+    except Exception as e:
+        print(f"[treasury_auctions] warning: {e}")
+        db.record_fetch_attempt("treasury_auctions", success=False, error=str(e))
+        return 0
+
+
+async def _fetch_fred_series(series_id: str, observation_start: str) -> list[dict]:
+    api_key = os.environ["FRED_API_KEY"]
+    resp = await _client.get(
+        FRED_BASE,
+        params={
+            "series_id": series_id,
+            "api_key": api_key,
+            "file_type": "json",
+            "observation_start": observation_start,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = []
+    for obs in data.get("observations", []):
+        v = obs.get("value")
+        rows.append({
+            "date": obs["date"],
+            "value": None if v == "." else float(v),
+        })
+    return rows
+
+
+async def _fetch_and_persist_money_supply():
+    if "FRED_API_KEY" not in os.environ:
+        raise HTTPException(500, "FRED_API_KEY environment variable is not set")
+    try:
+        observation_start = str(date.today() - timedelta(days=365 * FRED_FETCH_YEARS))
+        m2_rows = await _fetch_fred_series(FRED_SERIES_M2, observation_start)
+        walcl_rows = await _fetch_fred_series(FRED_SERIES_WALCL, observation_start)
+        cpi_rows = await _fetch_fred_series(FRED_SERIES_CPI, observation_start)
+        wresbal_rows = await _fetch_fred_series(FRED_SERIES_WRESBAL, observation_start)
+        rrpontsyd_rows = await _fetch_fred_series(FRED_SERIES_RRPONTSYD, observation_start)
+        wshotsl_rows = await _fetch_fred_series(FRED_SERIES_WSHOTSL, observation_start)
+        wshomcb_rows = await _fetch_fred_series(FRED_SERIES_WSHOMCB, observation_start)
+        wlcflpcl_rows = await _fetch_fred_series(FRED_SERIES_WLCFLPCL, observation_start)
+        dgs2_rows = await _fetch_fred_series(FRED_SERIES_DGS2, observation_start)
+        dgs10_rows = await _fetch_fred_series(FRED_SERIES_DGS10, observation_start)
+        dfii10_rows = await _fetch_fred_series(FRED_SERIES_DFII10, observation_start)
+        t10y2y_rows = await _fetch_fred_series(FRED_SERIES_T10Y2Y, observation_start)
+        dgs3mo_rows = await _fetch_fred_series(FRED_SERIES_DGS3MO, observation_start)
+        dgs5_rows = await _fetch_fred_series(FRED_SERIES_DGS5, observation_start)
+        dgs30_rows = await _fetch_fred_series(FRED_SERIES_DGS30, observation_start)
+        wshosho_rows = await _fetch_fred_series(FRED_SERIES_WSHOSHO, observation_start)
+        # Foreign/TIC holdings — 14 country series + 1 grand total, looped
+        # rather than named individually (unlike every series above) purely
+        # because there are too many to reasonably enumerate as separate
+        # local variables. Same fetch/persist/response-dict shape either
+        # way — tic_rows_by_series[series_id] holds each country's own row
+        # list, keyed by the real FRED series_id (not country name), so the
+        # /db route below can look up by series_id the same way every other
+        # series in this response already is.
+        tic_series_ids = {**FRED_SERIES_TIC_COUNTRIES, "_grand_total": FRED_SERIES_TIC_GRAND_TOTAL}
+        tic_rows_by_series = {}
+        for series_id in set(tic_series_ids.values()):
+            tic_rows_by_series[series_id] = await _fetch_fred_series(series_id, observation_start)
+        db.upsert_fred_observations(FRED_SERIES_M2, m2_rows)
+        db.upsert_fred_observations(FRED_SERIES_WALCL, walcl_rows)
+        db.upsert_fred_observations(FRED_SERIES_CPI, cpi_rows)
+        db.upsert_fred_observations(FRED_SERIES_WRESBAL, wresbal_rows)
+        db.upsert_fred_observations(FRED_SERIES_RRPONTSYD, rrpontsyd_rows)
+        db.upsert_fred_observations(FRED_SERIES_WSHOTSL, wshotsl_rows)
+        db.upsert_fred_observations(FRED_SERIES_WSHOMCB, wshomcb_rows)
+        db.upsert_fred_observations(FRED_SERIES_WLCFLPCL, wlcflpcl_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS2, dgs2_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS10, dgs10_rows)
+        db.upsert_fred_observations(FRED_SERIES_DFII10, dfii10_rows)
+        db.upsert_fred_observations(FRED_SERIES_T10Y2Y, t10y2y_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS3MO, dgs3mo_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS5, dgs5_rows)
+        db.upsert_fred_observations(FRED_SERIES_DGS30, dgs30_rows)
+        db.upsert_fred_observations(FRED_SERIES_WSHOSHO, wshosho_rows)
+        for series_id, rows in tic_rows_by_series.items():
+            db.upsert_fred_observations(series_id, rows)
+        db.record_fetch_attempt("money_supply", success=True)
+        return {
+            "success": True,
+            "data": {
+                FRED_SERIES_M2: m2_rows,
+                FRED_SERIES_WALCL: walcl_rows,
+                FRED_SERIES_CPI: cpi_rows,
+                FRED_SERIES_WRESBAL: wresbal_rows,
+                FRED_SERIES_RRPONTSYD: rrpontsyd_rows,
+                FRED_SERIES_WSHOTSL: wshotsl_rows,
+                FRED_SERIES_WSHOMCB: wshomcb_rows,
+                FRED_SERIES_WLCFLPCL: wlcflpcl_rows,
+                FRED_SERIES_DGS2: dgs2_rows,
+                FRED_SERIES_DGS10: dgs10_rows,
+                FRED_SERIES_DFII10: dfii10_rows,
+                FRED_SERIES_T10Y2Y: t10y2y_rows,
+                FRED_SERIES_DGS3MO: dgs3mo_rows,
+                FRED_SERIES_DGS5: dgs5_rows,
+                FRED_SERIES_DGS30: dgs30_rows,
+                FRED_SERIES_WSHOSHO: wshosho_rows,
+                **tic_rows_by_series,
+            },
+        }
+    except httpx.HTTPError as e:
+        db.record_fetch_attempt("money_supply", success=False, error=str(e))
+        raise HTTPException(502, str(e))
+
+
+async def _fetch_and_persist_yahoo_daily_close() -> dict:
+    """Real daily (not month-end) Yahoo closes for both metals — one
+    settlement_price instrument (XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE)
+    now serves every consumer that used to read from three differently-
+    shaped places: Money Supply's purchasing-power chart (previously
+    XAG_CLOSE/XAU_CLOSE, month-end resampled at write time), CATCOR's
+    event-reaction daily-close fallback (previously XAG_DAILY_CLOSE/
+    XAU_DAILY_CLOSE, a dedicated 120-day-deep series that duplicated this
+    same fetch at a shallower depth), and the leverage panel's long-window
+    price chart (previously stitched in via db.get_price_history's third
+    tier). Fetches the full METAL_PRICE_FETCH_YEARS range on every call —
+    goal 3 is "if data's available, get it" — but
+    upsert_settlement_price_rows only ever writes rows that are new or
+    actually changed, so a routine cadence tick doesn't rewrite years of
+    unchanged history (price-architecture-spec.md Q3)."""
+    result = {}
+    for metal, ticker in METAL_PRICE_TICKERS.items():
+        bars = await fetch_yahoo_bars(_client, ticker, interval="1d", range_=f"{METAL_PRICE_FETCH_YEARS}y")
+        daily_rows = bars_to_daily_rows(bars)
+        instrument = YAHOO_DAILY_CLOSE_BY_METAL[metal]
+        db.upsert_settlement_price_rows(instrument, daily_rows)
+        result[instrument] = daily_rows
+    return result
+
+
+async def _fetch_and_persist_metals_prices():
+    try:
+        result = await _fetch_and_persist_yahoo_daily_close()
+        db.record_fetch_attempt("metals_prices", success=True)
+        return {"success": True, "data": result}
+    except httpx.HTTPError as e:
+        db.record_fetch_attempt("metals_prices", success=False, error=str(e))
+        raise HTTPException(502, str(e))
+
+
+COT_MIN_REFRESH_DAYS = 7  # CFTC only publishes a new report ~weekly — no point re-pulling more often; also feeds cot_pipeline's CadenceSpec.min_gap below, single source of truth for the number
+
+
+async def _refresh_cot_pipeline():
+    """cot_pipeline's fetch_fn — the only source whose gate keys on
+    persisted-data age (gate_on="persisted_data_age" in its CadenceSpec)
+    rather than last-attempt time, since CFTC publishes within ~3 days of
+    its as-of date, so report age closely tracks fetch recency here (see
+    census_trade's CadenceSpec/gate for the contrasting case). Skips
+    entirely (no CFTC request at all) if the latest persisted report is
+    still within COT_MIN_REFRESH_DAYS, recording a 'skipped' attempt rather
+    than a failure. Otherwise runs the real pipeline in a thread (it's a
+    blocking, stdlib-only sync call) via asyncio.to_thread — run_pipeline_once
+    records its own success/failure to source_health itself (see
+    pipeline/run.py), so this wrapper doesn't duplicate that."""
+    latest_report_date = db.get_latest_cot_report_date()
+    if latest_report_date:
+        days_since = (date.today() - date.fromisoformat(latest_report_date)).days
+        if days_since < COT_MIN_REFRESH_DAYS:
+            db.record_fetch_attempt(
+                "cot_pipeline",
+                success=False,
+                skipped=True,
+                error="Latest report is less than 7 days old — skipped to respect CFTC's publish cadence.",
+            )
+            return
+    await asyncio.to_thread(pipeline_run.run_pipeline_once)
+
+
+# Canonical registry population (datasources-spec.md Story #1 + #3), moved
+# here from backend/main.py on 2026-09-17 — real bug found and fixed, not a
+# preemptive refactor: sources.register(...) originally only ran as a
+# module-level side effect of importing backend.main, which
+# `python -m backend.collector` (Story 2.1's whole point — collector runs
+# standalone, with NO import of backend.main, since main.py pulls in
+# FastAPI/every route) never does. Confirmed live: sources.SOURCE_REGISTRY
+# was empty (len() == 0) inside a real running Test AV collector container,
+# so _refresh_fast_tier/_refresh_slow_tier's `for source_key, source in
+# sources.sources_by_tier(...)` loops and _schedule_loop's own dispatch loop
+# all iterated zero sources — not a hang, not a deadlock, not a networking
+# problem (all independently ruled out first: py-spy confirmed the process
+# was genuinely idling inside _schedule_loop's `await asyncio.sleep(1)`,
+# exactly where a healthy loop with nothing to fire would sit). The
+# collector container came up, logged its one startup print, and then did
+# permanently nothing — every one of Test AV's ~27 sources froze at
+# whatever their last real value was under the OLD single-process (pre-
+# Story-2.2) deploy shape, silently, with zero errors anywhere, because an
+# empty-registry loop has nothing to fail on. This is the reason every sub-
+# panel in Test AV showed red/stale despite `collector` reporting `running`
+# with 0 restarts. Story 2.1/2.2's own live verification never caught this
+# because both sessions drove fetches by calling collector._fetch_and_persist_*
+# functions directly (bypassing the registry entirely) or by watching
+# source_health advance while api's now-disabled in-process scheduler (or a
+# stale pre-existing timestamp) was still the thing actually producing
+# writes — neither check exercised sources.sources_by_tier()/SOURCE_REGISTRY
+# against a truly standalone collector process the way a real `docker
+# compose up` finally did.
+#
+# Each real process (api, collector) calls register_sources() exactly once,
+# at its own startup — backend/main.py (api) calls it too, right after
+# importing this module, since api's own /api/health/db, /api/data-sources/db,
+# POST /api/health/refresh/{key}, and POST /api/refresh/force routes all read
+# sources.SOURCE_REGISTRY and need it populated in api's process independent
+# of whether collector's own process has run. This is NOT idempotent —
+# sources.register() raises ValueError on a duplicate source.key (see
+# backend/sources.py), so calling register_sources() twice within the SAME
+# process would crash on its second call. That's fine under the current
+# call sites (main.py calls it once at module import time; collector.run()
+# calls it once at the top of its own startup) but is a real constraint on
+# any future caller — don't call this from anywhere that might run more than
+# once per process (e.g. a route handler, or a retry loop).
+def register_sources() -> None:
+    sources.register(SourceDefinition(
+        key="spot_prices", label="Spot Prices (metalcharts.org)",
+        affinity_group="exchange_market", fetch_fn=_fetch_and_persist_prices,
+        tables=["spot_price"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=_refresh_settings["fast_interval_s"], enabled_flag="fast_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="Reverse-engineered metalcharts.org endpoint, no published quota."),
+    ))
+    # All 14 of these move at most daily upstream (per each entry's own note
+    # below, confirmed against CLAUDE.md's Standing rules) — one shared real
+    # interval covers all of them correctly, since there's no cadence spread
+    # to account for. 25h (a day + a safety margin) rather than exactly 24h,
+    # so one briefly-late or transiently-failed upstream update doesn't cost
+    # a full extra day before the next attempt.
+    exchange_inventory_interval_s = 90000  # 25 hours
+    # silver_leverage/gold_leverage are the two slow-tier sources whose only
+    # still-trusted field is metalcharts.org's daily `volume` (open_interest
+    # was dropped after the 2026-07 ~15%-vs-CFTC investigation). That volume-
+    # oi endpoint's own `date` field lags the real calendar day irregularly
+    # (confirmed live: Wed still serving Mon's figure) — at a 25h cadence,
+    # most days-worth of real volume never lands because a cycle rarely
+    # catches the moment the source rolls its `date` forward, then the next
+    # cycle is a day later. A ~6h cadence gives ~4 chances/day to catch each
+    # roll-forward without meaningfully more load (one small HTTP round-trip).
+    # This does NOT fix a multi-day upstream lag — see get_volume_series'
+    # docstring; this series stays best-effort, 6h just makes it less gappy.
+    leverage_volume_interval_s = 21600  # 6 hours
+    leverage_volume_keys = {"silver_leverage", "gold_leverage"}
+    slow_tier_fetch_fns: dict[str, tuple] = {
+        "comex_silver_history": (_fetch_and_persist_silver_history, ["inventory_aggregate"], "COMEX silver registered/eligible/total, daily."),
+        "comex_gold_history": (_fetch_and_persist_gold_history, ["gold_inventory_aggregate"], "COMEX gold registered/eligible/total, daily."),
+        "comex_silver_depositories": (_fetch_and_persist_silver_depositories, ["inventory_depository"], "COMEX silver per-vault snapshot, daily."),
+        "comex_gold_depositories": (_fetch_and_persist_gold_depositories, ["gold_inventory_depository"], "COMEX gold per-vault snapshot, daily."),
+        "silver_leverage": (_fetch_and_persist_silver_leverage, ["volume_oi"], "Silver COMEX volume (leverage/OI computed from cot_silver + inventory_aggregate, see db.get_leverage_history)."),
+        "gold_leverage": (_fetch_and_persist_gold_leverage, ["gold_volume_oi"], "Gold COMEX volume (leverage/OI computed from cot_gold + gold_inventory_aggregate)."),
+        "delivery_notices": (_fetch_and_persist_delivery_ytd, ["delivery_notices"], "COMEX silver daily issued/stopped delivery notices, YTD window."),
+        "gold_delivery_notices": (_fetch_and_persist_gold_delivery_ytd, ["gold_delivery_notices"], "COMEX gold daily issued/stopped delivery notices, YTD window."),
+        "shfe_silver_history": (_fetch_and_persist_shfe_history, ["shfe_inventory"], "SHFE silver inventory, daily."),
+        "shfe_warehouses": (_fetch_and_persist_shfe_warehouses, ["shfe_warehouse"], "SHFE per-warehouse warrant snapshot, daily."),
+        "shfe_gold_history": (_fetch_and_persist_shfe_gold_history, ["shfe_gold_inventory"], "SHFE gold inventory, daily."),
+        "shfe_gold_warehouses": (_fetch_and_persist_shfe_gold_warehouses, ["shfe_gold_warehouse"], "SHFE gold per-warehouse warrant snapshot, daily."),
+        "pslv": (_fetch_and_persist_pslv, ["pslv_snapshot"], "Sprott PSLV custodial ounces, direct from Sprott's API."),
+        "futures_curve_spread": (_fetch_and_persist_curve_spread, ["futures_curve_spread"], "COMEX front/next-month futures spread (Yahoo Finance), daily."),
+    }
+    for _key, (_fn, _tables, _note) in slow_tier_fetch_fns.items():
+        _interval = leverage_volume_interval_s if _key in leverage_volume_keys else exchange_inventory_interval_s
+        sources.register(SourceDefinition(
+            key=_key, label=_key.replace("_", " ").title(),
+            affinity_group="exchange_market", fetch_fn=_fn, tables=_tables,
+            cadence=CadenceSpec(trigger="interval", interval_seconds=_interval, enabled_flag="slow_enabled"),
+            rate_limit=RateLimitSpec(kind="undocumented", note=_note),
+        ))
+
+    # money_supply/metals_prices/treasury_outlays/treasury_outlays_by_agency:
+    # previously trigger="manual_only", fire_at_startup=True (fetch once per
+    # backend restart, never again automatically) — a deliberate choice at the
+    # time, but a real staleness gap for a continuously-run instance that
+    # rarely restarts. Converted to trigger="interval" so each recurs on its
+    # own real upstream cadence without the user needing to restart or hit
+    # manual refresh: money_supply weekly (its fastest-moving series — WALCL,
+    # Treasury Yields — update weekly; M2/CPI are monthly, but polling at the
+    # fastest real series' cadence means nothing in this fetch is ever stale
+    # by more than a week, without over-polling the monthly ones, which is
+    # cheap regardless since this is one HTTP round-trip per series either
+    # way), metals_prices daily (Yahoo daily closes), both Treasury outlays
+    # sources monthly (matching MTS's real publication cadence — a shorter
+    # interval would just re-fetch the same unchanged month). All four already
+    # had a "no documented hard rate limit" note before this change, so the
+    # added request volume from real recurrence carries no known rate-limit
+    # risk (unlike lbma_fix/census_trade below, which need their own gating
+    # preserved specifically because they DO have a real constraint).
+    money_supply_interval_s = 604800  # weekly
+    metals_prices_interval_s = 90000  # ~25h, same daily-plus-margin reasoning as the exchange-inventory sources
+    treasury_outlays_interval_s = 2678400  # 31 days — Table 1 MTS publication is monthly
+    sources.register(SourceDefinition(
+        key="money_supply", label="FRED — Money Supply (M2, WALCL, Composition)",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_money_supply,
+        tables=["fred_observations"], requires_env=["FRED_API_KEY"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=money_supply_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern."),
+    ))
+    sources.register(SourceDefinition(
+        key="metals_prices", label="Yahoo Finance — Daily Metal Closes",
+        affinity_group="exchange_market", fetch_fn=_fetch_and_persist_metals_prices,
+        tables=["settlement_price"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=metals_prices_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="No published quota; conservative-by-design per CLAUDE.md's Yahoo Finance dev note."),
+    ))
+    sources.register(SourceDefinition(
+        key="treasury_outlays", label="U.S. Treasury — Monthly Treasury Statement",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_outlays_startup,
+        tables=["treasury_outlays"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=treasury_outlays_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="fiscaldata.treasury.gov's public API has no documented hard rate limit; no API key required."),
+    ))
+    sources.register(SourceDefinition(
+        key="treasury_outlays_by_agency", label="U.S. Treasury — MTS Outlays by Department/Agency",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_outlays_by_agency_startup,
+        tables=["treasury_outlays_by_agency"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=treasury_outlays_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="Same host/no-key posture as treasury_outlays. Bounded to the most recent 36 months per run (see fetch fn docstring) — one HTTP request per real month, since Table 5's parent/child hierarchy can't be filtered server-side the way Table 1's flat MTH rows can."),
+    ))
+    # Unlike treasury_outlays/treasury_outlays_by_agency's manual_only+
+    # fire_at_startup (monthly-cadence upstream, restart-driven refresh is
+    # plenty), auctions happen several times a week AND a single auction's own
+    # record needs a second fetch days later to pick up settlement results —
+    # a real interval cadence is required here, not just a startup fire. Once
+    # daily is ample (auctions don't settle intraday).
+    treasury_auctions_interval_s = 86400
+    sources.register(SourceDefinition(
+        key="treasury_auctions", label="U.S. Treasury — Auction Results",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_treasury_auctions_tick,
+        tables=["treasury_auctions"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=treasury_auctions_interval_s, fire_at_startup=True),
+        rate_limit=RateLimitSpec(kind="undocumented", note="Same host/no-key posture as treasury_outlays. One request per tick, filtered to a rolling 120-day window (auction_date:gte:) via a fields= projection — not a full-history pull."),
+    ))
+    # cot_pipeline gates on PERSISTED DATA age (CFTC publishes within ~3 days
+    # of its as-of date, so report age closely tracks fetch recency) — the
+    # one source using gate_on="persisted_data_age" instead of the default
+    # "last_attempt_at". self_recording=True: run_pipeline_once records its
+    # own outcome to source_health (see pipeline/run.py), so the generic
+    # health_refresh route below must not double-record.
+    sources.register(SourceDefinition(
+        key="cot_pipeline", label="CFTC Commitment of Traders (Legacy + Disaggregated)",
+        affinity_group="gov_regulatory", fetch_fn=_refresh_cot_pipeline,
+        tables=["cot_silver", "cot_gold", "cot_disaggregated", "settlement_price", "pipeline_runs"],
+        cadence=CadenceSpec(
+            trigger="manual_only",
+            min_gap=timedelta(days=COT_MIN_REFRESH_DAYS),
+            gate_on="persisted_data_age",
+            persisted_age_fn=lambda: (date.fromisoformat(db.get_latest_cot_report_date()) if db.get_latest_cot_report_date() else None),
+        ),
+        rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=COT_MIN_REFRESH_DAYS), note="CFTC publishes a new report ~weekly."),
+        self_recording=True,
+    ))
+    # lbma_fix: reverted to manual_only, NOT fire_at_startup — disabled
+    # entirely as of 2026-08-12, after the recurring-interval version (shipped
+    # earlier in the per-source-cadence pass) burned through GoldAPI's free-
+    # tier 500 req/month quota. The per-fetch cost was undercounted at the
+    # time: _fetch_and_persist_lbma_fix's "today has no fix posted yet"
+    # fallback can double each symbol's request count (up to 4 req/cycle, not
+    # the assumed 2), and this data has no frontend consumer at all right now
+    # (LbmaFixBadge, the sole UI reader, was deleted in an earlier pass) — so
+    # continuous polling was spending quota nobody could see the benefit of.
+    # Reachable only via the Data tab's "Re-run now" button until a real
+    # consumer exists again; not even a startup fire, so a restart doesn't
+    # spend quota either. Re-evaluate a recurring cadence (and its real
+    # request cost) if/when this data gets a frontend surface again.
+    sources.register(SourceDefinition(
+        key="lbma_fix", label="GoldAPI.io — LBMA Fix",
+        affinity_group="exchange_market", fetch_fn=_fetch_and_persist_lbma_fix_startup,
+        tables=["settlement_price"], requires_env=["GAPI_API_KEY"],
+        cadence=CadenceSpec(trigger="manual_only"),
+        rate_limit=RateLimitSpec(kind="numeric_quota", quota_per_period="500/month"),
+    ))
+    # census_trade gates on LAST ATTEMPT time (Census's ~2-month publication
+    # lag means persisted-data age is never a useful gate — see
+    # _refresh_census_trade's own docstring for the full reasoning).
+    # self_recording=True for the same reason as cot_pipeline: its own skip
+    # branch already records "skipped", which health_refresh must not
+    # overwrite with a blanket "success". Converted from manual_only to a real
+    # weekly trigger="interval" so a continuously-run instance actually rechecks
+    # periodically rather than only once per restart — the real 25-day floor
+    # is still enforced by _refresh_census_trade's own min_gap check inside its
+    # fetch_fn (unchanged, still reads CENSUS_TRADE_MIN_REFRESH_DAYS directly,
+    # not derived from this CadenceSpec), so a weekly scheduler tick just means
+    # roughly 3 of every 4 ticks record a cheap "skipped" attempt rather than a
+    # real fetch — min_gap/gate_on stay on the spec purely so expected_interval_s
+    # and the Data tab's rate-limit display still reflect the true 25-day cadence,
+    # even though _schedule_loop itself only reads interval_seconds to decide
+    # firing.
+    sources.register(SourceDefinition(
+        key="census_trade", label="U.S. Census Bureau — International Trade",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_census_trade_startup,
+        tables=["census_trade"], requires_env=["CENSUS_API_KEY"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), gate_on="last_attempt_at"),
+        rate_limit=RateLimitSpec(kind="min_gap_derived", min_gap=timedelta(days=CENSUS_TRADE_MIN_REFRESH_DAYS), note="Census releases monthly, ~2-month publication lag."),
+        self_recording=True,
+    ))
+    # ofac_sanctions (sanctionsTimeline-spec.md, plus the 2026-08-26 entity-
+    # detail follow-up): daily full-list pull, diffed locally against ofac_uid
+    # — no rate limit, no key, so unlike census_trade this needs no min_gap/
+    # gate_on self-throttling, just a plain daily interval like the exchange-
+    # inventory sources. OFAC_INTERVAL_S reuses the same "24h + margin"
+    # reasoning as EXCHANGE_INVENTORY_INTERVAL_S (one missed/late tick
+    # shouldn't cost a full extra day) rather than a bare 86400. Display is a
+    # standalone "OFAC" nav tab (frontend/src/sanctions_panel.jsx) — the
+    # original Money Supply chart-overlay display was built, then removed at
+    # the user's request as noise; see CLAUDE.md's Tab: OFAC section.
+    ofac_interval_s = 90000  # ~25 hours
+    sources.register(SourceDefinition(
+        key="ofac_sanctions", label="OFAC — Sanctions List Service (SDN + Consolidated)",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_ofac_designations_startup,
+        tables=["ofac_designations", "ofac_aliases", "ofac_addresses", "ofac_id_documents"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=ofac_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="Official Treasury bulk XML download, no published rate limit, no auth/key required. User-Agent header required (403 without one). ~126MB SDN Advanced file + a smaller Consolidated Advanced file fetched and parsed daily; only the diff (new designations, delistings) is persisted for the parent table, while the three entity-detail child tables (aliases/addresses/ID documents) are fully replaced per entity on every fetch."),
+    ))
+    # catcor_startup: previously fired by a hand-written asyncio.create_task(...)
+    # call in lifespan, outside the scheduler entirely — a real, separate
+    # dispatch pattern this registration collapses into the same mechanism as
+    # every other source. fire_at_startup=True gives it today's original
+    # "runs once at boot" behavior; trigger="interval" + interval_seconds=604800
+    # (weekly, confirmed) adds real periodic re-runs on top, which it never had
+    # before. _catcor_startup's internal 6-step chain (each step independently
+    # try/excepted except step 1, which aborts the rest) is unchanged — see
+    # that function's own docstring for what this trades away in source_health
+    # fidelity (coarse success/fail, not per-step).
+    sources.register(SourceDefinition(
+        key="catcor_startup", label="CATCOR — Seed + Backfill Chain",
+        affinity_group="calendar_events", fetch_fn=_catcor_startup,
+        tables=["event_calendar", "spot_price", "settlement_price", "forexfactory_calendar", "macro_price_reaction"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True),
+        rate_limit=RateLimitSpec(kind="undocumented", note="Composite of Yahoo/ForexFactory/ALFRED calls — see catcor_consensus_actuals and each metal's own price-history source for their individual rate-limit notes."),
+    ))
+    # CATCOR's two recurring loops were never in any registry before this
+    # pass — folding them in per datasources-spec.md Story #3's explicit
+    # instruction. catcor_snapshot MUST stay trigger="always_on" (see
+    # CadenceSpec's docstring) — a missed reaction-capture window is
+    # permanent data loss, unlike every other source here.
+    sources.register(SourceDefinition(
+        key="catcor_snapshot", label="CATCOR — Reaction Snapshot Capture",
+        affinity_group="calendar_events", fetch_fn=_catcor_snapshot_tick,
+        tables=["macro_price_reaction"],
+        cadence=CadenceSpec(trigger="always_on", interval_seconds=60),
+        rate_limit=RateLimitSpec(kind="undocumented", note="Internal — reads already-fetched spot_price rows, no new upstream call."),
+    ))
+    sources.register(SourceDefinition(
+        key="catcor_consensus_actuals", label="CATCOR — ForexFactory Consensus + ALFRED Actuals",
+        affinity_group="calendar_events", fetch_fn=_catcor_consensus_tick,
+        tables=["forexfactory_calendar", "event_calendar"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=CATCOR_CONSENSUS_INTERVAL_S),
+        rate_limit=RateLimitSpec(kind="undocumented", note="ForexFactory: per-calendar-week cache, real fetch at most weekly; confirmed live to 429 on repeat hits within the same week."),
+    ))
+
+
+async def run() -> None:
+    """Initializes the shared DB(s), this module's own httpx client, then
+    runs the same one-shot backfill + tiered scheduler main.py's lifespan
+    starts in-process (when RUN_COLLECTOR_IN_PROCESS is true). Runs until
+    cancelled (SIGINT/SIGTERM)."""
+    register_sources()
+    db.init_db()
+    stack_db.init_db()
+    _interval_overrides.update(db.get_interval_overrides())
+    persisted_refresh_enabled = db.get_refresh_enabled()
+    if persisted_refresh_enabled is not None:
+        _refresh_settings["slow_enabled"] = persisted_refresh_enabled
+
+    global _client
+    _client = httpx.AsyncClient()
+    print("[collector] starting — backfill, one-shot tier refresh, then the scheduler loop")
+    try:
+        await _backfill_if_needed()
+        await _refresh_fast_tier()
+        await _refresh_slow_tier()
+        await _schedule_loop()
+    finally:
+        await _client.aclose()
+
+
+def main() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    task = loop.create_task(run())
+
+    def _request_stop():
+        print("[collector] shutdown signal received, stopping...")
+        task.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            # add_signal_handler isn't available on every platform (e.g.
+            # Windows) — Ctrl-C still raises KeyboardInterrupt into
+            # loop.run_until_complete below, just without the graceful
+            # in-loop cancellation path.
+            pass
+
+    try:
+        loop.run_until_complete(task)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -3,6 +3,7 @@ import { nearestRowDate } from "./date_utils";
 import { VAULT_COLORS } from "./palette";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
+import { apiFetch } from "./api_client";
 import {
   fmtTrillions,
   fmtBillions,
@@ -1384,10 +1385,10 @@ export default function MoneySupply() {
     try {
       const rangeParams = w === "custom" && start && end ? `&start=${start}&end=${end}` : "";
       const [moneyRes, metalsRes, outlaysRes, outlaysByAgencyRes] = await Promise.all([
-        fetch(`/api/fred/money-supply/db?window=${w}${rangeParams}`),
-        fetch(`/api/metals/prices/db?window=${w}${rangeParams}`),
-        fetch(`/api/treasury-outlays/db?window=${w}${rangeParams}`),
-        fetch(`/api/treasury-outlays-by-agency/db?window=${w}${rangeParams}`),
+        apiFetch(`/api/fred/money-supply/db?window=${w}${rangeParams}`),
+        apiFetch(`/api/metals/prices/db?window=${w}${rangeParams}`),
+        apiFetch(`/api/treasury-outlays/db?window=${w}${rangeParams}`),
+        apiFetch(`/api/treasury-outlays-by-agency/db?window=${w}${rangeParams}`),
       ]);
       if (!moneyRes.ok) throw new Error(`HTTP ${moneyRes.status}`);
       if (!metalsRes.ok) throw new Error(`HTTP ${metalsRes.status}`);
@@ -1425,8 +1426,8 @@ export default function MoneySupply() {
     setRefreshing(true);
     try {
       const [moneyRes, metalsRes] = await Promise.all([
-        fetch("/api/fred/money-supply/refresh"),
-        fetch("/api/metals/prices/refresh"),
+        apiFetch("/api/fred/money-supply/refresh"),
+        apiFetch("/api/metals/prices/refresh"),
       ]);
       if (!moneyRes.ok) throw new Error(`HTTP ${moneyRes.status}`);
       if (!metalsRes.ok) throw new Error(`HTTP ${metalsRes.status}`);

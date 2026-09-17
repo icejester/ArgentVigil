@@ -706,6 +706,20 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   width: 10px; height: 10px; border-radius: 50%; display: inline-block;
   margin-left: 8px; vertical-align: middle;
 }
+/* Test-environment override (2026-09-16, at the user's explicit request:
+   "annoyingly bright," "painfully clear I'm in test") — bigger than the
+   normal 10px dot, neon magenta instead of a normal health color, and
+   pulsing so it can't be mistaken for a static UI element at a glance. */
+.header-health-dot--test {
+  width: 18px; height: 18px;
+  background: #ff00ff;
+  box-shadow: 0 0 8px 2px #ff00ff;
+  animation: header-health-dot-pulse 1s ease-in-out infinite;
+}
+@keyframes header-health-dot-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 8px 2px #ff00ff; }
+  50% { opacity: 0.55; box-shadow: 0 0 16px 6px #ff00ff; }
+}
 .header-settings-gear {
   margin-left: 10px; font-size: 15px; cursor: pointer; user-select: none;
   vertical-align: middle; opacity: 0.65; transition: opacity 0.15s ease;

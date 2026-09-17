@@ -22,6 +22,7 @@ import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { VAULT_COLORS } from "./palette";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
+import { apiFetch } from "./api_client";
 
 // Fire a GET, unwrap { data }, hand it to a setter; any failure leaves the
 // setter at `fallback` (default []). MetalLeverageCurveVolumeChart's four
@@ -31,7 +32,7 @@ import { usePinnedDate } from "./pinned_date_context";
 // its own bespoke error message, and SpotPriceBadge/MetalCurrentReadout
 // swallow errors silently with no state change, both deliberately.
 function fetchInto(url, setter, fallback = []) {
-  return fetch(url)
+  return apiFetch(url)
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
     .then((j) => setter(j.data ?? fallback))
     .catch(() => setter(fallback));
@@ -699,7 +700,7 @@ function CategoryCompositionPanel({ since, until, pinnedDate, onPin }) {
 
   const fetchData = useCallback(() => {
     setError(null);
-    fetch(`/api/delivery-behavior/db?metal=${metal}`)
+    apiFetch(`/api/delivery-behavior/db?metal=${metal}`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -772,7 +773,7 @@ function SpotPriceBadge({ metal }) {
   const { spotKey } = METAL_CONFIG[metal];
 
   const fetchPrices = useCallback(() => {
-    fetch("/api/prices/db")
+    apiFetch("/api/prices/db")
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -832,7 +833,7 @@ function MetalCurrentReadout({ metal, compact = false }) {
   const { leverageUrl, contractOz } = METAL_CONFIG[metal];
 
   const fetchLeverage = useCallback(() => {
-    fetch(leverageUrl)
+    apiFetch(leverageUrl)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -1211,7 +1212,7 @@ export default function SilverCoTTracker() {
   const setPinnedDate = togglePinnedDate;
 
   useEffect(() => {
-    fetch("/api/cot/db")
+    apiFetch("/api/cot/db")
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();

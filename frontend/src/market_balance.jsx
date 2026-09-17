@@ -15,6 +15,7 @@ import {
   ReferenceLine,
 } from "recharts";
 import { VAULT_COLORS } from "./palette";
+import { apiFetch } from "./api_client";
 
 // Silver Institute publishes World Silver Survey headline figures each April,
 // covering the prior calendar year. All *_moz fields are million troy oz.
@@ -203,7 +204,7 @@ function useMarketBalance() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    fetch("/api/silver/market-balance")
+    apiFetch("/api/silver/market-balance")
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();

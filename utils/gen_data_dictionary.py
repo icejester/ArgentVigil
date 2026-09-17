@@ -26,8 +26,8 @@ Not stdlib-only like pipeline/ — see CLAUDE.md's ".venv, never bare
 python3" rule, which backend/ (unlike pipeline/) is not exempt from.
 """
 
+import json
 import os
-import re
 import sqlite3
 import sys
 
@@ -51,7 +51,10 @@ except ImportError:
     sources = None  # degrade gracefully — every table just shows "no registered source"
 
 OUTPUT_PATH = os.path.join(_REPO_ROOT, "docs", "data-dictionary.md")
-EDITORIAL_PATH = os.path.join(_REPO_ROOT, "frontend", "src", "data_editorial.js")
+# The real editorial content lives in the .json file (datasources-spec.md
+# Story #1's split) -- data_editorial.js is just a thin re-export wrapper
+# around it now, with no `fields: [...]` literals of its own to scrape.
+EDITORIAL_PATH = os.path.join(_REPO_ROOT, "frontend", "src", "data_editorial.json")
 
 TODO_MARKER = "<!-- TODO: describe field -->"
 
@@ -80,32 +83,36 @@ def introspect_tables() -> dict[str, list[dict]]:
 
 
 def load_editorial_descriptions() -> dict[str, dict[str, str]]:
-    """Best-effort extraction of {table_name: {field_name: description}}
-    from frontend/src/data_editorial.js's hand-written `tables` arrays.
-    This is a light regex scrape, not a JS parser — data_editorial.js's
-    per-table `fields: [[field, desc, reference], ...]` shape is simple
-    enough that a full JS AST isn't worth pulling in for a stdlib-only
-    script. Returns {} if the file doesn't exist yet or doesn't parse —
-    every column then just gets a TODO marker, which is the correct,
-    honest fallback per this generator's own stated convention."""
+    """Extracts {table_name: {field_name: description}} from
+    frontend/src/data_editorial.json — a list of source cards, each with
+    a `tables` array of {"name": table_name, "fields": [[field, desc,
+    reference], ...]}. Real JSON as of datasources-spec.md Story #1's
+    editorial/operational split (data_editorial.js is now just a thin
+    re-export wrapper around this file, with no `fields: [...]` literals
+    of its own — a prior version of this generator regex-scraped the .js
+    file directly and silently lost nearly all descriptions once that
+    split landed). Returns {} if the file doesn't exist yet or doesn't
+    parse — every column then just gets a TODO marker, which is the
+    correct, honest fallback per this generator's own stated convention."""
     if not os.path.exists(EDITORIAL_PATH):
         return {}
-    text = open(EDITORIAL_PATH, encoding="utf-8").read()
+    try:
+        cards = json.load(open(EDITORIAL_PATH, encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
     result: dict[str, dict[str, str]] = {}
-    # Matches: name: "table_name", ... fields: [ ["field", "description", ...], ... ]
-    for table_block in re.finditer(
-        r'name:\s*"(?P<table>\w+)"\s*,\s*fields:\s*\[(?P<body>.*?)\]\s*,?\s*(?:note:|\})',
-        text, re.DOTALL,
-    ):
-        table_name = table_block.group("table")
-        body = table_block.group("body")
-        fields: dict[str, str] = {}
-        for field_row in re.finditer(
-            r'\[\s*"(?P<field>[^"]+)"\s*,\s*"(?P<desc>(?:[^"\\]|\\.)*)"', body,
-        ):
-            fields[field_row.group("field")] = field_row.group("desc").replace('\\"', '"')
-        if fields:
-            result[table_name] = fields
+    for card in cards:
+        for table in card.get("tables", []):
+            table_name = table.get("name")
+            if not table_name:
+                continue
+            fields = {
+                row[0]: row[1]
+                for row in table.get("fields", [])
+                if len(row) >= 2
+            }
+            if fields:
+                result.setdefault(table_name, {}).update(fields)
     return result
 
 

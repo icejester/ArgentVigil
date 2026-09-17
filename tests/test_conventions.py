@@ -89,15 +89,24 @@ ALLOWED_NON_DB_API = {
     "/api/stack/": "Stack Tracker CRUD (specs/stackTracker-spec.md) — user-owned data, no upstream fetch at all",
 }
 
-# Limitation, documented: this scans string-literal fetch() URLs only.
-# research_panel.jsx routes through fetch(url, ...) with variable URLs —
-# those are covered by the /api/catcor/research/ allowlist entry above.
-FETCH_URL_RE = re.compile(r"""fetch\(\s*[`"']([^`"']+)[`"']""")
+# Limitation, documented: this scans string-literal apiFetch()/fetch() URLs
+# only (api-split-implementation-plan.md Story 1.2 replaced every direct
+# fetch() call site with the shared apiFetch() helper from api_client.js —
+# the regex matches both names so the guard keeps working post-rename; only
+# api_client.js's own implementation still calls bare fetch(), and it's
+# excluded from this scan below). research_panel.jsx/stack_tracker.jsx/
+# comex_inventory.jsx/silver_cot_tracker.jsx route some calls through
+# apiFetch(url, ...) with variable URLs — those are covered by the
+# /api/catcor/research/ and /api/stack/ allowlist entries above, or are
+# themselves /db routes.
+FETCH_URL_RE = re.compile(r"""(?:apiFetch|fetch)\(\s*[`"']([^`"']+)[`"']""")
 
 
 def _frontend_api_urls() -> set[str]:
     urls = set()
     for path in list(FRONTEND_SRC.glob("*.jsx")) + list(FRONTEND_SRC.glob("*.js")):
+        if path.name == "api_client.js":
+            continue
         for m in FETCH_URL_RE.finditer(path.read_text()):
             url = m.group(1)
             if url.startswith("/api/"):
@@ -239,3 +248,112 @@ async def test_always_on_reaction_capture_is_never_interval_overridable(tmp_db, 
     )
     assert resp.status_code >= 400
     assert tmp_db.get_interval_overrides() == {}
+
+
+# --- CORS: env-driven allow_origins, no hardcoded "*" (api-split Story 1.1) ---
+
+
+def test_no_hardcoded_wildcard_cors_origin():
+    """allow_origins=['*'] must never come back — it's write-open (once
+    allow_methods includes POST/PUT/DELETE, per CORS_ALLOWED_ORIGINS below)
+    to any origin's browser JS. The real allowlist is env-driven."""
+    assert "*" not in backend.main.CORS_ALLOWED_ORIGINS
+
+
+async def test_cors_allows_configured_origin(tmp_db, client):
+    """A GET from the default dev origin (no CORS_ALLOWED_ORIGINS set, so it
+    falls back to http://localhost:5173, matching today's dev behavior) gets
+    the browser-facing Access-Control-Allow-Origin header back."""
+    resp = await client.get(
+        "/api/health/db", headers={"Origin": "http://localhost:5173"}
+    )
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+async def test_cors_blocks_unlisted_origin(tmp_db, client):
+    """A GET from an origin not in the allowlist gets no
+    Access-Control-Allow-Origin header — the browser then blocks the page's
+    JS from reading the response, even though the server still answered."""
+    resp = await client.get(
+        "/api/health/db", headers={"Origin": "http://evil.example.com"}
+    )
+    assert "access-control-allow-origin" not in resp.headers
+
+
+async def test_cors_preflight_allows_post_put_delete():
+    """allow_methods must cover POST/PUT/DELETE now that frontend and
+    backend can be cross-origin — GET-only was the write-blocking bug
+    Story 1.1 fixes."""
+    import httpx
+
+    from backend.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        for method in ("POST", "PUT", "DELETE"):
+            resp = await c.options(
+                "/api/health/db",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": method,
+                },
+            )
+            allowed = resp.headers.get("access-control-allow-methods", "")
+            assert method in allowed, f"{method} missing from preflight allow-methods: {allowed}"
+
+
+# --- API versioning: every route reachable at /api/v1 (api-split Story 3.3) ---
+
+# The intended end state (api-split-implementation-plan.md Story 3.1's
+# "Done when") is that every route is reachable at /api/v1/...; the bare
+# /api/... alias is temporary (see CLAUDE.md's Standing rules "API
+# versioning" entry for the 90-day deprecation window) and still live
+# today, so this only asserts the /api/v1 half — it does NOT assert /api
+# is gone, since removing that alias is a separate, later step gated on
+# the frontend being confirmed migrated and the deprecation window having
+# passed. Update this test (assert /api/... 404s) once that removal lands.
+
+
+def _all_route_paths() -> set[str]:
+    return {route.path for route in backend.main.app.routes if hasattr(route, "path")}
+
+
+def test_every_api_route_reachable_under_v1():
+    """Every /api/... route the app registers must also exist at the
+    equivalent /api/v1/... path — the two include_router() calls in
+    main.py must stay symmetric as new routes are added to api_router."""
+    paths = _all_route_paths()
+    bare_api_paths = {p for p in paths if p.startswith("/api/") and not p.startswith("/api/v1/")}
+    missing = sorted(
+        p for p in bare_api_paths if p.replace("/api/", "/api/v1/", 1) not in paths
+    )
+    assert not missing, (
+        f"Routes reachable at a bare /api/... path but not the equivalent "
+        f"/api/v1/... path: {missing} — every route must be added to "
+        f"api_router (mounted at both prefixes), never registered directly "
+        f"on app or at only one of the two prefixes."
+    )
+
+
+def test_no_route_registered_directly_on_app_outside_router():
+    """Every real API route must live on api_router (mounted at both /api
+    and /api/v1), not declared directly on `app` at some other path — the
+    only routes app itself should own outside api_router's two mounts are
+    non-API static mounts (StaticFiles for /stack_images)."""
+    for route in backend.main.app.routes:
+        if not hasattr(route, "path"):
+            # The two app.include_router(api_router, prefix=...) calls
+            # themselves show up as routing.Include entries with no own
+            # .path — that's exactly the sanctioned "lives on api_router"
+            # shape this test exists to require, not something to flag.
+            continue
+        path = route.path
+        if path.startswith("/api/"):
+            continue
+        # Non-API: the /stack_images StaticFiles mount (and its implicit
+        # sub-paths) is the one sanctioned exception — data, not an API
+        # route, per Story 1.5's exit notes.
+        assert path.startswith("/stack_images") or path in ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"), (
+            f"Unexpected non-/api route registered directly on app: {path!r} "
+            f"— new routes belong on api_router, not directly on app."
+        )

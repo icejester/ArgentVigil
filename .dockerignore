@@ -1,0 +1,16 @@
+# Keeps build contexts small and avoids leaking local state into images.
+.git
+.venv
+node_modules
+runtime/
+frontend/node_modules
+frontend/dist
+__pycache__
+*.pyc
+.pytest_cache
+.DS_Store
+tests/
+docs/
+TDM/
+specs/
+*.md

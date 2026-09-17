@@ -25,6 +25,7 @@ import respx
 from helpers import make_fake_date
 from datetime import date
 
+from backend import collector
 from backend import main as main_module
 from backend import sources
 
@@ -76,8 +77,8 @@ async def booted_app(tmp_db, monkeypatch):
     fire_at_startup sources as already-fired from a PRIOR test's boot and
     skip them, which is what test_startup_only_sources_fire_exactly_once
     is specifically trying to observe."""
-    monkeypatch.setattr(main_module, "date", make_fake_date(date(2026, 7, 21)))  # Tuesday
-    main_module._startup_fired.clear()
+    monkeypatch.setattr(collector, "date", make_fake_date(date(2026, 7, 21)))  # Tuesday
+    collector._startup_fired.clear()
     router = _catchall_mock()
     with router:
         from backend.main import app
@@ -228,4 +229,4 @@ async def test_lifespan_teardown_cancels_background_tasks():
             await asyncio.sleep(0.1)
             for t in tasks_during:
                 assert t.cancelled() or t.done()
-            assert main_module._client.is_closed
+            assert collector._client.is_closed

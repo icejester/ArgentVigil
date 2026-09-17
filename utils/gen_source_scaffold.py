@@ -1,8 +1,8 @@
 """
-Deterministic scaffold generator for onboarding a new data source
-(datasources-spec.md Story #4). Emits reviewable boilerplate — never
-writes files directly (this repo's standing Learning Mode rule: never
-auto-apply, the user makes the final call).
+Deterministic scaffold generator for onboarding a new data source. Emits
+reviewable boilerplate — never writes files directly (this repo's
+standing Learning Mode rule: never auto-apply, the user makes the final
+call).
 
 Run with: .venv/bin/python utils/gen_source_scaffold.py path/to/source.yaml
 (stdlib-only otherwise, but needs the venv for the same reason
@@ -15,7 +15,7 @@ that reasons through the new source's real response shape, quirks, and
 correct cadence — see the accompanying .claude/commands/onboard-source.md),
 not a hand-authored starting point. This generator only does the
 boilerplate half: producing a SourceDefinition block, a DDL scaffold, a
-paired fetch/db route pair, and a data_editorial.js stub — all
+paired fetch/db route pair, and a data_editorial.json card stub — all
 structurally identical to every other source in this codebase by
 construction, so a new source #N can't quietly diverge from source #1's
 conventions the way the pre-datasources-spec.md sources did.
@@ -51,6 +51,7 @@ YAML shape (see utils/example_source.yaml for a worked example):
       - { name: date, type: TEXT, pk: true }
 """
 
+import json
 import os
 import sys
 
@@ -61,8 +62,10 @@ sys.path.insert(0, _REPO_ROOT)
 try:
     # Import backend.main (not just backend.sources) so SOURCE_REGISTRY is
     # actually populated — backend.sources itself only defines the empty
-    # dict; main.py's module-level sources.register(...) calls are what
-    # fill it in, same ordering quirk gen_data_dictionary.py works around.
+    # dict; collector.register_sources() is what fills it in, and main.py
+    # calls that once at its own module-import time (so api's routes see
+    # a populated registry too), same ordering quirk gen_data_dictionary.py
+    # works around.
     import backend.main  # noqa: F401,E402
     import backend.sources as sources_module  # noqa: E402
 except ImportError as e:
@@ -281,8 +284,7 @@ def generate_fetch_function(spec: dict) -> str:
 
     return f'''async def _fetch_and_persist_{key}() -> dict:
     """TODO: fill in real fetch/persist logic — this is generated
-    boilerplate, not a working integration. Judgment items still needed
-    (per datasources-spec.md Story #4's deterministic/judgment split):
+    boilerplate, not a working integration. Judgment items still needed:
     real response shape, null sentinels (does this upstream use 0 or a
     magic string to mean "not reported"? see AV's nulls-over-zeros
     convention in CLAUDE.md), unit conversions, and the real cadence this
@@ -304,7 +306,7 @@ def generate_fetch_function(spec: dict) -> str:
 
 def generate_db_route(spec: dict) -> str:
     key = spec["key"]
-    return f'''@app.get("/api/{key}/db")
+    return f'''@api_router.get("/{key}/db")
 async def {key}_db():
     rows = db.get_{key}(...)  # TODO: add db.get_{key} to backend/db.py
     return {{"success": True, "data": rows}}'''
@@ -329,29 +331,32 @@ def generate_ddl(spec: dict) -> str:
 
 
 def generate_editorial_stub(spec: dict) -> str:
+    # Real shape as of datasources-spec.md's Story #1 editorial/operational
+    # split: frontend/src/data_editorial.json is a JSON list of these card
+    # objects (data_editorial.js is now just a thin re-export wrapper
+    # around it, not something to hand-edit) — emit valid JSON, not a JS
+    # object literal, so this stub can be pasted straight into the array.
     key = spec["key"]
     label = spec["label"]
     fields = spec.get("fields", [])
-    field_rows = ",\n".join(
-        f'          ["{f["name"]}", "<!-- TODO: describe field -->", "<!-- TODO: where is this used in the UI -->"]'
-        for f in fields
-    )
-    return f'''  {{
-    key: "{key}",
-    label: "{label}",
-    origin: "<!-- TODO: describe upstream source -->",
-    sourceKeys: ["{key}"],
-    curl: `<!-- TODO: equivalent curl example -->`,
-    tables: [
-      {{
-        name: "{key}",
-        fields: [
-{field_rows}
+    card = {
+        "key": key,
+        "label": label,
+        "origin": "<!-- TODO: describe upstream source -->",
+        "sourceKeys": [key],
+        "curl": "<!-- TODO: equivalent curl example -->",
+        "tables": [
+            {
+                "name": key,
+                "fields": [
+                    [f["name"], "<!-- TODO: describe field -->", "<!-- TODO: where is this used in the UI -->"]
+                    for f in fields
+                ],
+                "note": "<!-- TODO: any upsert/append-only/nulls-over-zeros notes -->",
+            },
         ],
-        note: "<!-- TODO: any upsert/append-only/nulls-over-zeros notes -->",
-      }},
-    ],
-  }}'''
+    }
+    return json.dumps(card, indent=2, ensure_ascii=False)
 
 
 def generate_scaffold(spec: dict) -> str:
@@ -365,18 +370,22 @@ def generate_scaffold(spec: dict) -> str:
         "repo's Learning Mode standing rule). Copy each block into its real",
         "home by hand, filling in every TODO first.",
         "",
-        "--- 1. backend/sources.py: add near the other SourceDefinitions ---",
+        "--- 1. backend/collector.py's register_sources(): add near the",
+        "       other sources.register(SourceDefinition(...)) calls ---",
         "",
         generate_source_definition_block(spec),
         "",
-        "--- 2. backend/main.py: fetch function (module-level, before the",
-        "       sources.register(...) block that references it) ---",
+        "--- 2. backend/collector.py: fetch function (module-level, before",
+        "       the register_sources() block that references it — fetch",
+        "       functions live in collector.py, not main.py, since the API",
+        "       split; uses collector's own module-level _client) ---",
         "",
         generate_fetch_function(spec),
         "",
-        "--- 3. backend/main.py: paired /db read route (persist-on-fetch —",
-        "       the frontend calls only this, never the fetch function",
-        "       directly; see CLAUDE.md's Standing architectural rules) ---",
+        "--- 3. backend/main.py: paired /db read route, on api_router (not",
+        "       @app directly — persist-on-fetch: the frontend calls only",
+        "       this, never the fetch function directly; see CLAUDE.md's",
+        "       Standing architectural rules) ---",
         "",
         generate_db_route(spec),
         "",
@@ -384,8 +393,9 @@ def generate_scaffold(spec: dict) -> str:
         "",
         generate_ddl(spec),
         "",
-        "--- 5. frontend/src/data_editorial.js: card stub — add to the",
-        "       DATA_EDITORIAL array ---",
+        "--- 5. frontend/src/data_editorial.json: card stub — add as a new",
+        "       element of the top-level array (data_editorial.js is just a",
+        "       re-export wrapper around this file now — never hand-edit it) ---",
         "",
         generate_editorial_stub(spec),
         "",
@@ -396,9 +406,12 @@ def generate_scaffold(spec: dict) -> str:
         "  - Confirm the YAML's cadence guess against how often this source",
         "    really updates upstream — re-run utils/gen_data_dictionary.py",
         "    once wired up to confirm the new table/source shows up correctly.",
-        "  - If this source needs a startup call in lifespan (trigger=startup),",
-        "    add it explicitly — sources.py's registry doesn't auto-dispatch",
-        "    startup-trigger sources (see CadenceSpec's own docstring).",
+        "  - If this source should fire once at boot (in addition to or instead",
+        "    of a recurring cadence), set fire_at_startup=True on the CadenceSpec",
+        "    itself — there is no separate trigger=startup value; main.py calls",
+        "    collector.register_sources() once, which is enough for the generic",
+        "    scheduler to pick up fire_at_startup sources with no bespoke",
+        "    dispatch call needed (see CadenceSpec's own docstring).",
         "",
     ]
     return "\n".join(parts)

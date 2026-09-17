@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import DataPanel from "./data_panel";
+import { apiFetch } from "./api_client";
 
 // Read-only Configuration status — one row per env var AV uses, set/not-set
 // only (never the value). `used_by` is derived server-side from each
@@ -9,7 +10,7 @@ function ConfigStatusPanel() {
   const [rows, setRows] = useState(null);
 
   useEffect(() => {
-    fetch("/api/config/status")
+    apiFetch("/api/config/status")
       .then((r) => r.json())
       .then((j) => setRows(j.data ?? []))
       .catch(() => setRows([]));
