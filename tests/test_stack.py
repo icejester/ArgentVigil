@@ -94,6 +94,33 @@ def test_create_and_get_item_round_trip(tmp_stack_db):
     assert item["count"] == 1
 
 
+def test_create_and_update_item_sub_type(tmp_stack_db):
+    """sub_type (2026-09-20) — the optional second tier under series, e.g.
+    'Barber Half' under 'US - Constitutional'. Freehand like series, no
+    validation gate, round-trips through create/get/update same as any
+    other nullable text field."""
+    item_id = stack.create_item(_base_fields(series="US - Constitutional", sub_type="Barber Half"))
+    item = stack.get_item(item_id)
+    assert item["series"] == "US - Constitutional"
+    assert item["sub_type"] == "Barber Half"
+
+    stack.update_item(item_id, _base_fields(series="US - Constitutional", sub_type="Washington Quarter"))
+    assert stack.get_item(item_id)["sub_type"] == "Washington Quarter"
+
+
+def test_create_item_without_sub_type_leaves_it_null(tmp_stack_db):
+    item_id = stack.create_item(_base_fields(series="Canadian Maple Leaf"))
+    assert stack.get_item(item_id)["sub_type"] is None
+
+
+def test_bulk_update_sub_type(tmp_stack_db):
+    a = stack.create_item(_base_fields(series="US - Constitutional"))
+    b = stack.create_item(_base_fields(series="US - Constitutional"))
+    stack.bulk_update_items([a, b], {"sub_type": "Kennedy Half"})
+    assert stack.get_item(a)["sub_type"] == "Kennedy Half"
+    assert stack.get_item(b)["sub_type"] == "Kennedy Half"
+
+
 def test_create_item_persists_every_nullable_numismatic_field(tmp_stack_db):
     item_id = stack.create_item(
         _base_fields(

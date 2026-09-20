@@ -45,6 +45,35 @@ SERIES = [
     "Other/Generic",
 ]
 
+# sub_type — a second, optional freehand tier under series (2026-09-20),
+# for series that hold more than one distinct design/denomination (e.g.
+# "US - Constitutional" spanning Washington Quarter/Kennedy Half/Barber
+# Half/Peace Dollar/Morgan Dollar/etc; "Canada - Bullion" spanning Maple
+# Leaf/Red-tailed Hawk). Same freehand-suggestions convention as SERIES —
+# this is a short starter list, not a validated enum; the group-by view's
+# real known-values list is drawn from distinct sub_type values already in
+# the data, same as SeriesInput already does for series. A series with no
+# real sub_type variation (Krugerrand, generic bars) simply leaves every
+# item's sub_type null — the group-by view skips the nesting level
+# entirely in that case, per the design discussion.
+SUB_TYPES = [
+    "Washington Quarter",
+    "Standing Liberty Quarter",
+    "Barber Quarter",
+    "Barber Half",
+    "Kennedy Half",
+    "Franklin Half",
+    "Roosevelt Dime",
+    "Mercury Dime",
+    "Peace Dollar",
+    "Morgan Dollar",
+    "Maple Leaf",
+    "Red-tailed Hawk",
+    "Kookaburra",
+    "Kangaroo",
+    "Crocodile",
+]
+
 # Group-update: fields that are usually genuinely IDENTICAL across a
 # same-purchase lot (what the item IS/says), as opposed to
 # purchase_date/count, which are usually per-row-different even within one
@@ -55,7 +84,7 @@ SERIES = [
 BULK_UPDATE_FIELDS = [
     "description", "metal", "form", "silver_weight_oz", "gold_weight_oz",
     "unit_weight_oz", "purchase_date", "purchase_price", "premium_paid",
-    "mint_year", "series", "mint_mark", "mintage",
+    "mint_year", "series", "sub_type", "mint_mark", "mintage",
     "grading_service", "grade", "certification_number", "numismatic_value",
     "numismatic_value_as_of", "numismatic_notes",
 ]
@@ -66,7 +95,7 @@ MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10MB
 _ITEM_COLUMNS = [
     "description", "metal", "form", "silver_weight_oz", "gold_weight_oz",
     "unit_weight_oz", "count", "lot_id", "purchase_date", "purchase_price", "premium_paid",
-    "mint_year", "series", "mint_mark", "mintage",
+    "mint_year", "series", "sub_type", "mint_mark", "mintage",
     "grading_service", "grade", "certification_number", "numismatic_value",
     "numismatic_value_as_of", "numismatic_notes",
 ]

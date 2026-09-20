@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS stack_items (
     premium_paid REAL,
     mint_year INTEGER,
     series TEXT,
+    sub_type TEXT,
     mint_mark TEXT,
     mintage INTEGER,
     grading_service TEXT,

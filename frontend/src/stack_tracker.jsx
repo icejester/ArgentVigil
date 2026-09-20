@@ -61,6 +61,26 @@ const SERIES = [
   "US - Constitutional",
   "Other/Generic",
 ];
+// Mirrors backend/stack.py's SUB_TYPES — see that list's comment for the
+// full rationale. Short starter list; knownSubTypes (real distinct values
+// already in use) is what actually grows this over time.
+const SUB_TYPES = [
+  "Washington Quarter",
+  "Standing Liberty Quarter",
+  "Barber Quarter",
+  "Barber Half",
+  "Kennedy Half",
+  "Franklin Half",
+  "Roosevelt Dime",
+  "Mercury Dime",
+  "Peace Dollar",
+  "Morgan Dollar",
+  "Maple Leaf",
+  "Red-tailed Hawk",
+  "Kookaburra",
+  "Kangaroo",
+  "Crocodile",
+];
 const GRADING_SERVICES = ["PCGS", "NGC", "ANACS", "Ungraded"];
 // Mirrors backend/stack.py's UNIT_WEIGHT_QUICK_PICKS — oz per single unit.
 // 0.1808 is the standard 90%-silver junk-silver quarter's actual silver
@@ -140,22 +160,12 @@ function fmtPct(v) {
 
 const SERIES_CUSTOM_SENTINEL = "__custom__";
 
-// Series is freehand text server-side (per the user's "this DB is mine"
-// call — a casino chip's series is just as valid as "Canadian Maple
-// Leaf"), and SERIES is only the seed list of common-case quick-picks.
-// `knownSeries` (any distinct series values already in use, sourced from
-// series-summary — see callers) is merged in so a custom series typed
-// once becomes a selectable quick-pick from then on, rather than only
-// ever being reachable by re-typing it. Shared across the Add/Edit/
-// Bulk-update forms so all three offer the same picker rather than
-// drifting into three slightly different inputs. `blankLabel` differs
-// per call site ("No series" vs. "Series — leave unchanged" for bulk
-// update).
-function SeriesInput({ value, onChange, blankLabel, knownSeries }) {
-  const options = useMemo(() => {
-    const merged = new Set([...SERIES, ...(knownSeries || []).filter(Boolean)]);
-    return [...merged].sort((a, b) => a.localeCompare(b));
-  }, [knownSeries]);
+// Shared combo-box primitive: known values + a "Custom…" option that
+// reveals a free-text input. A value typed once becomes a selectable
+// quick-pick from then on (the caller merges it into `knownValues`), so
+// nothing is ever only reachable by re-typing it. Backs both SeriesInput
+// and SubTypeInput below — same interaction, different value lists.
+function ComboInput({ value, onChange, blankLabel, options, placeholder }) {
   const isCustom = value !== "" && !options.includes(value);
   const [customMode, setCustomMode] = useState(isCustom);
 
@@ -179,12 +189,53 @@ function SeriesInput({ value, onChange, blankLabel, knownSeries }) {
       {customMode && (
         <input
           className="research-input"
-          placeholder="Type a series, e.g. 'Luxor'"
+          placeholder={placeholder}
           value={value}
           onChange={(e) => onChange(e.target.value)}
         />
       )}
     </>
+  );
+}
+
+// Series is freehand text server-side (per the user's "this DB is mine"
+// call — a casino chip's series is just as valid as "Canadian Maple
+// Leaf"), and SERIES is only the seed list of common-case quick-picks.
+// `knownSeries` (any distinct series values already in use, sourced from
+// the item list — see callers) is merged in so a custom series typed once
+// becomes a selectable quick-pick from then on. Shared across the Add/
+// Edit/Bulk-update forms so all three offer the same picker rather than
+// drifting into three slightly different inputs. `blankLabel` differs per
+// call site ("No series" vs. "Series — leave unchanged" for bulk update).
+function SeriesInput({ value, onChange, blankLabel, knownSeries }) {
+  const options = useMemo(() => {
+    const merged = new Set([...SERIES, ...(knownSeries || []).filter(Boolean)]);
+    return [...merged].sort((a, b) => a.localeCompare(b));
+  }, [knownSeries]);
+  return (
+    <ComboInput
+      value={value} onChange={onChange} blankLabel={blankLabel} options={options}
+      placeholder="Type a series, e.g. 'Luxor'"
+    />
+  );
+}
+
+// sub_type — the optional second tier under series (Washington Quarter/
+// Barber Half/etc under "US - Constitutional"; Maple Leaf/Red-tailed Hawk
+// under "Canada - Bullion"). Same combo-box mechanics as SeriesInput —
+// SUB_TYPES is a short starter list, `knownSubTypes` (real distinct values
+// already in use, computed client-side same as knownSeriesNames) is what
+// actually grows this over time.
+function SubTypeInput({ value, onChange, blankLabel, knownSubTypes }) {
+  const options = useMemo(() => {
+    const merged = new Set([...SUB_TYPES, ...(knownSubTypes || []).filter(Boolean)]);
+    return [...merged].sort((a, b) => a.localeCompare(b));
+  }, [knownSubTypes]);
+  return (
+    <ComboInput
+      value={value} onChange={onChange} blankLabel={blankLabel} options={options}
+      placeholder="Type a sub-type, e.g. 'Kookaburra'"
+    />
   );
 }
 
@@ -212,9 +263,15 @@ const GROUP_BY_OPTIONS = [
 // under. Missing values get an explicit "Unknown ___" bucket (matching
 // stack.date_summary's existing "Unknown date" convention) rather than
 // silently dropping the item from every group.
+// sub_type is deliberately NOT in GROUP_BY_OPTIONS — per the user's
+// explicit call, it's only ever viewed nested under its series (see the
+// activeSeriesGroup drilldown below), never a top-level group-by
+// dimension of its own. Kept in GROUP_KEY_FNS anyway so groupItemsBy can
+// still be called with dimension="sub_type" for that one nested case.
 const GROUP_KEY_FNS = {
   date: (i) => i.purchase_date || "Unknown date",
   series: (i) => i.series || i.description || "Unknown series",
+  sub_type: (i) => i.sub_type || "Unspecified",
   metal: (i) => i.metal || "Unknown metal",
   form: (i) => i.form || "Unknown form",
 };
@@ -304,6 +361,16 @@ export default function StackTracker() {
   const [listError, setListError] = useState(null);
   const [activeItemId, setActiveItemId] = useState(null);
   const [activeGroupIds, setActiveGroupIds] = useState(null); // item ids of the drilled-into group, or null
+  // When groupBy==="series" and a clicked series group has 2+ distinct
+  // sub_type values among its members, activeSeriesGroupIds holds that
+  // series' item ids so a SECOND GroupList (grouped by sub_type, scoped to
+  // just those items) renders before the flat ItemList — the nested
+  // series -> sub_type -> items drilldown from the design mockup. A series
+  // where every member's sub_type is null/the-same-single-value skips this
+  // middle level entirely (see handleOpenGroup below) and activeGroupIds
+  // is set directly instead, same as before this feature existed.
+  const [activeSeriesGroupIds, setActiveSeriesGroupIds] = useState(null);
+  const [activeSeriesLabel, setActiveSeriesLabel] = useState(null);
 
   const refresh = useCallback(() => {
     getJSON("/api/stack/items/db").then(setItems).catch((err) => setListError(err.message));
@@ -329,6 +396,10 @@ export default function StackTracker() {
   }, [items]);
   const knownSeriesNames = useMemo(
     () => [...new Set(items.map((i) => i.series).filter(Boolean))],
+    [items]
+  );
+  const knownSubTypeNames = useMemo(
+    () => [...new Set(items.map((i) => i.sub_type).filter(Boolean))],
     [items]
   );
   useEffect(() => {
@@ -358,6 +429,32 @@ export default function StackTracker() {
 
   function switchGroupBy(nextGroupBy) {
     setGroupBy(nextGroupBy);
+    setActiveGroupIds(null);
+    setActiveSeriesGroupIds(null);
+    setActiveSeriesLabel(null);
+  }
+
+  // Dispatches a GroupList row click. When grouped by series AND the
+  // clicked group's members span 2+ distinct sub_type values, drop into
+  // the middle sub_type-breakdown level instead of straight to items —
+  // otherwise (every other dimension, or a series with no real sub_type
+  // variation) behaves exactly as before this feature existed.
+  function handleOpenGroup(group) {
+    if (groupBy === "series") {
+      const members = filteredItems.filter((i) => group.item_ids.includes(i.id));
+      const distinctSubTypes = new Set(members.map((i) => i.sub_type).filter(Boolean));
+      if (distinctSubTypes.size > 1) {
+        setActiveSeriesGroupIds(group.item_ids);
+        setActiveSeriesLabel(group.label);
+        return;
+      }
+    }
+    setActiveGroupIds(group.item_ids);
+  }
+
+  function backToSeriesGroups() {
+    setActiveSeriesGroupIds(null);
+    setActiveSeriesLabel(null);
     setActiveGroupIds(null);
   }
 
@@ -444,20 +541,42 @@ export default function StackTracker() {
               </div>
 
               {groupBy === "none" && (
-                <ItemList items={filteredItems} error={listError} onOpen={openItem} onBulkUpdated={refresh} knownSeries={knownSeriesNames} />
+                <ItemList items={filteredItems} error={listError} onOpen={openItem} onBulkUpdated={refresh} knownSeries={knownSeriesNames} knownSubTypes={knownSubTypeNames} />
               )}
 
-              {groupBy !== "none" && !activeGroupIds && (
+              {/* Level 1: top-level groups (Date/Series/Metal/Form). */}
+              {groupBy !== "none" && !activeSeriesGroupIds && !activeGroupIds && (
                 <GroupList
                   groups={groupItemsBy(filteredItems, groupBy)}
                   error={listError}
-                  onOpenGroup={setActiveGroupIds}
+                  onOpenGroup={handleOpenGroup}
                 />
               )}
+
+              {/* Level 2 (series only): sub_type breakdown within the
+                  clicked series — only reached when that series has 2+
+                  distinct sub_type values (see handleOpenGroup); a series
+                  with no real sub_type variation skips straight to Level 3. */}
+              {groupBy === "series" && activeSeriesGroupIds && !activeGroupIds && (
+                <div>
+                  <button type="button" onClick={backToSeriesGroups}>← Back to series groups</button>
+                  <div className="comex-panel-note" style={{ margin: "4px 0" }}>{activeSeriesLabel}</div>
+                  <GroupList
+                    groups={groupItemsBy(filteredItems.filter((i) => activeSeriesGroupIds.includes(i.id)), "sub_type")}
+                    error={listError}
+                    onOpenGroup={(g) => setActiveGroupIds(g.item_ids)}
+                  />
+                </div>
+              )}
+
+              {/* Level 3 (or Level 2 for non-series dimensions): the actual items. */}
               {groupBy !== "none" && activeGroupIds && (
                 <div>
-                  <button type="button" onClick={() => setActiveGroupIds(null)}>
-                    ← Back to {GROUP_BY_OPTIONS.find((o) => o.key === groupBy)?.label.toLowerCase()} groups
+                  <button
+                    type="button"
+                    onClick={() => (activeSeriesGroupIds ? setActiveGroupIds(null) : backToSeriesGroups())}
+                  >
+                    ← Back to {activeSeriesGroupIds ? activeSeriesLabel : GROUP_BY_OPTIONS.find((o) => o.key === groupBy)?.label.toLowerCase()}
                   </button>
                   <ItemList
                     items={filteredItems.filter((i) => activeGroupIds.includes(i.id))}
@@ -465,6 +584,7 @@ export default function StackTracker() {
                     onOpen={openItem}
                     onBulkUpdated={refresh}
                     knownSeries={knownSeriesNames}
+                    knownSubTypes={knownSubTypeNames}
                   />
                 </div>
               )}
@@ -502,8 +622,8 @@ export default function StackTracker() {
               />
             </div>
           )}
-          {view === "detail" && <ItemDetail itemId={activeItemId} onBack={backToList} knownSeries={knownSeriesNames} />}
-          {view === "add" && <AddForm onDone={backToList} onCancel={backToList} knownSeries={knownSeriesNames} />}
+          {view === "detail" && <ItemDetail itemId={activeItemId} onBack={backToList} knownSeries={knownSeriesNames} knownSubTypes={knownSubTypeNames} />}
+          {view === "add" && <AddForm onDone={backToList} onCancel={backToList} knownSeries={knownSeriesNames} knownSubTypes={knownSubTypeNames} />}
         </div>
       </details>
     </div>
@@ -1254,7 +1374,7 @@ function GroupList({ groups, error, onOpenGroup }) {
             </thead>
             <tbody>
               {rows.map((g) => (
-                <tr key={g.label} onClick={() => onOpenGroup(g.item_ids)} style={{ cursor: "pointer" }}>
+                <tr key={g.label} onClick={() => onOpenGroup(g)} style={{ cursor: "pointer" }}>
                   <td>{g.label}</td>
                   <td className="right"><GroupCountCell totalCount={g.total_count} byMetalForm={g.by_metal_form} /></td>
                   <td className="right">{fmtOzBare(g.total_weight_oz)}</td>
@@ -1275,7 +1395,7 @@ function GroupList({ groups, error, onOpenGroup }) {
 // BULK_UPDATE_FIELDS) to every selected row at once. e.g. select the 12
 // rows from the 1/29 order, set series="Canadian Maple Leaf" + mint_year
 // once, apply to all 12 — date/price/count stay per-row, untouched.
-function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
+function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries, knownSubTypes }) {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkEditing, setBulkEditing] = useState(false);
   const [applyingPhoto, setApplyingPhoto] = useState(false);
@@ -1334,6 +1454,7 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
               onDone={handleBulkUpdated}
               onCancel={() => setBulkEditing(false)}
               knownSeries={knownSeries}
+              knownSubTypes={knownSubTypes}
             />
           )}
           {applyingPhoto && (
@@ -1350,11 +1471,11 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
                   <th><input type="checkbox" checked={allSelected} onChange={toggleAll} /></th>
                   <th className="stack-thumb-col">Photo</th>
                   <SortTh label="Date" sortKeyName="purchase_date" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
-                  <SortTh label="Series / description" sortKeyName="series" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
-                  <SortTh label="Total oz" sortKeyName="total_weight_oz" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
+                  <SortTh label="Series" sortKeyName="series" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
+                  <SortTh label="Group" sortKeyName="sub_type" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
+                  <SortTh label="Weight" sortKeyName="total_weight_oz" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
                   <SortTh label="Price paid" sortKeyName="purchase_price" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
                   <SortTh label="Melt value" sortKeyName="melt_value" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
-                  <SortTh label="Gain/loss" sortKeyName="unrealized_gain" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
                 </tr>
               </thead>
               <tbody>
@@ -1399,14 +1520,16 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
                     </td>
                     <td>{item.purchase_date || "—"}</td>
                     <td>{item.series || item.description}</td>
+                    <td>{item.sub_type || "—"}</td>
                     <td className="right">{fmtOzBare(item.total_weight_oz)}</td>
                     <td className="right">{fmtUsd(item.purchase_price)}</td>
-                    <td className="right">{fmtUsd(item.melt_value)}</td>
                     <td className="right">
-                      {fmtUsd(item.unrealized_gain)}
-                      {item.unrealized_gain_pct !== null && item.unrealized_gain_pct !== undefined
-                        ? ` (${item.unrealized_gain_pct.toFixed(1)}%)`
-                        : ""}
+                      {fmtUsd(item.melt_value)}
+                      {item.unrealized_gain !== null && item.unrealized_gain !== undefined && (
+                        <span style={{ color: item.unrealized_gain >= 0 ? "#4caf76" : "#e05252", marginLeft: 4 }}>
+                          ({item.unrealized_gain >= 0 ? "+" : "-"}{fmtUsd(Math.abs(item.unrealized_gain))})
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -1514,8 +1637,9 @@ function ApplyPhotoForm({ itemIds, onDone, onCancel }) {
 // to bulk update any one (or all) of the nested fields of the coin"
 // request. Every field starts blank; only fields actually filled in get
 // sent, so an untouched field is never overwritten with an empty value.
-function BulkUpdateForm({ itemIds, onDone, onCancel, knownSeries }) {
+function BulkUpdateForm({ itemIds, onDone, onCancel, knownSeries, knownSubTypes }) {
   const [series, setSeries] = useState("");
+  const [subType, setSubType] = useState("");
   const [description, setDescription] = useState("");
   const [metal, setMetal] = useState("");
   const [form, setForm] = useState("");
@@ -1543,6 +1667,7 @@ function BulkUpdateForm({ itemIds, onDone, onCancel, knownSeries }) {
     setError(null);
     const fields = {};
     if (series) fields.series = series;
+    if (subType) fields.sub_type = subType;
     if (description) fields.description = description;
     if (metal) fields.metal = metal;
     if (form) fields.form = form;
@@ -1581,6 +1706,7 @@ function BulkUpdateForm({ itemIds, onDone, onCancel, knownSeries }) {
 
       <div className="research-input-row">
         <SeriesInput value={series} onChange={setSeries} blankLabel="Series — leave unchanged" knownSeries={knownSeries} />
+        <SubTypeInput value={subType} onChange={setSubType} blankLabel="Sub-type — leave unchanged" knownSubTypes={knownSubTypes} />
         <input
           className="research-input" placeholder="Description — leave blank to skip"
           value={description} onChange={(e) => setDescription(e.target.value)}
@@ -1686,7 +1812,7 @@ function BulkUpdateForm({ itemIds, onDone, onCancel, knownSeries }) {
 // --- Shared minimal-fields form ----------------------------------------
 
 const EMPTY_STATE = {
-  description: "", series: "", metal: "silver",
+  description: "", series: "", subType: "", metal: "silver",
   unitWeightPick: "1", unitWeightCustom: "",
   quantity: "1", purchase_date: "", purchase_price: "",
 };
@@ -1696,7 +1822,7 @@ function unitWeightOzFromState(state) {
   return raw ? parseFloat(raw) : null;
 }
 
-function MinimalFieldsInputs({ state, setField, knownSeries }) {
+function MinimalFieldsInputs({ state, setField, knownSeries, knownSubTypes }) {
   return (
     <div>
       <div className="research-input-row">
@@ -1705,6 +1831,12 @@ function MinimalFieldsInputs({ state, setField, knownSeries }) {
           onChange={(v) => setField("series", v)}
           blankLabel="No series (bar / generic round) — type a description below"
           knownSeries={knownSeries}
+        />
+        <SubTypeInput
+          value={state.subType}
+          onChange={(v) => setField("subType", v)}
+          blankLabel="No sub-type (optional)"
+          knownSubTypes={knownSubTypes}
         />
       </div>
       <div className="research-input-row">
@@ -1747,7 +1879,7 @@ function MinimalFieldsInputs({ state, setField, knownSeries }) {
   );
 }
 
-function AddForm({ onDone, onCancel, knownSeries }) {
+function AddForm({ onDone, onCancel, knownSeries, knownSubTypes }) {
   const [state, setState] = useState(EMPTY_STATE);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -1765,6 +1897,7 @@ function AddForm({ onDone, onCancel, knownSeries }) {
       const shared = {
         description: state.description || state.series || "Unlabeled item",
         series: state.series || null,
+        sub_type: state.subType || null,
         metal: state.metal,
         form: "coin",
         unit_weight_oz: unitWeightOzFromState(state),
@@ -1798,7 +1931,7 @@ function AddForm({ onDone, onCancel, knownSeries }) {
         Quantity &gt; 1 creates that many independent entries (own edit/delete later), not one row with a
         count — e.g. "7, 2013 Canadian Maple Leaf" becomes 7 separate rows you can track individually.
       </div>
-      <MinimalFieldsInputs state={state} setField={setField} knownSeries={knownSeries} />
+      <MinimalFieldsInputs state={state} setField={setField} knownSeries={knownSeries} knownSubTypes={knownSubTypes} />
       {error && <div className="comex-panel-note">{error}</div>}
       <div className="research-input-row">
         <button type="submit" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
@@ -1829,10 +1962,11 @@ function FormField({ label, children }) {
   );
 }
 
-function ItemDetail({ itemId, onBack, knownSeries }) {
+function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
   const [item, setItem] = useState(null);
   const [description, setDescription] = useState("");
   const [series, setSeries] = useState("");
+  const [subType, setSubType] = useState("");
   const [metal, setMetal] = useState("silver");
   const [form, setForm] = useState("coin");
   const [unitWeight, setUnitWeight] = useState("");
@@ -1863,6 +1997,7 @@ function ItemDetail({ itemId, onBack, knownSeries }) {
         setItem(data);
         setDescription(data.description || "");
         setSeries(data.series || "");
+        setSubType(data.sub_type || "");
         setMetal(data.metal || "silver");
         setForm(data.form || "coin");
         setUnitWeight(data.unit_weight_oz !== null && data.unit_weight_oz !== undefined ? String(data.unit_weight_oz) : "");
@@ -1895,6 +2030,7 @@ function ItemDetail({ itemId, onBack, knownSeries }) {
       await putJSON(`/api/stack/items/${itemId}`, {
         description: description || series || "Unlabeled item",
         series: series || null,
+        sub_type: subType || null,
         metal,
         form,
         unit_weight_oz: unitWeight ? parseFloat(unitWeight) : null,
@@ -2034,6 +2170,7 @@ function ItemDetail({ itemId, onBack, knownSeries }) {
         </div>
         <div className="research-input-row">
           <SeriesInput value={series} onChange={setSeries} blankLabel="No series" knownSeries={knownSeries} />
+          <SubTypeInput value={subType} onChange={setSubType} blankLabel="No sub-type" knownSubTypes={knownSubTypes} />
         </div>
         <div className="research-input-row">
           <FormField label="Description">

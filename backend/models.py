@@ -175,6 +175,7 @@ class StackItem(BaseModel):
     premium_paid: float | None = None
     mint_year: int | None = None
     series: str | None = None
+    sub_type: str | None = None
     mint_mark: str | None = None
     mintage: int | None = None
     grading_service: str | None = None
