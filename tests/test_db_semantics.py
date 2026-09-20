@@ -63,6 +63,41 @@ def test_price_backfill_stitches_ticks_over_daily_closes(tmp_db):
     assert [r["price"] for r in rows] == [39.0, 39.6]
 
 
+def test_price_backfill_until_ts_bounds_both_tiers(tmp_db):
+    """A range-picker query with an explicit until_ts must exclude ticks
+    and daily closes past that bound, on both ends — not just apply the
+    since_ts lower bound like the lookback-only original behavior."""
+    tmp_db.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [
+        {"date": "2026-07-18", "price": 39.0},
+        {"date": "2026-07-19", "price": 39.3},
+        {"date": "2026-07-21", "price": 39.9},
+    ])
+    tmp_db.append_spot_price_ticks([
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T08:00:00+00:00", "price": 39.6, "change_pct_24h": None},
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T16:00:00+00:00", "price": 39.7, "change_pct_24h": None},
+    ])
+    rows = tmp_db.get_price_backfill(
+        "XAG", "2026-07-01T00:00:00+00:00", "2026-07-20T12:00:00+00:00"
+    )
+    # 2026-07-21's daily close and the 16:00 tick both fall after until_ts
+    # and must be excluded; 2026-07-19's daily close is still covered by
+    # the daily-cutoff tier since it's strictly before the earliest real
+    # tick date (2026-07-20).
+    assert [r["ts"] for r in rows] == ["2026-07-18", "2026-07-19", "2026-07-20T08:00:00+00:00"]
+    assert [r["price"] for r in rows] == [39.0, 39.3, 39.6]
+
+
+def test_spot_price_ticks_since_omitted_until_is_backward_compatible(tmp_db):
+    """until_ts defaults to no upper bound — existing lookback-only callers
+    (hours-based) must see identical behavior to before this param existed."""
+    tmp_db.append_spot_price_ticks([
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T08:00:00+00:00", "price": 39.6, "change_pct_24h": None},
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T16:00:00+00:00", "price": 39.7, "change_pct_24h": None},
+    ])
+    rows = tmp_db.get_spot_price_ticks_since("XAG_SPOT", "2026-07-20T00:00:00+00:00")
+    assert [r["price"] for r in rows] == [39.6, 39.7]
+
+
 def _census_row(**overrides) -> dict:
     row = {
         "metal": "XAG",

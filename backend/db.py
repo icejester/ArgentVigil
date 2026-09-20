@@ -1983,29 +1983,33 @@ def get_event_reaction_series() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_spot_price_ticks_since(instrument: str, since_ts: str) -> list[dict]:
-    """Full tick history for instrument at/after since_ts, ordered
-    oldest-first — for a 24h price chart, not a nearest-tick lookup like
-    get_spot_price_near (CATCOR's use case). Ticks only exist from whenever
-    the fast-tier refresh loop started actually running at its 60s cadence
-    (for *_SPOT) or CATCOR's intraday backfill last ran (for
-    *_FUTURES_FRONT); a freshly-enabled instance will have a short/empty
-    history until it accumulates. Pass a real price_instruments constant —
-    *_SPOT and *_FUTURES_FRONT are deliberately different instruments (see
-    price_instruments.py's module docstring for the sawtooth bug this
-    schema exists to make impossible)."""
+def get_spot_price_ticks_since(instrument: str, since_ts: str, until_ts: str | None = None) -> list[dict]:
+    """Full tick history for instrument at/after since_ts (and, if given,
+    at/before until_ts), ordered oldest-first — for a price-range chart,
+    not a nearest-tick lookup like get_spot_price_near (CATCOR's use case).
+    until_ts is optional and defaults to no upper bound (through "now"),
+    preserving the original lookback-only behavior when omitted. Ticks
+    only exist from whenever the fast-tier refresh loop started actually
+    running at its 60s cadence (for *_SPOT) or CATCOR's intraday backfill
+    last ran (for *_FUTURES_FRONT); a freshly-enabled instance will have a
+    short/empty history until it accumulates. Pass a real
+    price_instruments constant — *_SPOT and *_FUTURES_FRONT are
+    deliberately different instruments (see price_instruments.py's module
+    docstring for the sawtooth bug this schema exists to make impossible)."""
+    query = "SELECT ts, price FROM spot_price WHERE instrument = ? AND ts >= ?"
+    params: list = [instrument, since_ts]
+    if until_ts is not None:
+        query += " AND ts <= ?"
+        params.append(until_ts)
+    query += " ORDER BY ts ASC"
     with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT ts, price FROM spot_price
-               WHERE instrument = ? AND ts >= ?
-               ORDER BY ts ASC""",
-            (instrument, since_ts),
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_price_backfill(metal: str, since_ts: str) -> list[dict]:
-    """Tiered price history for a lookback window, per
+def get_price_backfill(metal: str, since_ts: str, until_ts: str | None = None) -> list[dict]:
+    """Tiered price history for a since/until range (until_ts optional,
+    defaults to no upper bound / through "now"), per
     price-architecture-spec.md's get_price_backfill: real spot_price ticks
     (60s resolution, but only exist from whenever the fast-tier refresh
     loop actually started running) stitched with settlement_price's real
@@ -2023,13 +2027,14 @@ def get_price_backfill(metal: str, since_ts: str) -> list[dict]:
     spot_instrument = f"{metal}_SPOT"
     daily_instrument = f"{metal}_YAHOO_DAILY_CLOSE"
 
-    ticks = get_spot_price_ticks_since(spot_instrument, since_ts)
+    ticks = get_spot_price_ticks_since(spot_instrument, since_ts, until_ts)
     earliest_tick_date = ticks[0]["ts"][:10] if ticks else None
-    daily_cutoff = earliest_tick_date or datetime.now(timezone.utc).date().isoformat()
+    daily_cutoff = earliest_tick_date or (until_ts[:10] if until_ts else datetime.now(timezone.utc).date().isoformat())
 
     daily_rows = [
         r for r in get_settlement_price_series(daily_instrument)
         if r["price"] is not None and since_ts[:10] <= r["date"] < daily_cutoff
+        and (until_ts is None or r["date"] <= until_ts[:10])
     ]
 
     combined = (

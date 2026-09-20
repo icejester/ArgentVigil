@@ -537,16 +537,27 @@ async def prices_db():
 
 
 @api_router.get("/prices/db/ticks")
-async def prices_db_ticks(series_id: str = Query("XAG"), hours: int = Query(24)):
-    """Price history for the leverage panel's price chart, spanning
-    windows from 6H to 12M. Stitches two resolutions (see
-    db.get_price_backfill): real 60s spot_price ticks where they exist
-    (only from whenever the fast-tier refresh loop started running), then
-    settlement_price's real Yahoo daily closes further back — so long
-    windows show real, if coarser, history instead of a gap before the
-    tick table existed."""
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    rows = db.get_price_backfill(series_id, since)
+async def prices_db_ticks(
+    series_id: str = Query("XAG"),
+    hours: int = Query(24),
+    since: str | None = Query(None),
+    until: str | None = Query(None),
+):
+    """Price history for the CoT tab's per-metal price range chart.
+    Stitches two resolutions (see db.get_price_backfill): real 60s
+    spot_price ticks where they exist (only from whenever the fast-tier
+    refresh loop started running), then settlement_price's real Yahoo
+    daily closes further back — so long windows show real, if coarser,
+    history instead of a gap before the tick table existed.
+
+    `since`/`until` (ISO datetime strings) are the real range-picker
+    params and take precedence when given; `hours` is kept as a
+    backward-compatible lookback-from-now shorthand for any caller that
+    doesn't pass an explicit `since`. `until` is optional even when
+    `since` is given — omitting it means "through now", matching the
+    original hours-only behavior."""
+    effective_since = since or (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = db.get_price_backfill(series_id, effective_since, until)
     return {"success": True, "data": rows}
 
 

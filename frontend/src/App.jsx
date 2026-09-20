@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { PRICE_HISTORY_WINDOWS, PRICE_LIVE_POLL_MS } from "./date_utils";
 import SilverCoTTracker from "./silver_cot_tracker";
 import ComexInventoryDashboard from "./comex_inventory";
 import MoneySupply from "./money_supply";
@@ -84,17 +85,21 @@ function HeaderHealthDot() {
   return <span className="header-health-dot" style={{ background: color }} title={`Data health: ${worst}`} />;
 }
 
-const TICKER_POLL_INTERVAL_MS = 60000; // same cadence as HeaderHealthDot — the fast tier's own 60s cadence, no point polling faster than new ticks can actually arrive
-const TICKER_SPARKLINE_HOURS = 3; // "2-3 hours of history" — real spot_price ticks only (see HeaderTicker's own note on why this stays off the daily/leverage chart's data)
+// Default window before a user picks anything — "2-3 hours of history" was
+// the original fixed sparkline width; now just the initial preset, since
+// each TickerRow owns its own range picker (see below).
+const TICKER_DEFAULT_WINDOW_MS = PRICE_HISTORY_WINDOWS[0].ms; // "6H"
 
 // Fixed-content tooltip for the expanded ticker chart — factual only (time
-// + price), no prediction/target framing per AV Voice Rules.
+// + price), no prediction/target framing per AV Voice Rules. Full
+// date+time (not just time) since the range picker now allows windows
+// spanning multiple days, unlike the old fixed 3h-only sparkline.
 function TickerTooltipContent({ active, payload, color }) {
   if (!active || !payload || !payload.length) return null;
   const row = payload[0].payload;
   return (
     <div style={{ background: "#141820", border: "1px solid #2e3547", padding: "6px 8px", fontSize: 11 }}>
-      <div style={{ color: "#8a94a6" }}>{new Date(row.ts).toLocaleTimeString()}</div>
+      <div style={{ color: "#8a94a6" }}>{new Date(row.ts).toLocaleString()}</div>
       <div style={{ color }}>${row.price.toFixed(2)}</div>
     </div>
   );
@@ -102,38 +107,155 @@ function TickerTooltipContent({ active, payload, color }) {
 
 // One collapsible row per metal — collapsed shows just label/price/change
 // (no chart), matching every other collapsible-pane summary in the app.
-// Expanded reveals the real chart: last ~3h of REAL spot ticks
-// (spot_price's XAG_SPOT/XAU_SPOT via /api/prices/db/ticks — the same
-// tick-resolution feed the Paper Games panel's leverage chart deliberately
-// does NOT use, since that chart wants years of daily history, not hours
-// of live ticks). Purely a "stuff's running" visual, not a trading
-// readout — no price targets/prediction framing. Price change shown is
-// absolute change over the fetched window, not a 24h %, since the point
-// here is "what's the live feed showing right now."
-function TickerRow({ metalKey, label, color, ticks }) {
-  if (!ticks || ticks.length === 0) return null;
-  const latest = ticks[ticks.length - 1].price;
-  const first = ticks[0].price;
-  const change = latest - first;
-  const changeColor = change === 0 ? "#5a6278" : change > 0 ? "#4caf76" : "#e0555c";
+// Expanded reveals the real chart plus its own range picker + Live toggle
+// (same PRICE_HISTORY_WINDOWS/PRICE_LIVE_POLL_MS convention as the CoT
+// tab's MetalPriceHistoryChart — see silver_cot_tracker.jsx) — real
+// spot_price ticks via /api/prices/db/ticks, the same tick-resolution feed
+// the Paper Games panel's leverage chart deliberately does NOT use, since
+// that chart wants years of daily history, not hours of live ticks.
+// Purely a "stuff's running" visual, not a trading readout — no price
+// targets/prediction framing. Price change shown is absolute change over
+// the fetched window, not a 24h %, since the point here is "what's the
+// feed showing right now for the window I picked."
+//
+// Range/live state is owned per-row (not hoisted to HeaderTicker) since
+// each metal's pane expands/collapses and picks its own window
+// independently — same reasoning MetalPriceHistoryChart keeps its own
+// state local rather than sharing a panel-level selector.
+function TickerRow({ metalKey, label, color }) {
+  const [open, setOpen] = useState(false);
+  const [windowMs, setWindowMs] = useState(TICKER_DEFAULT_WINDOW_MS);
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const [live, setLive] = useState(true); // matches the old always-polling default
+  const [ticks, setTicks] = useState(null);
+
+  const customSince = customStart ? new Date(customStart + "T00:00") : null;
+  const customUntil = customEnd ? new Date(customEnd + "T23:59") : null;
+  const customRangeIncomplete = windowMs === "custom" && (!customStart || !customEnd || customStart > customEnd);
+
+  // Live always tracks to "now", same semantics as MetalPriceHistoryChart's
+  // Live toggle — ignores whatever preset/Custom window was picked before.
+  const effectiveSince = live
+    ? new Date(Date.now() - TICKER_DEFAULT_WINDOW_MS)
+    : windowMs === "custom"
+    ? customSince
+    : windowMs == null
+    ? null
+    : new Date(Date.now() - windowMs);
+  const effectiveUntil = live ? null : windowMs === "custom" ? customUntil : null;
+
+  const chartSince = !live && customRangeIncomplete ? null : effectiveSince;
+  const chartUntil = !live && customRangeIncomplete ? null : effectiveUntil;
+
+  const fetchTicks = useCallback(() => {
+    // Collapsed panes don't need fresh data — skip the fetch/poll entirely
+    // rather than the old behavior of always polling regardless of expand
+    // state, which was pure waste for a pane nobody's looking at.
+    if (!open) return;
+    if (!live && customRangeIncomplete) return;
+    const params = new URLSearchParams({ series_id: metalKey });
+    if (chartSince) params.set("since", chartSince.toISOString());
+    if (chartUntil) params.set("until", chartUntil.toISOString());
+    apiFetch(`/api/prices/db/ticks?${params.toString()}`)
+      .then((r) => r.json())
+      .then((j) => setTicks(j.data ?? []))
+      .catch(() => setTicks([]));
+  }, [metalKey, open, chartSince?.getTime(), chartUntil?.getTime(), live, customRangeIncomplete]);
+
+  useEffect(() => {
+    fetchTicks();
+    let timer = null;
+    if (open && live) timer = setInterval(fetchTicks, PRICE_LIVE_POLL_MS);
+    return () => { if (timer) clearInterval(timer); };
+  }, [fetchTicks, open, live]);
+
+  const rows = ticks ?? [];
+  const latest = rows.length ? rows[rows.length - 1].price : null;
+  const first = rows.length ? rows[0].price : null;
+  const change = latest != null && first != null ? latest - first : null;
+  const changeColor = change == null ? "#5a6278" : change === 0 ? "#5a6278" : change > 0 ? "#4caf76" : "#e0555c";
+
+  const activeWindowLabel = PRICE_HISTORY_WINDOWS.find((w) => w.ms === windowMs)?.label
+    ?? (windowMs === "custom" ? "Custom" : "6H");
 
   return (
-    <details className="collapsible-pane header-ticker-pane">
+    <details
+      className="collapsible-pane header-ticker-pane"
+      open={open}
+      onToggle={(e) => setOpen(e.target.open)}
+    >
       <summary className="collapsible-pane-title header-ticker-summary">
         <span className="header-ticker-label" style={{ color }}>{label}</span>
-        <span className="header-ticker-price">${latest.toFixed(2)}</span>
-        <span className="header-ticker-pct" style={{ color: changeColor }}>
-          {change >= 0 ? "+" : ""}{change.toFixed(2)}
-        </span>
+        {latest != null && <span className="header-ticker-price">${latest.toFixed(2)}</span>}
+        {change != null && (
+          <span className="header-ticker-pct" style={{ color: changeColor }}>
+            {change >= 0 ? "+" : ""}{change.toFixed(2)}
+          </span>
+        )}
       </summary>
       <div className="collapsible-pane-body">
-        {ticks.length > 1 ? (
+        <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+          {PRICE_HISTORY_WINDOWS.map((w) => (
+            <button
+              key={w.label}
+              type="button"
+              className={`comex-range-btn${!live && windowMs === w.ms ? " comex-range-btn--active" : ""}`}
+              disabled={live}
+              onClick={() => setWindowMs(w.ms)}
+            >
+              {w.label}
+            </button>
+          ))}
+          <button
+            type="button"
+            className={`comex-range-btn${!live && windowMs === "custom" ? " comex-range-btn--active" : ""}`}
+            disabled={live}
+            onClick={() => setWindowMs("custom")}
+          >
+            Custom
+          </button>
+          <label className="live-toggle" title="Track to now, polling every 60s (matches the backend's own spot-price write cadence)">
+            <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} />
+            Live
+          </label>
+        </div>
+        {windowMs === "custom" && !live && (
+          <div className="comex-range-selector" style={{ marginBottom: 8 }}>
+            <label className="form-inline-label">
+              From
+              <input
+                type="datetime-local"
+                value={customStart}
+                onChange={(e) => setCustomStart(e.target.value)}
+                max={customEnd || undefined}
+              />
+            </label>
+            <label className="form-inline-label">
+              To
+              <input
+                type="datetime-local"
+                value={customEnd}
+                onChange={(e) => setCustomEnd(e.target.value)}
+                min={customStart || undefined}
+              />
+            </label>
+            {customStart && customEnd && customStart > customEnd && (
+              <span style={{ fontSize: 11, color: "#e05252" }}>Start must be before end.</span>
+            )}
+          </div>
+        )}
+        {ticks == null ? null : rows.length > 1 ? (
           <ResponsiveContainer width="100%" height={140}>
-            <LineChart data={ticks} margin={{ top: 8, right: 16, bottom: 4, left: 4 }}>
+            <LineChart data={rows} margin={{ top: 8, right: 16, bottom: 4, left: 4 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e2333" />
               <XAxis
                 dataKey="ts"
-                tickFormatter={(t) => new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                tickFormatter={(t) =>
+                  windowMs != null && windowMs !== "custom" && windowMs <= 24 * 60 * 60 * 1000
+                    ? new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+                    : new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" })
+                }
                 minTickGap={50}
                 stroke="#5a6278"
                 fontSize={11}
@@ -163,7 +285,7 @@ function TickerRow({ metalKey, label, color, ticks }) {
             </LineChart>
           </ResponsiveContainer>
         ) : (
-          <div className="comex-empty">Not enough real ticks yet — check back in a minute.</div>
+          <div className="comex-empty">Not enough real ticks yet for this window — check back in a minute.</div>
         )}
       </div>
     </details>
@@ -171,36 +293,15 @@ function TickerRow({ metalKey, label, color, ticks }) {
 }
 
 function HeaderTicker() {
-  const [series, setSeries] = useState(null); // { XAG: [{ts,price}, ...], XAU: [...] } | null
-
-  useEffect(() => {
-    const poll = () => {
-      Promise.all(
-        ["XAG", "XAU"].map((key) =>
-          apiFetch(`/api/prices/db/ticks?series_id=${key}&hours=${TICKER_SPARKLINE_HOURS}`)
-            .then((r) => r.json())
-            .then((j) => [key, j.data ?? []])
-        )
-      )
-        .then((pairs) => setSeries(Object.fromEntries(pairs)))
-        .catch(() => {});
-    };
-    poll();
-    const id = setInterval(poll, TICKER_POLL_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, []);
-
-  if (!series) return null;
-
   const rows = [
-    { key: "XAG", label: "Ag", color: "#5aa9e6", ticks: series.XAG },
-    { key: "XAU", label: "Au", color: "#e0c14c", ticks: series.XAU },
+    { key: "XAG", label: "Ag", color: "#5aa9e6" },
+    { key: "XAU", label: "Au", color: "#e0c14c" },
   ];
 
   return (
     <div className="header-ticker">
-      {rows.map(({ key, label, color, ticks }) => (
-        <TickerRow key={key} metalKey={key} label={label} color={color} ticks={ticks} />
+      {rows.map(({ key, label, color }) => (
+        <TickerRow key={key} metalKey={key} label={label} color={color} />
       ))}
     </div>
   );
