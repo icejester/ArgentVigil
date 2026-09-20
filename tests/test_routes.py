@@ -31,6 +31,45 @@ async def test_silver_leverage_route_round_trips_contracts(tmp_db, client):
     assert row["date"] == "2026-07-14"
 
 
+async def test_prices_db_ticks_bounded_by_since_and_until(tmp_db, client):
+    """The range-picker's explicit since/until params must bound the
+    returned ticks on both ends; until is optional (backward compatible
+    with the original hours-only lookback)."""
+    tmp_db.append_spot_price_ticks([
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T08:00:00+00:00", "price": 39.6, "change_pct_24h": None},
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T16:00:00+00:00", "price": 39.7, "change_pct_24h": None},
+        {"instrument": "XAG_SPOT", "ts": "2026-07-21T08:00:00+00:00", "price": 39.9, "change_pct_24h": None},
+    ])
+
+    resp = await client.get(
+        "/api/prices/db/ticks",
+        params={
+            "series_id": "XAG",
+            "since": "2026-07-20T00:00:00+00:00",
+            "until": "2026-07-20T12:00:00+00:00",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert [r["price"] for r in body["data"]] == [39.6]
+
+
+async def test_prices_db_ticks_until_omitted_matches_original_behavior(tmp_db, client):
+    tmp_db.append_spot_price_ticks([
+        {"instrument": "XAG_SPOT", "ts": "2026-07-20T08:00:00+00:00", "price": 39.6, "change_pct_24h": None},
+        {"instrument": "XAG_SPOT", "ts": "2026-07-21T08:00:00+00:00", "price": 39.9, "change_pct_24h": None},
+    ])
+
+    resp = await client.get(
+        "/api/prices/db/ticks",
+        params={"series_id": "XAG", "since": "2026-07-20T00:00:00+00:00"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["price"] for r in body["data"]] == [39.6, 39.9]
+
+
 async def test_census_trade_route_includes_implied_qty_oz(tmp_db, client):
     tmp_db.upsert_settlement_price_rows("XAG_YAHOO_DAILY_CLOSE", [{"date": "2026-04-30", "price": 40.0}])
     tmp_db.upsert_census_trade_rows([{

@@ -33,3 +33,23 @@ export function xTicks(data, maxTicks = 8) {
   const step = Math.floor(data.length / n) || 1;
   return data.filter((_, i) => i % step === 0).map((r) => r.date);
 }
+
+// Shared range-picker/live-toggle constants for any tick-resolution price
+// chart reading /api/prices/db/ticks (its since/until params). Originally
+// defined once inline in silver_cot_tracker.jsx's MetalPriceHistoryChart,
+// then lifted here when App.jsx's always-on-every-tab HeaderTicker grew
+// the same picker — one definition, both consumers, rather than a second
+// drifting copy of the window list or the poll interval.
+export const PRICE_HISTORY_WINDOWS = [
+  { label: "6H", ms: 6 * 60 * 60 * 1000 },
+  { label: "24H", ms: 24 * 60 * 60 * 1000 },
+  { label: "7D", ms: 7 * 24 * 60 * 60 * 1000 },
+  { label: "1M", ms: 30 * 24 * 60 * 60 * 1000 },
+  { label: "3M", ms: 90 * 24 * 60 * 60 * 1000 },
+  { label: "1Y", ms: 365 * 24 * 60 * 60 * 1000 },
+  { label: "All", ms: null },
+];
+// Matches the backend fast-tier's own ~60s spot_price write cadence
+// (backend/sources.py's fast_interval_s) — polling faster than this just
+// re-reads the same latest persisted row, polling slower defeats "live."
+export const PRICE_LIVE_POLL_MS = 60 * 1000;
