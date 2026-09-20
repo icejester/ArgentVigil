@@ -1279,6 +1279,7 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkEditing, setBulkEditing] = useState(false);
   const [applyingPhoto, setApplyingPhoto] = useState(false);
+  const [lightboxPath, setLightboxPath] = useState(null);
   const { sortKey, sortDir, toggleSort, sorted } = useSort("purchase_date", "desc");
 
   const itemAccessor = (item, key) => (key === "series" ? item.series || item.description : item[key]);
@@ -1347,6 +1348,7 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
               <thead>
                 <tr>
                   <th><input type="checkbox" checked={allSelected} onChange={toggleAll} /></th>
+                  <th className="stack-thumb-col">Photo</th>
                   <SortTh label="Date" sortKeyName="purchase_date" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
                   <SortTh label="Series / description" sortKeyName="series" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} />
                   <SortTh label="Total oz" sortKeyName="total_weight_oz" currentKey={sortKey} currentDir={sortDir} onSort={toggleSort} className="right" />
@@ -1366,23 +1368,37 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
                         onChange={() => {}}
                       />
                     </td>
-                    <td>{item.purchase_date || "—"}</td>
                     <td>
-                      {item.form && (
-                        <span
-                          title={`${item.metal ? item.metal[0].toUpperCase() + item.metal.slice(1) + " " : ""}${item.form[0].toUpperCase() + item.form.slice(1)}`}
-                          style={{ marginRight: 6, color: metalIconColor(item.metal), opacity: 0.85 }}
-                        >
-                          {formIcon(item.form)}
-                        </span>
-                      )}
-                      {item.series || item.description}
-                      {item.photo_count > 0 && (
-                        <span title={`${item.photo_count} photo${item.photo_count === 1 ? "" : "s"}`} style={{ marginLeft: 6, opacity: 0.75 }}>
-                          📷
-                        </span>
-                      )}
+                      <div className="stack-thumb-cell">
+                        {item.thumbnail_path ? (
+                          <span className="stack-thumb-badge">
+                            <img
+                              className="stack-thumb"
+                              src={`/stack_images/${item.thumbnail_path}`}
+                              alt={item.series || item.description || "stack item photo"}
+                              title={item.photo_count > 1 ? `${item.photo_count} photos — click to preview` : "Click to preview"}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setLightboxPath(item.thumbnail_path);
+                              }}
+                            />
+                            {item.photo_count > 1 && (
+                              <span className="stack-thumb-count">+{item.photo_count - 1}</span>
+                            )}
+                          </span>
+                        ) : (
+                          <span
+                            className="stack-thumb-placeholder"
+                            title={item.form ? `${item.metal ? item.metal[0].toUpperCase() + item.metal.slice(1) + " " : ""}${item.form[0].toUpperCase() + item.form.slice(1)}` : "No photo"}
+                            style={{ color: metalIconColor(item.metal) }}
+                          >
+                            {item.form ? formIcon(item.form) : "—"}
+                          </span>
+                        )}
+                      </div>
                     </td>
+                    <td>{item.purchase_date || "—"}</td>
+                    <td>{item.series || item.description}</td>
                     <td className="right">{fmtOzBare(item.total_weight_oz)}</td>
                     <td className="right">{fmtUsd(item.purchase_price)}</td>
                     <td className="right">{fmtUsd(item.melt_value)}</td>
@@ -1397,6 +1413,17 @@ function ItemList({ items, error, onOpen, onBulkUpdated, knownSeries }) {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+      {lightboxPath && (
+        <div
+          onClick={() => setLightboxPath(null)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)",
+            display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, cursor: "pointer",
+          }}
+        >
+          <img src={`/stack_images/${lightboxPath}`} alt="" style={{ maxWidth: "90%", maxHeight: "90%" }} />
         </div>
       )}
     </div>
