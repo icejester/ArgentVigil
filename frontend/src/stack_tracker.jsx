@@ -181,7 +181,7 @@ function ComboInput({ value, onChange, blankLabel, options, placeholder }) {
 
   return (
     <>
-      <select value={customMode ? SERIES_CUSTOM_SENTINEL : value} onChange={handleSelectChange}>
+      <select className="stack-combo-select" value={customMode ? SERIES_CUSTOM_SENTINEL : value} onChange={handleSelectChange}>
         <option value="">{blankLabel}</option>
         {options.map((s) => <option key={s} value={s}>{s}</option>)}
         <option value={SERIES_CUSTOM_SENTINEL}>Custom…</option>
@@ -1963,6 +1963,16 @@ function FormField({ label, children }) {
 }
 
 function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
+  // Read-only by default (2026-09-23, UI-only per the user's explicit
+  // request — no backend gating, this is purely a "don't let a stray
+  // click mutate a coin record" guard). locked=true disables every
+  // writable control on the page (form fields, Save, Delete, photo
+  // upload/delete, add/remove reference link) except the lock toggle
+  // itself and Back. Resets to locked on every itemId change (navigating
+  // to a different item's page) rather than persisting unlocked across
+  // records — each page opens read-only, per the user's "by default."
+  const [locked, setLocked] = useState(true);
+  useEffect(() => { setLocked(true); }, [itemId]);
   const [item, setItem] = useState(null);
   const [description, setDescription] = useState("");
   const [series, setSeries] = useState("");
@@ -2123,14 +2133,18 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
     <div>
       <div className="research-input-row">
         <button type="button" onClick={onBack}>← Back</button>
-        <button type="button" onClick={handleDelete}>Delete</button>
+        <button type="button" onClick={handleDelete} disabled={locked}>Delete</button>
+        <button
+          type="button"
+          className="stack-lock-toggle"
+          onClick={() => setLocked((v) => !v)}
+          title={locked ? "Click to unlock editing" : "Click to lock"}
+          aria-label={locked ? "Unlock editing" : "Lock editing"}
+          style={{ marginLeft: "auto" }}
+        >
+          {locked ? "🔒" : "🔓"}
+        </button>
       </div>
-
-      {item.lot_id && (
-        <div className="comex-panel-note">
-          Part of a group added together — independently editable/deletable from the others.
-        </div>
-      )}
 
       <div className="comex-panel-header">
         <div>
@@ -2165,6 +2179,14 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
       </div>
 
       <form onSubmit={handleSave}>
+        {/* fieldset disabled cascades to every native input/select/button
+            inside it (including SeriesInput/SubTypeInput's own <select>/
+            <input>) with no per-field prop-threading needed — the
+            standard HTML mechanism for "this whole form is read-only
+            right now." Wraps everything through the Save button below;
+            Delete/photos/links are separate elements outside this form,
+            gated individually with their own disabled={locked}. */}
+        <fieldset disabled={locked} style={{ border: "none", padding: 0, margin: 0 }}>
         <div className="comex-panel-note" style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.06em", margin: "12px 0 4px" }}>
           Basics
         </div>
@@ -2179,12 +2201,12 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
         </div>
         <div className="research-input-row">
           <FormField label="Metal">
-            <select value={metal} onChange={(e) => setMetal(e.target.value)}>
+            <select className="stack-combo-select" value={metal} onChange={(e) => setMetal(e.target.value)}>
               {METALS_FULL.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </FormField>
           <FormField label="Form">
-            <select value={form} onChange={(e) => setForm(e.target.value)}>
+            <select className="stack-combo-select" value={form} onChange={(e) => setForm(e.target.value)}>
               {FORMS.map((f) => <option key={f} value={f}>{f}</option>)}
             </select>
           </FormField>
@@ -2235,7 +2257,7 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
         </div>
         <div className="research-input-row">
           <FormField label="Grading service">
-            <select value={gradingService} onChange={(e) => setGradingService(e.target.value)}>
+            <select className="stack-combo-select" value={gradingService} onChange={(e) => setGradingService(e.target.value)}>
               <option value="">No grading service</option>
               {GRADING_SERVICES.map((g) => <option key={g} value={g}>{g}</option>)}
             </select>
@@ -2265,13 +2287,14 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
         <div className="research-input-row" style={{ margin: "16px 0" }}>
           <button type="submit" disabled={saving}>{saving ? "Saving…" : "Save changes"}</button>
         </div>
+        </fieldset>
       </form>
 
       <details className="collapsible-pane" open>
         <summary className="collapsible-pane-title">Photos ({item.images.length}/5)</summary>
         <div className="collapsible-pane-body">
           <div className="research-input-row">
-            <input type="file" accept="image/*" multiple onChange={handlePhotoUpload} disabled={item.images.length >= 5} />
+            <input type="file" accept="image/*" multiple onChange={handlePhotoUpload} disabled={locked || item.images.length >= 5} />
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
             {item.images.map((img) => (
@@ -2282,7 +2305,7 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
                   style={{ width: 96, height: 96, objectFit: "cover", cursor: "pointer" }}
                   onClick={() => setLightbox(img)}
                 />
-                <button type="button" onClick={() => handleDeletePhoto(img.id)} style={{ position: "absolute", top: 0, right: 0 }}>
+                <button type="button" onClick={() => handleDeletePhoto(img.id)} disabled={locked} style={{ position: "absolute", top: 0, right: 0 }}>
                   ×
                 </button>
               </div>
@@ -2298,10 +2321,11 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
             {item.reference_links.map((link) => (
               <li key={link.id}>
                 <a href={link.url} target="_blank" rel="noreferrer">{link.label || link.url}</a>{" "}
-                <button type="button" onClick={() => handleDeleteLink(link.id)}>Remove</button>
+                <button type="button" onClick={() => handleDeleteLink(link.id)} disabled={locked}>Remove</button>
               </li>
             ))}
           </ul>
+          <fieldset disabled={locked} style={{ border: "none", padding: 0, margin: 0 }}>
           <form onSubmit={handleAddLink} className="research-input-row">
             <input
               className="research-input" placeholder="URL (Numista listing, PCGS pop report, ...)"
@@ -2313,6 +2337,7 @@ function ItemDetail({ itemId, onBack, knownSeries, knownSubTypes }) {
             />
             <button type="submit">Add link</button>
           </form>
+          </fieldset>
         </div>
       </details>
 

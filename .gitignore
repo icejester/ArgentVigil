@@ -226,6 +226,7 @@ frontend/dist/
 frontend/.vite/
 *-spec.md
 *-plan.md
+migrate_stack*.py
 
 # macOS
 .DS_Store
