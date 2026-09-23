@@ -94,6 +94,33 @@ def test_create_and_get_item_round_trip(tmp_stack_db):
     assert item["count"] == 1
 
 
+def test_create_and_update_item_sub_type(tmp_stack_db):
+    """sub_type (2026-09-20) — the optional second tier under series, e.g.
+    'Barber Half' under 'US - Constitutional'. Freehand like series, no
+    validation gate, round-trips through create/get/update same as any
+    other nullable text field."""
+    item_id = stack.create_item(_base_fields(series="US - Constitutional", sub_type="Barber Half"))
+    item = stack.get_item(item_id)
+    assert item["series"] == "US - Constitutional"
+    assert item["sub_type"] == "Barber Half"
+
+    stack.update_item(item_id, _base_fields(series="US - Constitutional", sub_type="Washington Quarter"))
+    assert stack.get_item(item_id)["sub_type"] == "Washington Quarter"
+
+
+def test_create_item_without_sub_type_leaves_it_null(tmp_stack_db):
+    item_id = stack.create_item(_base_fields(series="Canadian Maple Leaf"))
+    assert stack.get_item(item_id)["sub_type"] is None
+
+
+def test_bulk_update_sub_type(tmp_stack_db):
+    a = stack.create_item(_base_fields(series="US - Constitutional"))
+    b = stack.create_item(_base_fields(series="US - Constitutional"))
+    stack.bulk_update_items([a, b], {"sub_type": "Kennedy Half"})
+    assert stack.get_item(a)["sub_type"] == "Kennedy Half"
+    assert stack.get_item(b)["sub_type"] == "Kennedy Half"
+
+
 def test_create_item_persists_every_nullable_numismatic_field(tmp_stack_db):
     item_id = stack.create_item(
         _base_fields(
@@ -284,6 +311,34 @@ def test_list_items(tmp_stack_db):
     stack.create_item(_base_fields(description="B"))
     items = stack.list_items()
     assert {i["description"] for i in items} == {"A", "B"}
+
+
+@pytest.mark.asyncio
+async def test_list_items_thumbnail_path(tmp_stack_db, tmp_stack_images):
+    """list_items()'s thumbnail_path is the earliest-added photo's
+    file_path — powers ItemList's per-row image without a per-item fetch.
+    No photo -> None; one photo -> that photo; multiple -> the first one,
+    while photo_count still reflects the real total for the "+N" badge."""
+    no_photo_id = stack.create_item(_base_fields(description="No photo"))
+    one_photo_id = stack.create_item(_base_fields(description="One photo"))
+    many_photo_id = stack.create_item(_base_fields(description="Many photos"))
+
+    first = await stack.add_photo(one_photo_id, _FakeUploadFile("a.jpg", b"x"), None)
+
+    first_of_many = await stack.add_photo(many_photo_id, _FakeUploadFile("a.jpg", b"x"), None)
+    await stack.add_photo(many_photo_id, _FakeUploadFile("b.jpg", b"x"), None)
+    await stack.add_photo(many_photo_id, _FakeUploadFile("c.jpg", b"x"), None)
+
+    items = {i["id"]: i for i in stack.list_items()}
+
+    assert items[no_photo_id]["thumbnail_path"] is None
+    assert items[no_photo_id]["photo_count"] == 0
+
+    assert items[one_photo_id]["thumbnail_path"] == first["file_path"]
+    assert items[one_photo_id]["photo_count"] == 1
+
+    assert items[many_photo_id]["thumbnail_path"] == first_of_many["file_path"]
+    assert items[many_photo_id]["photo_count"] == 3
 
 
 def test_delete_item_removes_links_and_images(tmp_stack_db, tmp_stack_images):

@@ -155,7 +155,9 @@ class OfacDetailResponse(BaseModel):
 
 class StackItem(BaseModel):
     """A stack_items row plus compute_valuation()'s derived fields and
-    list_items()'s joined photo_count. Every field nulls-over-zeros per the
+    list_items()'s joined photo_count/thumbnail_path (the earliest-added
+    photo's file_path, so the list view can render a real image per row
+    without a per-item fetch). Every field nulls-over-zeros per the
     standing convention — a missing spot price or unset numismatic field is
     None, never a fabricated 0."""
 
@@ -173,6 +175,7 @@ class StackItem(BaseModel):
     premium_paid: float | None = None
     mint_year: int | None = None
     series: str | None = None
+    sub_type: str | None = None
     mint_mark: str | None = None
     mintage: int | None = None
     grading_service: str | None = None
@@ -184,6 +187,7 @@ class StackItem(BaseModel):
     created_at: str
     updated_at: str
     photo_count: int = 0
+    thumbnail_path: str | None = None
     total_weight_oz: float | None = None
     melt_value: float | None = None
     numismatic_premium: float | None = None
