@@ -1007,6 +1007,8 @@ bash utils/vigil.sh up test           # any other environments/<name>.env — e.
 bash utils/vigil.sh down prod
 bash utils/vigil.sh status            # every av-* project currently running (or `status <env>` for just one)
 bash utils/vigil.sh logs prod api     # docker compose logs -f, Ctrl-C to stop
+bash utils/vigil.sh keys prod         # which API keys this shell exports (never values) + what each missing one breaks; container check if up
+bash utils/vigil.sh up prod --require-keys   # refuse to start prod if a needed key is missing
 bash utils/vigil.sh test              # full test suite (253 tests, ~12s) — see ## Tests; pytest args pass through, no Docker involved
 bash utils/refresh-test-db.sh test    # snapshot a source environment's data into a snapshot-mode environment's HOST_RUNTIME_DIR — checks REFRESH_POLICY first, refuses on "protected"; also refuses while that environment's own containers are up
 python3 pipeline/run.py               # CoT pipeline only, no server needed — independent of which environment(s) are up
@@ -1046,7 +1048,12 @@ compose` from whatever's exported in the shell that runs `vigil.sh up <env>` —
 mechanism `vigil-native.sh`'s bare-process backend already relies on. A shell without these
 exported silently boots the containers with empty keys (no error) — that source's fetch
 function just quietly no-ops. See `environments/README.md`'s "API keys / secrets" section
-for the full explanation; there is no check today that catches a missing key at `up` time.
+for the full explanation. **`vigil.sh` checks and reports this** (v2.29.0), never printing a value:
+- `up <env>` lists which keys the shell exports and which sources each missing one leaves empty (derived from `sources.py`'s `requires_env`), then verifies the running containers received them.
+- `up <env> --require-keys` refuses to start with a needed key missing. Use it for prod.
+- `keys <env>` runs the report on demand.
+
+The two CATCOR sources that call ALFRED now declare `requires_env=["FRED_API_KEY"]` so they show up there and in Settings' Configuration status.
 
 ### Local dev fallback (`vigil-native.sh`) — bare host processes, no Docker
 

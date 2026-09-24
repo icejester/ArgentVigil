@@ -2921,6 +2921,10 @@ def register_sources() -> None:
         key="catcor_startup", label="CATCOR — Seed + Backfill Chain",
         affinity_group="calendar_events", fetch_fn=_catcor_startup,
         tables=["event_calendar", "spot_price", "settlement_price", "forexfactory_calendar", "macro_price_reaction"],
+        # requires_env is metadata (Settings' config panel, vigil.sh keys):
+        # ALFRED CPI/NFP dates and actuals need FRED_API_KEY; the rest of the
+        # chain still runs without it.
+        requires_env=["FRED_API_KEY"],
         cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True),
         rate_limit=RateLimitSpec(kind="undocumented", note="Composite of Yahoo/ForexFactory/ALFRED calls — see catcor_consensus_actuals and each metal's own price-history source for their individual rate-limit notes."),
     ))
@@ -2940,6 +2944,10 @@ def register_sources() -> None:
         key="catcor_consensus_actuals", label="CATCOR — ForexFactory Consensus + ALFRED Actuals",
         affinity_group="calendar_events", fetch_fn=_catcor_consensus_tick,
         tables=["forexfactory_calendar", "event_calendar"],
+        # requires_env is metadata (Settings' config panel, vigil.sh keys):
+        # ALFRED CPI/NFP dates and actuals need FRED_API_KEY; the rest of the
+        # chain still runs without it.
+        requires_env=["FRED_API_KEY"],
         cadence=CadenceSpec(trigger="interval", interval_seconds=CATCOR_CONSENSUS_INTERVAL_S),
         rate_limit=RateLimitSpec(kind="undocumented", note="ForexFactory: per-calendar-week cache, real fetch at most weekly; confirmed live to 429 on repeat hits within the same week."),
     ))

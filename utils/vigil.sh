@@ -39,6 +39,13 @@
 #   status  [env]             - compose ps for one environment, or every
 #                              av-* project currently up if <env> omitted.
 #   logs    <env> [service]   - compose logs -f [service] (Ctrl-C to stop).
+#   keys    <env>             - report which API keys the invoking shell
+#                              exports (never their values) and what each
+#                              missing key breaks; if that environment is
+#                              up, also verify its containers actually
+#                              received them. `up` runs the same check.
+#                              `up <env> --require-keys` refuses to start
+#                              if a key the environment needs is missing.
 #   test    [pytest args...]  - run the full test suite (see CLAUDE.md
 #                              ## Tests) — no Docker involved, pytest always
 #                              runs on the host; not environment-scoped.
@@ -169,10 +176,132 @@ refuse_if_vigil_native_running() {
   fi
 }
 
+# ── API key check ────────────────────────────────────────────────────────────
+# docker-compose.yml passes FRED/GAPI/CENSUS/ANTHROPIC keys through as
+# ${VAR:-} from THE SHELL RUNNING THIS SCRIPT — not from environments/*.env.
+# A shell without them boots the containers with empty keys and no error;
+# the affected sources just quietly fetch nothing. These checks make that
+# visible. Values are never printed — presence only.
+
+API_KEYS=(FRED_API_KEY GAPI_API_KEY CENSUS_API_KEY ANTHROPIC_API_KEY)
+
+# "KEY=source1,source2" lines derived from backend/sources.py's registry
+# (each SourceDefinition's requires_env) — same derivation the Settings
+# view's Configuration status panel uses, so this can't drift from the app.
+# Falls back to a static summary if .venv isn't bootstrapped yet.
+key_consumers() {
+  local out=""
+  if [ -x "$VENV/bin/python" ]; then
+    out="$(cd "$REPO" && AV_RUNTIME_DIR="$REPO/runtime/.pytest-import-scratch" "$VENV/bin/python" - 2>/dev/null <<'PY'
+from backend import collector, sources
+if not sources.SOURCE_REGISTRY:
+    collector.register_sources()
+by_key = {}
+for key, src in sources.SOURCE_REGISTRY.items():
+    for env in src.requires_env:
+        by_key.setdefault(env, []).append(key)
+for env, keys in by_key.items():
+    print(f"{env}={','.join(sorted(keys))}")
+PY
+)"
+  fi
+  if [ -z "$out" ]; then
+    out="FRED_API_KEY=money_supply,fed_transmission,fed_reserve_bank_h41 (+CATCOR actuals)
+GAPI_API_KEY=lbma_fix
+CENSUS_API_KEY=census_trade"
+  fi
+  echo "$out"
+}
+
+env_file_value() {
+  grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2
+}
+
+# Sets KEYS_MISSING_REQUIRED=1 if a key this environment actually needs is
+# unset. ANTHROPIC_API_KEY is only needed when AI_BACKEND=anthropic (the
+# Research chat backend; forge needs no key). In a frozen environment
+# nothing fetches on a schedule, so missing keys are reported but only
+# matter for manual "Re-run now".
+check_shell_keys() {
+  local consumers ai_backend key used_by needed
+  consumers="$(key_consumers)"
+  ai_backend="$(env_file_value AI_BACKEND)"
+  ai_backend="${ai_backend:-forge}"
+  KEYS_MISSING_REQUIRED=0
+  log "API keys in this shell (values never shown):"
+  for key in "${API_KEYS[@]}"; do
+    used_by="$(echo "$consumers" | grep -E "^$key=" | cut -d= -f2-)"
+    needed=1
+    if [ "$key" = "ANTHROPIC_API_KEY" ]; then
+      used_by="Research chat (AI_BACKEND=$ai_backend)"
+      [ "$ai_backend" = "anthropic" ] || needed=0
+    fi
+    if [ -n "${!key:-}" ] && [ -n "$(echo "${!key}" | tr -d '[:space:]')" ]; then
+      log "  ✓ $key set"
+    elif [ "$needed" = "1" ]; then
+      KEYS_MISSING_REQUIRED=1
+      log "  ✗ $key MISSING — these will be missing data: ${used_by:-(no registered source)}"
+    else
+      log "  · $key not set — not needed (${used_by})"
+    fi
+  done
+  if [ "$KEYS_MISSING_REQUIRED" = "1" ]; then
+    if [ "$UPDATE_MODE" = "live" ]; then
+      log "  !!! Missing keys: the containers will start with those keys EMPTY (no error)."
+    else
+      log "  (UPDATE_MODE=frozen — no scheduled fetches, so this only affects manual re-runs.)"
+    fi
+    log "      Fix: export them in this shell (e.g. from your shell profile) and re-run."
+  fi
+}
+
+# After `up`: confirm the running containers actually received each key
+# (catches a compose mapping problem, not just a shell one). `test -n` runs
+# inside the container, so no value ever leaves it.
+check_container_keys() {
+  local services=(api)
+  [ "$UPDATE_MODE" = "live" ] && services+=(collector)
+  local svc container key
+  log "API keys inside the running containers:"
+  for svc in "${services[@]}"; do
+    container="av-$AV_ENV_NAME-$svc"
+    if ! docker inspect "$container" > /dev/null 2>&1; then
+      log "  ? $container not running — skipped"
+      continue
+    fi
+    local line="  $svc:"
+    for key in "${API_KEYS[@]}"; do
+      if docker exec "$container" sh -c "test -n \"\${$key:-}\"" 2>/dev/null; then
+        line="$line ✓$key"
+      else
+        line="$line ✗$key"
+      fi
+    done
+    log "$line"
+  done
+}
+
+do_keys() {
+  resolve_env "$1"
+  check_shell_keys
+  if docker_ready && docker inspect "av-$AV_ENV_NAME-api" > /dev/null 2>&1; then
+    check_container_keys
+  else
+    log "(environment '$AV_ENV_NAME' isn't running — container check skipped)"
+  fi
+}
+
 do_up() {
   resolve_env "$1"
+  local require_keys=0
+  [ "${2:-}" = "--require-keys" ] && require_keys=1
   if [ "$AV_ENV_NAME" = "prod" ]; then
     refuse_if_vigil_native_running
+  fi
+  check_shell_keys
+  if [ "$require_keys" = "1" ] && [ "$KEYS_MISSING_REQUIRED" = "1" ]; then
+    log "!!! --require-keys: refusing to start '$AV_ENV_NAME' with missing keys (see above)."
+    exit 1
   fi
   ensure_docker
   log "environment: $AV_ENV_NAME (project: $PROJECT, update mode: $UPDATE_MODE)"
@@ -187,6 +316,8 @@ do_up() {
   # unbound-variable error, unlike bash 4+ — this guard expands to nothing
   # on an empty array on both versions instead of erroring on 3.2.
   (cd "$REPO" && compose --env-file "$ENV_FILE" -p "$PROJECT" ${COMPOSE_PROFILE_ARGS[@]+"${COMPOSE_PROFILE_ARGS[@]}"} up -d --build)
+  log ""
+  check_container_keys
   log ""
   log "Open this URL and check the app with your own eyes:"
   log "  http://localhost:$WEB_PORT"
@@ -291,7 +422,8 @@ run_tests() {
 # ── dispatch ─────────────────────────────────────────────────────────────────
 
 usage() {
-  echo "Usage: $0 <up|down|status|logs> <env> [service]"
+  echo "Usage: $0 <up|down|status|logs|keys> <env> [service]"
+  echo "       $0 up <env> --require-keys   (refuse to start if a needed API key is missing)"
   echo "       $0 test [pytest args...]"
   echo "  <env> is any environments/<name>.env in this repo (see environments/README.md)."
   echo "  'status' with no <env> lists every av-* project currently running."
@@ -307,6 +439,7 @@ case "$ACTION" in
   down) do_down "$@" ;;
   status) do_status "$@" ;;
   logs) do_logs "$@" ;;
+  keys) do_keys "$@" ;;
   test) run_tests "$@" ;;
   *) usage ;;
 esac
