@@ -1,4 +1,4 @@
-# ArgentVigil v2.28.0
+# ArgentVigil v2.29.0
 
 Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
 
@@ -24,6 +24,10 @@ The paper market. Weekly CFTC Commitment of Traders positioning for COMEX silver
 
 The denominator side of every metals chart. M2 money stock with the Fed's balance sheet (WALCL) drawn as the share of M2 it represents; a look inside that balance sheet split correctly into **assets** (Treasuries, MBS, discount-window lending) and **liabilities** (bank reserves, reverse repo) — two sides of one balance sheet, never summed together; a weekly **QE/QT momentum** view (is the balance sheet growing or shrinking, week by week, against its level); the federal fiscal picture — monthly **outlays/receipts/deficit** topline and by department, **Treasury auction** bid-to-cover and buyer mix, and **foreign holdings of U.S. Treasuries** by country; the Treasury yield curve; and a **purchasing-power race** — $100 of fiat vs. gold vs. silver vs. CPI-adjusted dollars since 2006, rebased against any baseline you pick. If the metals panels ask "is silver moving," this panel asks "or is the yardstick shrinking, and who's still buying the debt that shrinks it?"
 
+#### Money Management
+
+How the Fed is actually put together, and how that reaches the banks people use. **Governance**: the Board of Governors, the 12 regional Reserve Banks and their presidents, and this year's FOMC voters (computed from the statutory rotation). **Bank lookup**: search any FDIC-insured institution, active or long gone, to see its Federal Reserve district, regulator, Fed membership, and holding company. **Transmission chain**: the policy rate → overnight funding → prime/mortgage/card rates → bank credit → discount window → loan officers' own reported lending standards (SLOOS), each charted on its own scale. No composite score, no soundness ratings.
+
 #### Inventory ("Stock & Flow")
 
 The physical layer. COMEX (New York) registered vs. eligible inventory by individual vault — registered is warranted for delivery, eligible is just stored, and sharp registered drops or reclassification spikes are delivery-pressure signals; SHFE (Shanghai) warehouse stocks for the eastern flow; PSLV's custodial holdings as an investment-demand reference; daily delivery notices (issued/stopped). A nested **Delivery Behavior** layer cross-checks these against each other — flagging days where registered inventory jumped but almost no actual delivery volume accompanied it (paper reshuffling wearing an inflow costume), and computing First Notice Day / Last Trade Day from COMEX's own contract rules. Longer-horizon context: the Silver Institute's annual supply/demand balance (the structural deficit, kept deliberately separate from short-term blips), estimated above-ground stock with explicit ±20% uncertainty, a personal stack calculator, and U.S. **trade flow** — where American silver supply actually comes from, by country, from Census import/export data.
@@ -32,7 +36,7 @@ The physical layer. COMEX (New York) registered vs. eligible inventory by indivi
 
 Did the catalyst actually move the metal? A macro-event calendar (FOMC, CPI, NFP) with consensus expectations and actual prints, and the **surprise** between them, paired against captured silver/gold price reactions at four fixed windows around each event (T−30min, T+5min, T+30min, T+2hr). Observed data only — no interpretation layer, no scoring. The point is to build an honest record of which surprises mattered and which didn't, instead of narrating causation after the fact.
 
-#### Research
+#### Research (sub-pane of CATCOR)
 
 A workbench for testing one claim at a time — "SLV shorts are covering," "industrial demand is quietly accelerating" — with a human driving every step. Each turn is assembled from explicitly chosen controls: which model answers, which persona frames it, which AV data blocks get pasted into the prompt (positioning, inventory, money supply, market balance — only what you check), and whether the session remembers prior turns. Nothing is auto-fetched by a model deciding it's relevant. A session ends in a disposition: **promote** (it becomes a tracked event on the CATCOR timeline, hotlinked back to its research record, and gets its price reactions captured like any calendar event), **dismiss** (logged as noise, with a required reason), or **discard**.
 
@@ -130,8 +134,11 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
 | Event-window price reactions (XAG / XAU) | Yahoo Finance intraday (5-min bars) / daily close fallback | Per event |
 | International trade flow, HS 7106 (silver) / 7108 (gold) | U.S. Census Bureau International Trade API | Monthly, ~25-day gated |
 | OFAC sanctions designations (SDN + Consolidated, all programs, real designation dates) | Treasury OFAC Sanctions List Service (bulk Advanced XML) | Daily (slow tier) |
+| Bank registry (institutions, Fed district, regulator, holding company — full history) | FDIC BankFind Suite API | Weekly |
+| Rate transmission (IORB, EFFR, SOFR, prime, 30yr mortgage, card rate, bank credit) + SLOOS lending standards | FRED | Weekly |
+| Fed Board / Reserve Bank presidents / FOMC rotation | federalreserve.gov (hand-maintained seed, weekly roster drift check) | Weekly check |
 | Annual supply/demand balance | Silver Institute World Silver Survey (manually transcribed) | Annual |
-| Research tab chat backend | Anthropic Messages API / amp-forge LAN service | On-demand |
+| Research (CATCOR sub-pane) chat backend | Anthropic Messages API / amp-forge LAN service | On-demand |
 | COMEX rulebook (Ch. 112/113 — Last Trade Day rule) | CME Group, static reference PDFs | One-time reference |
 
 LME (London) requires a paid subscription and is not tracked. CME's per-contract-month open interest (Market Data Platform) is also paid and not integrated — the features that would need it are documented as permanently out of scope rather than approximated.

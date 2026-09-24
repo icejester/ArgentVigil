@@ -49,19 +49,15 @@ silently falls back to an empty string (`${FRED_API_KEY:-}` → `""`) rather
 than erroring — the container boots fine, and that source's fetch function
 just quietly no-ops (same "logs a skip message, rest of the app boots
 normally" behavior documented in CLAUDE.md's "Running it" section for a
-missing key locally). There is no check today that catches this at
-`vigil.sh up` time — a key silently missing for a `live`-mode
-environment is easy to miss until you notice a `source_health` row stuck
-in `error`/`skipped`.
+missing key locally).
 
-Practically: before running `vigil.sh up prod` (or any `live`-mode
-environment where you actually want real upstream data), confirm the
-invoking shell has the real keys exported — `env | grep -E
-'FRED_API_KEY|GAPI_API_KEY|CENSUS_API_KEY|ANTHROPIC_API_KEY'` — the same
-keys `.env.example` at the repo root documents. If you're running this
-from a fresh shell, a cron job, or CI, that environment needs its own way
-of exporting these before invoking the script; nothing in this framework
-does it for you.
+**`vigil.sh` now checks this for you**, and never prints a value, only whether each key is present:
+- `vigil.sh up <env>` reports, before building, which keys the invoking shell exports and which registered sources each missing key leaves without data. The list comes from `backend/sources.py`'s `requires_env`, so it can't drift from the app. `ANTHROPIC_API_KEY` counts as needed only when the environment's `AI_BACKEND=anthropic`.
+- After the containers start, `up` verifies the `api` (and, for `live`, `collector`) containers actually received each key (`test -n` inside the container).
+- `vigil.sh up <env> --require-keys` refuses to start if a needed key is missing. Use it for prod.
+- `vigil.sh keys <env>` runs the same report on demand without starting anything, plus the container check if that environment is already up.
+
+If you run this from a fresh shell, a cron job, or CI, that environment still needs its own way of exporting these (the same keys `.env.example` at the repo root documents); the check reports a gap, it doesn't fill it.
 
 ## Port bookkeeping
 

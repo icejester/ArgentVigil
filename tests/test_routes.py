@@ -113,6 +113,7 @@ async def test_config_status_reports_presence_not_values(client):
         assert isinstance(rows[var]["used_by"], list)
     # requires_env wiring surfaces in used_by, not hand-duplicated.
     assert "money_supply" in rows["FRED_API_KEY"]["used_by"]
+    assert "catcor_consensus_actuals" in rows["FRED_API_KEY"]["used_by"]  # ALFRED actuals
     assert "lbma_fix" in rows["GAPI_API_KEY"]["used_by"]
     # No real key value is ever echoed back.
     for var in ["FRED_API_KEY", "GAPI_API_KEY", "CENSUS_API_KEY", "ANTHROPIC_API_KEY"]:

@@ -1431,5 +1431,279 @@
         "note": "Upsert keyed by (cusip, auction_date), NOT append-only \u2014 see the table's own DDL comment in backend/db.py. A later fetch's real (non-null) value overwrites an earlier fetch's null via COALESCE; a real settled value is never reverted back to null by a subsequent fetch. Nulls over zeros throughout \u2014 an unsettled field stays NULL, never a fabricated 0."
       }
     ]
+  },
+  {
+    "key": "fed_transmission",
+    "label": "FRED \u2014 Rate Transmission Chain + SLOOS",
+    "origin": "FRED (St. Louis Fed) public API, same key and fred_observations table as the Money Supply sources. Money Management tab's Transmission Chain (money-management-spec.md Story #3): policy rate -> bank funding cost -> what borrowers pay -> did lending actually move. IORB (interest on reserve balances, daily, from 2021-07-29), EFFR and SOFR (realized overnight rates, daily), MPRIME (prime rate, monthly), MORTGAGE30US (30yr fixed, weekly), TERMCBCCALLNS (credit card plans, monthly), TOTBKCR (bank credit, weekly, billions USD). Plus a representative subset of the Senior Loan Officer Opinion Survey (SLOOS, quarterly): net % of banks tightening standards for C&I large/middle (DRTSCILM) and small firms (DRTSCIS), credit cards (DRTSCLCC), auto (STDSAUTO), other consumer (STDSOTHCONS \u2014 DRTSCLNG does not exist on FRED, confirmed live), CRE construction & land (SUBLPDRCSC), GSE-eligible mortgages (SUBLPDHMSENQ). Every series charted independently, never combined into a composite. Discount-window borrowing (WLCFLPCL) is shown on the same panel but fetched by the money_supply source, not this one. Per-district discount-window data is not available from FRED.",
+    "sourceKeys": [
+      "fed_transmission"
+    ],
+    "curl": "curl \"https://api.stlouisfed.org/fred/series/observations?series_id=IORB&api_key=$FRED_API_KEY&file_type=json&observation_start=2021-01-01\"",
+    "tables": [
+      {
+        "name": "fred_observations",
+        "fields": [
+          [
+            "series_id",
+            "FRED series id \u2014 one of the 14 transmission/SLOOS ids above (shared table with the Money Supply sources)."
+          ],
+          [
+            "date",
+            "Observation date (FRED's own; quarterly SLOOS dates are the quarter's first day)."
+          ],
+          [
+            "value",
+            "Native FRED value: percent for every rate and SLOOS series (SLOOS = net % tightening, negative = easing); TOTBKCR in billions USD. NULL where FRED reports '.'."
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "key": "bank_registry",
+    "label": "FDIC BankFind \u2014 Institution Registry",
+    "origin": "FDIC BankFind Suite REST API (api.fdic.gov/banks/institutions \u2014 the old banks.data.fdic.gov host 301s there), free, no key, no published rate limit. Money Management tab's Bank Lookup (money-management-spec.md Story #2). FULL history is persisted, active and inactive (merged/closed) institutions alike \u2014 ~27.8k rows confirmed live 2026-09-23 \u2014 regardless of what the UI shows (lookup defaults to active only). Fed district comes from FDIC's own native FED field (confirmed live, '01'..'12'), not derived or joined. Weekly full sync, ~3 pages of 10,000 rows, 3s apart; upsert keyed on FDIC certificate number. Size fields (total assets, deposits, equity capital) come from each institution's latest quarterly Call Report as FDIC reports it (REPDTE; 2026-06-30 for active banks at build time); for an inactive institution they're its LAST filing, not a current figure. Used to rank a district's banks by size in the Governance drilldown. Not a bank health/soundness screener \u2014 no ratings or scores of any kind.",
+    "sourceKeys": [
+      "bank_registry"
+    ],
+    "curl": "curl \"https://api.fdic.gov/banks/institutions?fields=CERT,NAME,FED,FED_RSSD,REGAGNT,BKCLASS,NAMEHCR,RSSDHCR,CITY,STALP,ACTIVE,ENDEFYMD,ASSET,DEP,EQ,REPDTE&limit=10000&offset=0&sort_by=CERT&sort_order=ASC\"",
+    "tables": [
+      {
+        "name": "bank_registry",
+        "fields": [
+          [
+            "cert",
+            "PK \u2014 FDIC certificate number (CERT)."
+          ],
+          [
+            "name",
+            "Institution legal name (NAME)."
+          ],
+          [
+            "fed_rssd",
+            "Federal Reserve RSSD id (FED_RSSD) \u2014 the Fed's own institution identifier."
+          ],
+          [
+            "charter_class",
+            "FDIC BKCLASS: N (national, OCC), SM (state member, Fed), NM (state non-member, FDIC), SB/SA (savings), etc. Fed membership is derived from this at read time (N or SM = member), never stored."
+          ],
+          [
+            "regulator",
+            "Primary federal regulator (REGAGNT): OCC / FED / FDIC / etc."
+          ],
+          [
+            "fed_district",
+            "Federal Reserve district 1\u201312 (FDIC's native FED field). NULL if FDIC reports none \u2014 never 0."
+          ],
+          [
+            "holding_company",
+            "Top holding company name (NAMEHCR), NULL if none."
+          ],
+          [
+            "holding_company_rssd",
+            "Top holding company RSSD id (RSSDHCR)."
+          ],
+          [
+            "city",
+            "City (CITY)."
+          ],
+          [
+            "state",
+            "State abbreviation (STALP)."
+          ],
+          [
+            "active",
+            "1 = currently active, 0 = inactive (merged, closed, or converted)."
+          ],
+          [
+            "inactive_date",
+            "Date the institution ceased (ENDEFYMD) for inactive rows; NULL for active ones (FDIC's 12/31/9999 sentinel is not persisted)."
+          ],
+          [
+            "total_assets_k",
+            "Total assets, thousands of USD (ASSET), latest Call Report. Converted to USD at read time. NULL if FDIC reports none."
+          ],
+          [
+            "deposits_k",
+            "Total deposits, thousands of USD (DEP)."
+          ],
+          [
+            "equity_k",
+            "Total equity capital, thousands of USD (EQ). Used, summed over member banks, as a rough proxy for the 'capital and surplus' that sets each member's Reserve Bank stock subscription."
+          ],
+          [
+            "financials_as_of",
+            "Call Report date the size fields are from (REPDTE)."
+          ],
+          [
+            "fetched_at",
+            "UTC timestamp of the sync that last wrote this row."
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "key": "fed_governance",
+    "label": "Federal Reserve \u2014 Governance (Board, Reserve Banks, FOMC)",
+    "origin": "Hand-maintained seed file seed_data/fed_governance.json, transcribed from federalreserve.gov (each governor's bio page for term dates; monetarypolicy/fomc.htm for the FOMC roster and rotation schedule) and reviewed by hand \u2014 there is no Fed API for this. Loaded replace-all into three tables on every run of the fed_governance_check source. That source also fetches federalreserve.gov's Board-members page weekly and compares its roster against the seed: a mismatch shows as an error on the health badge but never rewrites the seed. FOMC voting rotation is computed at read time from the statutory groups (NY permanent; Cleveland/Chicago alternate; the other three groups rotate on a 3-year cycle), never stored. Reserve Bank presidents flagged verified=false in the seed were not on the Fed's own FOMC page at review time.",
+    "sourceKeys": [
+      "fed_governance_check"
+    ],
+    "curl": "curl -A \"ArgentVigil/1.0\" \"https://www.federalreserve.gov/aboutthefed/bios/board/default.htm\"",
+    "tables": [
+      {
+        "name": "fed_board",
+        "fields": [
+          [
+            "name",
+            "PK \u2014 governor's name as shown on federalreserve.gov."
+          ],
+          [
+            "role",
+            "Chair / Vice Chair / Vice Chair for Supervision / Governor."
+          ],
+          [
+            "board_term_end",
+            "End of the 14-year Board seat term."
+          ],
+          [
+            "role_term_end",
+            "End of the 4-year leadership-role term (Chair/Vice Chair), NULL for plain governors or where not confirmed."
+          ],
+          [
+            "bio_slug",
+            "federalreserve.gov bio page slug \u2014 the key the weekly roster check compares on."
+          ],
+          [
+            "sort_order",
+            "Display order from the seed."
+          ]
+        ]
+      },
+      {
+        "name": "fed_reserve_banks",
+        "fields": [
+          [
+            "district",
+            "PK \u2014 district number 1\u201312."
+          ],
+          [
+            "city",
+            "Reserve Bank city."
+          ],
+          [
+            "president",
+            "Current president (or interim)."
+          ],
+          [
+            "president_title",
+            "President / Interim President."
+          ],
+          [
+            "verified",
+            "1 if confirmed against federalreserve.gov at the last review, 0 if carried from prior knowledge."
+          ]
+        ]
+      },
+      {
+        "name": "fed_governance_meta",
+        "fields": [
+          [
+            "id",
+            "Single row (1)."
+          ],
+          [
+            "reviewed_as_of",
+            "Date the seed was last reviewed by hand."
+          ],
+          [
+            "review_notes",
+            "Where each part of the seed came from."
+          ],
+          [
+            "rotation_json",
+            "The statutory FOMC rotation groups (input to the read-time voter calculation)."
+          ],
+          [
+            "loaded_at",
+            "When the seed was last loaded into these tables."
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "key": "fed_reserve_bank_h41",
+    "label": "FRED \u2014 Each Reserve Bank's H.4.1 Statement of Condition",
+    "origin": "FRED mirror of the Fed's weekly H.4.1 release, Table 6 (Statement of Condition of Each Federal Reserve Bank), Wednesday levels, millions of USD, all 12 districts from 2002-12-18 (confirmed live 2026-09-23). Five lines per district: total assets (D{n}WATAL), deposits held by depository institutions (H41RESPPLLDEF{nn}NWW \u2014 the reserve balances banks keep at THAT Reserve Bank), capital paid in (D{n}WCPIL \u2014 what member banks have paid for their Reserve Bank stock: by statute each member subscribes 6% of its capital and surplus and pays in half), surplus (D{n}WCSL), and Federal Reserve notes, net (D{n}WLNNBH). Money Management's Governance panel sets these next to the district's FDIC-reported bank totals. A Reserve Bank's total assets are mostly its allocated share of the System's national securities portfolio (SOMA), not something its member banks funded \u2014 the reserve-deposit and paid-in-capital lines are the real links. No current per-district loans/discount-window series exists (the old D{n}WALL line was discontinued 2020-03-11).",
+    "sourceKeys": [
+      "fed_reserve_bank_h41"
+    ],
+    "curl": "curl \"https://api.stlouisfed.org/fred/series/observations?series_id=D2WATAL&api_key=$FRED_API_KEY&file_type=json&sort_order=desc&limit=1\"",
+    "tables": [
+      {
+        "name": "fred_observations",
+        "fields": [
+          [
+            "series_id",
+            "One of the 60 per-district H.4.1 ids above (shared table)."
+          ],
+          [
+            "date",
+            "Wednesday of the statement week."
+          ],
+          [
+            "value",
+            "Millions of USD, FRED native; converted to USD at read time."
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "key": "bank_financials",
+    "label": "FDIC BankFind \u2014 Quarterly Call Report History",
+    "origin": "FDIC BankFind Suite's /banks/financials endpoint (api.fdic.gov), free, no key. Every FDIC-insured bank's quarterly Call Report totals from 2002 onward \u2014 deliberately not FDIC's full 1984+ depth: 2002 is when FRED's per-Reserve-Bank H.4.1 series begin, and the point of this history is to set banks' relative size beside the Fed's own district balance sheets. ~671k rows (~9.6k banks per quarter in 2002, ~4.3k now), fetched one request per quarter, 3s apart. FED (the Federal Reserve district) is reported PER FILING and kept per quarter \u2014 banks do move (confirmed live: Citibank, cert 7213, is District 2 in the 1980s and District 9 after relocating its main office to Sioux Falls) \u2014 so district history uses each quarter's own district, never today's. The first backfill (~10-15 min) runs as a detached background task so it can't stall the scheduler; later runs fetch only unpersisted quarters plus the latest two, since FDIC amends recent filings. Mergers appear as steps: an acquired bank's history ends under its own cert and the acquirer's assets jump.",
+    "sourceKeys": [
+      "bank_financials"
+    ],
+    "curl": "curl \"https://api.fdic.gov/banks/financials?filters=REPDTE:20260630&fields=CERT,REPDTE,FED,ASSET,DEP,EQ&limit=10000&offset=0&sort_by=CERT&sort_order=ASC\"",
+    "tables": [
+      {
+        "name": "bank_financials",
+        "fields": [
+          [
+            "cert",
+            "PK part \u2014 FDIC certificate number; joins bank_registry.cert."
+          ],
+          [
+            "repdte",
+            "PK part \u2014 Call Report quarter-end date (ISO)."
+          ],
+          [
+            "fed_district",
+            "Federal Reserve district AS OF THAT QUARTER (FDIC's FED on that filing). NULL if unreported, never 0."
+          ],
+          [
+            "total_assets_k",
+            "Total assets, thousands of USD (ASSET). Converted to USD at read time."
+          ],
+          [
+            "deposits_k",
+            "Total deposits, thousands of USD (DEP)."
+          ],
+          [
+            "equity_k",
+            "Total equity capital, thousands of USD (EQ)."
+          ],
+          [
+            "fetched_at",
+            "UTC timestamp of the sync that last wrote this row."
+          ]
+        ]
+      }
+    ]
   }
 ]

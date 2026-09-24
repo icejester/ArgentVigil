@@ -1065,3 +1065,16 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 
 .loading { color: #4a5268; padding: 40px 0; text-align: center; }
+
+/* Money Management: clickable names (Reserve Bank -> district screen,
+   bank -> bank screen). Text ink, not a series color; underline on hover. */
+.mm-link {
+  color: #e8ecf4;
+  text-decoration: underline;
+  text-decoration-color: #5a6278;
+  text-underline-offset: 2px;
+}
+tr:hover .mm-link,
+.mm-link:hover {
+  text-decoration-color: #e8ecf4;
+}
