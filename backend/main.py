@@ -17,6 +17,7 @@ from . import catcor_research
 from . import collector
 from . import db
 from . import delivery_behavior
+from . import fed_structure
 from . import models
 from . import sources
 from . import stack
@@ -39,9 +40,11 @@ from pipeline.config import (
     FRED_SERIES_DGS30,
     FRED_SERIES_M2,
     FRED_SERIES_RRPONTSYD,
+    FRED_SERIES_SLOOS,
     FRED_SERIES_T10Y2Y,
     FRED_SERIES_TIC_COUNTRIES,
     FRED_SERIES_TIC_GRAND_TOTAL,
+    FRED_SERIES_TRANSMISSION,
     FRED_SERIES_WALCL,
     FRED_SERIES_WLCFLPCL,
     FRED_SERIES_WRESBAL,
@@ -707,7 +710,7 @@ async def refresh_settings_post(body: dict = Body(...)):
     return {"success": True, "data": collector._refresh_settings}
 
 
-_VALID_NAV_SECTIONS = {"cot", "moneySupply", "inventory", "catcor", "research", "stack", "sanctions"}
+_VALID_NAV_SECTIONS = {"cot", "moneySupply", "moneyManagement", "inventory", "catcor", "stack", "sanctions"}
 # NB: "data" was removed when the Data tab moved into the Settings view (a
 # sibling of activeSection, not a nav section) — Settings is deliberately
 # not a pinnable default-landing tab. This set MUST stay in lockstep with
@@ -1034,6 +1037,109 @@ async def metals_prices_db(
             ],
         },
     }
+
+
+# --- Money Management (money-management-spec.md) --------------------------
+
+@api_router.get("/fred/transmission/db")
+async def fred_transmission_db(
+    window: str = Query("5y"),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    """Rate-transmission chain + SLOOS subset, raw per series (no composite,
+    no cross-series math). Same window/custom-range convention as
+    /fred/money-supply/db. WLCFLPCL is fetched by money_supply, read here;
+    it's native millions, converted to billions at read time."""
+    if window == "custom" and start:
+        since = start
+    else:
+        since = str(date.today() - timedelta(days=365 * FRED_WINDOW_YEARS.get(window, 5)))
+
+    def _read(series_id: str) -> list[dict]:
+        rows = db.get_fred_observations(series_id, since)
+        return [r for r in rows if end is None or r["date"] <= end]
+
+    series = {key: _read(sid) for key, sid in FRED_SERIES_TRANSMISSION.items()}
+    series["WLCFLPCL_BILLIONS"] = [
+        {"date": r["date"], "value": round(r["value"] / 1000, 3) if r["value"] is not None else None}
+        for r in _read(FRED_SERIES_WLCFLPCL)
+    ]
+    sloos = {label: _read(sid) for label, sid in FRED_SERIES_SLOOS.items()}
+    return {
+        "success": True,
+        "data": {
+            "series": series,
+            "sloos": sloos,
+            "sloos_ids": FRED_SERIES_SLOOS,
+        },
+    }
+
+
+@api_router.get("/bank-registry/db")
+async def bank_registry_db(
+    q: str = Query("", max_length=100),
+    active_only: bool = Query(True),
+    district: int | None = Query(None, ge=1, le=12),
+    limit: int = Query(50, ge=1, le=5000),
+):
+    """Name search, or — with `district` set — a whole district's banks
+    (Governance panel's click-a-district drilldown), in which case an empty
+    `q` is allowed. The 5000 cap covers the largest district's full history
+    (~4k rows); a bare name search still needs 2+ characters."""
+    q = q.strip()
+    if len(q) < 2 and district is None:
+        return {"success": True, "data": [], "total_registry_rows": db.get_bank_registry_count()}
+    return {
+        "success": True,
+        "data": db.search_bank_registry(q, active_only=active_only, district=district, limit=limit),
+        "total_registry_rows": db.get_bank_registry_count(),
+    }
+
+
+@api_router.get("/bank-registry/db/district-counts")
+async def bank_registry_district_counts_db():
+    return {"success": True, "data": db.get_bank_registry_district_counts()}
+
+
+@api_router.get("/bank-registry/db/top")
+async def bank_registry_top_db(n: int = Query(100, ge=1, le=500), members_only: bool = Query(True)):
+    """Bank Lookup's top-N pie: largest active banks by assets and the
+    population total they're a share of."""
+    return {"success": True, "data": db.get_top_banks(n, members_only)}
+
+
+@api_router.get("/bank-registry/db/bank/{cert}")
+async def bank_registry_bank_db(cert: int):
+    """Money Management's bank screen: one bank, its district rank/total, its
+    same-holding-company active siblings, and its Reserve Bank's balance sheet."""
+    bank = db.get_bank(cert)
+    if bank is None:
+        raise HTTPException(404, f"No bank with FDIC cert {cert}")
+    reserve_bank = None
+    if bank["fed_district"] is not None:
+        gov = fed_structure.governance_view()
+        reserve_bank = next((b for b in gov["reserve_banks"] if b["district"] == bank["fed_district"]), None)
+    return {"success": True, "data": {"bank": bank, "reserve_bank": reserve_bank}}
+
+
+@api_router.get("/bank-registry/db/bank/{cert}/history")
+async def bank_registry_bank_history_db(cert: int):
+    """Quarterly Call Report history (2002+) for one bank, with its as-of
+    district's total, its rank there, and its U.S. share/rank each quarter."""
+    return {"success": True, "data": db.get_bank_history(cert)}
+
+
+@api_router.get("/fed-districts/db/history/{district}")
+async def fed_district_history_db(district: int):
+    if not 1 <= district <= 12:
+        raise HTTPException(404, "district must be 1-12")
+    return {"success": True, "data": fed_structure.district_history(district)}
+
+
+@api_router.get("/fed-governance/db")
+async def fed_governance_db(year: int | None = Query(None, ge=1936, le=2100)):
+    return {"success": True, "data": fed_structure.governance_view(year)}
 
 
 @api_router.get("/fred/money-supply/db")

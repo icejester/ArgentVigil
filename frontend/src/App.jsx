@@ -4,6 +4,7 @@ import { PRICE_HISTORY_WINDOWS, PRICE_LIVE_POLL_MS } from "./date_utils";
 import SilverCoTTracker from "./silver_cot_tracker";
 import ComexInventoryDashboard from "./comex_inventory";
 import MoneySupply from "./money_supply";
+import MoneyManagement from "./money_management";
 import CatcorPanel from "./catcor_panel";
 import { computeStatus } from "./data_panel";
 import ResearchPanel from "./research_panel";
@@ -25,9 +26,9 @@ const SECTIONS = [
   { key: "cot", label: "Trading" },
   { key: "inventory", label: "Inventory" },
   { key: "moneySupply", label: "Money Supply" },
+  { key: "moneyManagement", label: "Money Management" },
   { key: "stack", label: "Stack" },
   { key: "catcor", label: "CATCOR" },
-  { key: "research", label: "Research" },
   { key: "sanctions", label: "OFAC" },
 ];
 
@@ -316,19 +317,20 @@ export default function App() {
   // nav-button click closes it by switching activeSection.
   const [showSettings, setShowSettings] = useState(false);
   // Cross-panel hotlink: CatcorPanel sets this when a promoted (Observed-
-  // origin) catalyst's dot is clicked, so the Research tab opens straight
-  // into that session's record instead of its own session list.
+  // origin) catalyst's dot is clicked, so the Research sub-pane (inside the
+  // CATCOR tab since the 2026-09-23 merge) opens straight into that
+  // session's record instead of its own session list.
   const [openResearchSessionId, setOpenResearchSessionId] = useState(null);
 
   function openResearchSession(sessionId) {
     setOpenResearchSessionId(sessionId);
-    setActiveSection("research");
+    setActiveSection("catcor");
     setShowSettings(false);
   }
 
   // A tab panel is visible only when it's the active section AND Settings
   // isn't covering the content area. `base` is the wrapper's own layout
-  // class ("app-shell" for most, "" for cot/research which don't use it).
+  // class ("app-shell" for most, "" for cot which doesn't use it).
   function sectionClass(key, base) {
     const visible = activeSection === key && !showSettings;
     return (base ? base + " " : "") + (visible ? "" : "section-hidden");
@@ -448,13 +450,16 @@ export default function App() {
       <div className={sectionClass("moneySupply", "app-shell")}>
         <MoneySupply />
       </div>
+      <div className={sectionClass("moneyManagement", "app-shell")}>
+        <MoneyManagement />
+      </div>
       <div className={sectionClass("inventory", "app-shell")}>
         <ComexInventoryDashboard />
       </div>
+      {/* CATCOR tab: Catalyst Correlation + the Research workbench as a
+          sub-pane (Research was its own nav tab until 2026-09-23). */}
       <div className={sectionClass("catcor", "app-shell")}>
         <CatcorPanel onOpenResearchSession={openResearchSession} />
-      </div>
-      <div className={sectionClass("research", "")}>
         <ResearchPanel
           openSessionId={openResearchSessionId}
           onOpenedSession={() => setOpenResearchSessionId(null)}

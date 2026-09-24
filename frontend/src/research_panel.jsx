@@ -65,6 +65,10 @@ export default function ResearchPanel({ openSessionId, onOpenedSession }) {
   const [sessions, setSessions] = useState([]);
   const [sessionsError, setSessionsError] = useState(null);
   const [activeSessionId, setActiveSessionId] = useState(null);
+  // Research is a sub-pane of the CATCOR tab (merged 2026-09-23, formerly
+  // its own nav tab). A hotlink from a CATCOR chart dot must re-open this
+  // pane if the user had collapsed it, and bring it into view.
+  const detailsRef = useRef(null);
 
   const refreshSessions = useCallback(() => {
     getJSON("/api/catcor/research/sessions/db")
@@ -94,14 +98,17 @@ export default function ResearchPanel({ openSessionId, onOpenedSession }) {
   useEffect(() => {
     if (openSessionId) {
       openSession(openSessionId);
+      if (detailsRef.current) {
+        detailsRef.current.open = true;
+        detailsRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
       onOpenedSession?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openSessionId]);
 
   return (
-    <div className="app-shell">
-      <details className="collapsible-pane" open>
+    <details className="collapsible-pane" open ref={detailsRef}>
         <summary className="collapsible-pane-title">
           <span>Research</span>
         </summary>
@@ -120,8 +127,7 @@ export default function ResearchPanel({ openSessionId, onOpenedSession }) {
           )}
           <ForgeSessionsPlaceholder />
         </div>
-      </details>
-    </div>
+    </details>
   );
 }
 

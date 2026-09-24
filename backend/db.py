@@ -579,6 +579,86 @@ CREATE TABLE IF NOT EXISTS ui_settings (
     pinned_section TEXT,
     refresh_enabled INTEGER
 );
+
+-- Money Management tab (money-management-spec.md Story #2). FDIC BankFind
+-- institutions, full history (active + inactive — ~27.8k rows confirmed live
+-- 2026-09-23). Upsert keyed on FDIC's own CERT number, since FDIC revises and
+-- re-labels institution records. fed_district is FDIC's native FED field
+-- ("01".."12" upstream, stored as INTEGER); NULL when absent, never 0.
+-- Fed membership is NOT stored — derived at read time from charter_class
+-- (BKCLASS: N = national, always a member; SM = state member).
+-- total_assets_k/deposits_k/equity_k are FDIC's native thousands of USD from
+-- the institution's latest Call Report (financials_as_of) — for an inactive
+-- institution that's its LAST filing, not a current figure.
+CREATE TABLE IF NOT EXISTS bank_registry (
+    cert INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    fed_rssd TEXT,
+    charter_class TEXT,
+    regulator TEXT,
+    fed_district INTEGER,
+    holding_company TEXT,
+    holding_company_rssd TEXT,
+    city TEXT,
+    state TEXT,
+    active INTEGER NOT NULL,
+    inactive_date TEXT,
+    total_assets_k REAL,
+    deposits_k REAL,
+    equity_k REAL,
+    financials_as_of TEXT,
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bank_registry_name ON bank_registry (name);
+
+-- Quarterly Call Report history per bank (FDIC BankFind /financials), 2002
+-- onward — the start of FRED's per-Reserve-Bank H.4.1 series, so every
+-- quarter here has Fed balance-sheet data to compare against. fed_district
+-- is the district AS OF THAT QUARTER (FDIC reports it per filing; banks do
+-- move — Citibank went NY -> Minneapolis), never back-filled from today's.
+-- Upsert: FDIC amends Call Reports. Thousands of USD, FDIC native.
+CREATE TABLE IF NOT EXISTS bank_financials (
+    cert INTEGER NOT NULL,
+    repdte TEXT NOT NULL,
+    fed_district INTEGER,
+    total_assets_k REAL,
+    deposits_k REAL,
+    equity_k REAL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (cert, repdte)
+);
+-- Covering index: per-quarter district/national sums and ranks never touch the table.
+CREATE INDEX IF NOT EXISTS idx_bank_financials_q_d_a ON bank_financials (repdte, fed_district, total_assets_k);
+
+-- Money Management governance reference data (Story #1) — loaded
+-- idempotently from seed_data/fed_governance.json (replace-all on every
+-- load; the seed file is the record, these tables are its queryable copy).
+-- FOMC rotation is NOT stored — computed at read time from the seed's
+-- rotation groups (backend/fed_structure.py).
+CREATE TABLE IF NOT EXISTS fed_board (
+    name TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    board_term_end TEXT,
+    role_term_end TEXT,
+    bio_slug TEXT,
+    sort_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fed_reserve_banks (
+    district INTEGER PRIMARY KEY,
+    city TEXT NOT NULL,
+    president TEXT,
+    president_title TEXT,
+    verified INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS fed_governance_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    reviewed_as_of TEXT,
+    review_notes TEXT,
+    rotation_json TEXT,
+    loaded_at TEXT
+);
 """
 
 
@@ -706,6 +786,18 @@ def init_db():
             conn.execute("ALTER TABLE ofac_designations ADD COLUMN legal_basis TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+        # bank_registry size fields (Money Management district drilldown,
+        # 2026-09-23) — added after the table first shipped.
+        for stmt in (
+            "ALTER TABLE bank_registry ADD COLUMN total_assets_k REAL",
+            "ALTER TABLE bank_registry ADD COLUMN deposits_k REAL",
+            "ALTER TABLE bank_registry ADD COLUMN equity_k REAL",
+            "ALTER TABLE bank_registry ADD COLUMN financials_as_of TEXT",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 def upsert_aggregate_rows(rows: list[dict]):
@@ -2530,3 +2622,352 @@ def discard_research_session(session_id: str):
     with get_conn() as conn:
         conn.execute("DELETE FROM research_messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM research_sessions WHERE session_id = ?", (session_id,))
+
+
+# --- Money Management (money-management-spec.md) --------------------------
+
+_FED_MEMBER_CLASSES = {"N", "SM"}
+
+
+def upsert_bank_registry(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO bank_registry
+                 (cert, name, fed_rssd, charter_class, regulator, fed_district,
+                  holding_company, holding_company_rssd, city, state, active,
+                  inactive_date, total_assets_k, deposits_k, equity_k, financials_as_of, fetched_at)
+               VALUES (:cert, :name, :fed_rssd, :charter_class, :regulator, :fed_district,
+                       :holding_company, :holding_company_rssd, :city, :state, :active,
+                       :inactive_date, :total_assets_k, :deposits_k, :equity_k, :financials_as_of, :fetched_at)
+               ON CONFLICT(cert) DO UPDATE SET
+                 name=excluded.name, fed_rssd=excluded.fed_rssd,
+                 charter_class=excluded.charter_class, regulator=excluded.regulator,
+                 fed_district=excluded.fed_district, holding_company=excluded.holding_company,
+                 holding_company_rssd=excluded.holding_company_rssd, city=excluded.city,
+                 state=excluded.state, active=excluded.active,
+                 inactive_date=excluded.inactive_date, total_assets_k=excluded.total_assets_k,
+                 deposits_k=excluded.deposits_k, equity_k=excluded.equity_k,
+                 financials_as_of=excluded.financials_as_of, fetched_at=excluded.fetched_at""",
+            rows,
+        )
+
+
+def _bank_row(r) -> dict:
+    d = dict(r)
+    # FDIC thousands -> USD at read time; NULL stays NULL.
+    for src, dst in (("total_assets_k", "total_assets"), ("deposits_k", "deposits"), ("equity_k", "equity")):
+        v = d.pop(src, None)
+        d[dst] = v * 1000 if v is not None else None
+    d["active"] = bool(d["active"])
+    cls = d.get("charter_class")
+    # Derived at read time, never stored (Cross-cutting convention). NULL when
+    # the charter class itself is unknown, rather than guessing "not a member".
+    d["fed_member"] = None if cls is None else cls in _FED_MEMBER_CLASSES
+    return d
+
+
+def search_bank_registry(q: str, active_only: bool = True, district: int | None = None, limit: int = 50) -> list[dict]:
+    clauses, params = ["name LIKE ?"], [f"%{q}%"]
+    if active_only:
+        clauses.append("active = 1")
+    if district is not None:
+        clauses.append("fed_district = ?")
+        params.append(district)
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT cert, name, fed_rssd, charter_class, regulator, fed_district,
+                       holding_company, holding_company_rssd, city, state, active, inactive_date,
+                       total_assets_k, deposits_k, equity_k, financials_as_of
+                FROM bank_registry WHERE {' AND '.join(clauses)}
+                ORDER BY active DESC, name LIMIT ?""",
+            params,
+        ).fetchall()
+    return [_bank_row(r) for r in rows]
+
+
+def get_bank_registry_district_counts() -> dict[int, dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT fed_district,
+                      SUM(active) AS active_count,
+                      SUM(CASE WHEN active = 1 AND charter_class IN ('N','SM') THEN 1 ELSE 0 END) AS member_count,
+                      COUNT(*) AS total_count,
+                      SUM(CASE WHEN active = 1 THEN total_assets_k END) AS assets_k,
+                      SUM(CASE WHEN active = 1 THEN deposits_k END) AS deposits_k,
+                      SUM(CASE WHEN active = 1 AND charter_class IN ('N','SM') THEN total_assets_k END) AS member_assets_k,
+                      SUM(CASE WHEN active = 1 AND charter_class IN ('N','SM') THEN equity_k END) AS member_equity_k,
+                      SUM(CASE WHEN active = 1 AND total_assets_k IS NOT NULL THEN 1 ELSE 0 END) AS sized_count,
+                      MAX(CASE WHEN active = 1 THEN financials_as_of END) AS financials_as_of
+               FROM bank_registry WHERE fed_district IS NOT NULL
+               GROUP BY fed_district"""
+        ).fetchall()
+
+    def _usd(k):
+        return k * 1000 if k is not None else None
+
+    return {
+        r["fed_district"]: {
+            "active": r["active_count"],
+            "active_members": r["member_count"],
+            "all_time": r["total_count"],
+            # Sums over ACTIVE banks with a reported figure only — sized_count
+            # says how many that is, so a partial sum never masquerades as total.
+            "active_assets": _usd(r["assets_k"]),
+            "active_deposits": _usd(r["deposits_k"]),
+            "member_assets": _usd(r["member_assets_k"]),
+            "member_equity": _usd(r["member_equity_k"]),
+            "sized_count": r["sized_count"],
+            "financials_as_of": r["financials_as_of"],
+        }
+        for r in rows
+    }
+
+
+def get_bank_registry_count() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM bank_registry").fetchone()[0]
+
+
+def replace_fed_governance(board: list[dict], banks: list[dict], meta: dict):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM fed_board")
+        conn.execute("DELETE FROM fed_reserve_banks")
+        conn.executemany(
+            """INSERT INTO fed_board (name, role, board_term_end, role_term_end, bio_slug, sort_order)
+               VALUES (:name, :role, :board_term_end, :role_term_end, :bio_slug, :sort_order)""",
+            board,
+        )
+        conn.executemany(
+            """INSERT INTO fed_reserve_banks (district, city, president, president_title, verified)
+               VALUES (:district, :city, :president, :president_title, :verified)""",
+            banks,
+        )
+        conn.execute(
+            """INSERT INTO fed_governance_meta (id, reviewed_as_of, review_notes, rotation_json, loaded_at)
+               VALUES (1, :reviewed_as_of, :review_notes, :rotation_json, :loaded_at)
+               ON CONFLICT(id) DO UPDATE SET reviewed_as_of=excluded.reviewed_as_of,
+                 review_notes=excluded.review_notes, rotation_json=excluded.rotation_json,
+                 loaded_at=excluded.loaded_at""",
+            meta,
+        )
+
+
+def get_fed_governance() -> dict | None:
+    with get_conn() as conn:
+        meta = conn.execute("SELECT * FROM fed_governance_meta WHERE id = 1").fetchone()
+        if meta is None:
+            return None
+        board = conn.execute("SELECT name, role, board_term_end, role_term_end, bio_slug FROM fed_board ORDER BY sort_order").fetchall()
+        banks = conn.execute("SELECT district, city, president, president_title, verified FROM fed_reserve_banks ORDER BY district").fetchall()
+    return {
+        "meta": dict(meta),
+        "board": [dict(r) for r in board],
+        "reserve_banks": [{**dict(r), "verified": bool(r["verified"])} for r in banks],
+    }
+
+
+def get_bank(cert: int) -> dict | None:
+    """One bank plus its size rank among its district's ACTIVE sized banks
+    (computed at read time). rank/district_* are NULL for an inactive or
+    unsized bank, or one with no district — never a manufactured rank."""
+    with get_conn() as conn:
+        r = conn.execute(
+            """SELECT cert, name, fed_rssd, charter_class, regulator, fed_district,
+                      holding_company, holding_company_rssd, city, state, active, inactive_date,
+                      total_assets_k, deposits_k, equity_k, financials_as_of
+               FROM bank_registry WHERE cert = ?""",
+            (cert,),
+        ).fetchone()
+        if r is None:
+            return None
+        bank = _bank_row(r)
+        rank = district_count = district_assets_k = None
+        if r["fed_district"] is not None:
+            agg = conn.execute(
+                """SELECT COUNT(*) AS n, SUM(total_assets_k) AS assets
+                   FROM bank_registry
+                   WHERE fed_district = ? AND active = 1 AND total_assets_k IS NOT NULL""",
+                (r["fed_district"],),
+            ).fetchone()
+            district_count, district_assets_k = agg["n"], agg["assets"]
+            if r["active"] == 1 and r["total_assets_k"] is not None:
+                rank = 1 + conn.execute(
+                    """SELECT COUNT(*) FROM bank_registry
+                       WHERE fed_district = ? AND active = 1 AND total_assets_k > ?""",
+                    (r["fed_district"], r["total_assets_k"]),
+                ).fetchone()[0]
+        holding_peers = []
+        if r["holding_company_rssd"]:
+            holding_peers = [
+                _bank_row(p) for p in conn.execute(
+                    """SELECT cert, name, fed_rssd, charter_class, regulator, fed_district,
+                              holding_company, holding_company_rssd, city, state, active, inactive_date,
+                              total_assets_k, deposits_k, equity_k, financials_as_of
+                       FROM bank_registry
+                       WHERE holding_company_rssd = ? AND cert != ? AND active = 1
+                       ORDER BY total_assets_k DESC""",
+                    (r["holding_company_rssd"], cert),
+                ).fetchall()
+            ]
+    bank["district_rank"] = rank
+    bank["district_active_sized_count"] = district_count
+    bank["district_active_assets"] = district_assets_k * 1000 if district_assets_k is not None else None
+    bank["holding_company_peers"] = holding_peers
+    return bank
+
+
+
+# --- Bank financials history (quarterly, 2002+) -----------------------------
+
+def upsert_bank_financials(rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO bank_financials (cert, repdte, fed_district, total_assets_k, deposits_k, equity_k, fetched_at)
+               VALUES (:cert, :repdte, :fed_district, :total_assets_k, :deposits_k, :equity_k, :fetched_at)
+               ON CONFLICT(cert, repdte) DO UPDATE SET
+                 fed_district=excluded.fed_district, total_assets_k=excluded.total_assets_k,
+                 deposits_k=excluded.deposits_k, equity_k=excluded.equity_k, fetched_at=excluded.fetched_at""",
+            rows,
+        )
+
+
+def get_bank_financials_quarter_counts() -> dict[str, int]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT repdte, COUNT(*) AS n FROM bank_financials GROUP BY repdte").fetchall()
+    return {r["repdte"]: r["n"] for r in rows}
+
+
+def get_district_quarter_totals() -> list[dict]:
+    """Per quarter x as-of district: summed bank assets (USD) and bank count.
+    Banks with no district that quarter are kept under district NULL so the
+    national total stays complete."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT repdte, fed_district, SUM(total_assets_k) AS assets_k,
+                      SUM(CASE WHEN total_assets_k IS NOT NULL THEN 1 ELSE 0 END) AS n
+               FROM bank_financials GROUP BY repdte, fed_district ORDER BY repdte"""
+        ).fetchall()
+    return [
+        {"repdte": r["repdte"], "district": r["fed_district"],
+         "assets": r["assets_k"] * 1000 if r["assets_k"] is not None else None, "count": r["n"]}
+        for r in rows
+    ]
+
+
+def get_district_top_n_share(district: int, n: int = 10) -> dict[str, float]:
+    """Per quarter: summed assets (USD) of the district's n largest banks
+    that quarter (as-of district)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT repdte, SUM(a) AS top_k FROM (
+                   SELECT repdte, total_assets_k AS a,
+                          ROW_NUMBER() OVER (PARTITION BY repdte ORDER BY total_assets_k DESC) AS rn
+                   FROM bank_financials
+                   WHERE fed_district = ? AND total_assets_k IS NOT NULL
+               ) WHERE rn <= ? GROUP BY repdte""",
+            (district, n),
+        ).fetchall()
+    return {r["repdte"]: r["top_k"] * 1000 for r in rows}
+
+
+def get_district_top_banks_latest(district: int, n: int) -> list[dict]:
+    """The district's n largest banks in the latest persisted quarter."""
+    with get_conn() as conn:
+        latest = conn.execute(
+            "SELECT MAX(repdte) FROM bank_financials WHERE fed_district = ?", (district,)
+        ).fetchone()[0]
+        if latest is None:
+            return []
+        rows = conn.execute(
+            """SELECT f.cert, COALESCE(r.name, 'FDIC cert ' || f.cert) AS name
+               FROM bank_financials f LEFT JOIN bank_registry r ON r.cert = f.cert
+               WHERE f.repdte = ? AND f.fed_district = ? AND f.total_assets_k IS NOT NULL
+               ORDER BY f.total_assets_k DESC LIMIT ?""",
+            (latest, district, n),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_bank_assets_in_district(certs: list[int], district: int) -> list[dict]:
+    if not certs:
+        return []
+    marks = ",".join("?" * len(certs))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT cert, repdte, total_assets_k FROM bank_financials
+                WHERE fed_district = ? AND cert IN ({marks}) AND total_assets_k IS NOT NULL""",
+            [district, *certs],
+        ).fetchall()
+    return [{"cert": r["cert"], "repdte": r["repdte"], "assets": r["total_assets_k"] * 1000} for r in rows]
+
+
+def get_bank_history(cert: int) -> list[dict]:
+    """One bank's quarters, each with its as-of district, that district's
+    total and the bank's rank in it, plus U.S. total and national rank —
+    all computed at read time from bank_financials."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """WITH b AS (SELECT * FROM bank_financials WHERE cert = ?)
+               SELECT b.repdte, b.fed_district, b.total_assets_k, b.deposits_k, b.equity_k,
+                      (SELECT SUM(total_assets_k) FROM bank_financials x
+                        WHERE x.repdte = b.repdte AND x.fed_district = b.fed_district) AS district_k,
+                      (SELECT COUNT(*) FROM bank_financials x
+                        WHERE x.repdte = b.repdte AND x.fed_district = b.fed_district
+                          AND x.total_assets_k IS NOT NULL) AS district_n,
+                      (SELECT COUNT(*) FROM bank_financials x
+                        WHERE x.repdte = b.repdte AND x.fed_district = b.fed_district
+                          AND x.total_assets_k > b.total_assets_k) AS district_ahead,
+                      (SELECT SUM(total_assets_k) FROM bank_financials x WHERE x.repdte = b.repdte) AS us_k,
+                      (SELECT COUNT(*) FROM bank_financials x
+                        WHERE x.repdte = b.repdte AND x.total_assets_k > b.total_assets_k) AS us_ahead
+               FROM b ORDER BY b.repdte""",
+            (cert,),
+        ).fetchall()
+
+    def usd(k):
+        return k * 1000 if k is not None else None
+
+    out = []
+    for r in rows:
+        sized = r["total_assets_k"] is not None
+        out.append({
+            "date": r["repdte"],
+            "fed_district": r["fed_district"],
+            "total_assets": usd(r["total_assets_k"]),
+            "deposits": usd(r["deposits_k"]),
+            "equity": usd(r["equity_k"]),
+            "district_assets": usd(r["district_k"]) if r["fed_district"] is not None else None,
+            "district_count": r["district_n"] if r["fed_district"] is not None else None,
+            "district_rank": r["district_ahead"] + 1 if sized and r["fed_district"] is not None else None,
+            "us_assets": usd(r["us_k"]),
+            "us_rank": r["us_ahead"] + 1 if sized else None,
+        })
+    return out
+
+
+
+def get_top_banks(n: int = 100, members_only: bool = True) -> dict:
+    """The n largest ACTIVE banks by total assets (latest Call Report), plus
+    the population they're a share of: all active sized banks, or only Fed
+    members (national + state member banks) when members_only."""
+    where = "active = 1 AND total_assets_k IS NOT NULL"
+    if members_only:
+        where += " AND charter_class IN ('N','SM')"
+    with get_conn() as conn:
+        agg = conn.execute(f"SELECT COUNT(*) AS c, SUM(total_assets_k) AS a, MAX(financials_as_of) AS asof FROM bank_registry WHERE {where}").fetchone()
+        rows = conn.execute(
+            f"""SELECT cert, name, fed_rssd, charter_class, regulator, fed_district,
+                       holding_company, holding_company_rssd, city, state, active, inactive_date,
+                       total_assets_k, deposits_k, equity_k, financials_as_of
+                FROM bank_registry WHERE {where}
+                ORDER BY total_assets_k DESC LIMIT ?""",
+            (n,),
+        ).fetchall()
+    return {
+        "banks": [_bank_row(r) for r in rows],
+        "population_count": agg["c"],
+        "population_assets": agg["a"] * 1000 if agg["a"] is not None else None,
+        "financials_as_of": agg["asof"],
+        "members_only": members_only,
+    }

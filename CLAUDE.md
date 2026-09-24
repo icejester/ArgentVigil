@@ -1,8 +1,8 @@
-# ArgentVigil v2.28.0
+# ArgentVigil v2.29.0
 
 Silver speculative-positioning monitor with gold as comparative context. Framing is **"selling dollars, not buying metals"** — is the speculative futures crowd genuinely capitulated, or just pulling back. Not a trading system: no price targets, no prediction framing, no risk-tolerance commentary. `SPEC.MD` is a retired holdover from an earlier one-big-file era (it once covered the Stock & Flow panel spec and CATCOR feature map together) — **do not reference it**; that content now lives inline in this doc's own Tab: Inventory and Tab: CATCOR sections below, following the same one-spec-file-per-feature convention as everything else. Companion spec docs are **ephemeral story documents** — gitignored, local-only, closed-JIRA-ticket semantics: written to drive one development effort, deletable (and mostly deleted) once their stories land. Specs referenced by name throughout this doc (`deliveryBehavior-spec.md`, `dataHealth-spec.md`, `international-trade-spec.md`, `fed-balance-spec.md`, `price-spec.md`, `catcor-events-spec.md`, `squeeze-context-spec.md`, `datasources-spec.md`) may therefore no longer exist on disk — **this doc is the durable record**; a missing spec file is not missing information, never block on reading one, and never treat a still-present spec as more current than this doc (a landed spec's text is frozen at landing time). In-flight or recently-landed specs live in `specs/`. `frontend/docs/UI_STANDARDS.md` (checked in, not gitignored) covers cross-cutting interactive-UI conventions (legends, tooltips, color coding, sizing — check new interactive elements against it before inventing a new pattern); `README.md` covers the user-facing feature/data-source overview.
 
-This doc is organized **by app tab** — the seven nav sections below match `frontend/src/App.jsx`'s nav bar (the doc section order below is a stable reading order and does **not** track the nav bar's display order, which the user reorders freely; nav bar as of v2.17.0: Trading, Inventory, Money Supply, Stack, CATCOR, Research, OFAC). CoT's nav label is **"Trading"**, `key: "cot"` — renamed from "CoT" at the user's request; this doc's `## Tab: CoT` heading and internal cross-references keep the "CoT" name since that's still the underlying data/module naming (`silver_cot_tracker.jsx`, `cot_silver`/`cot_gold` tables, `/api/cot/db`) — same doc-heading-vs-display-label split Money Supply's tab already has ("Money Supply" in nav, "Dollars and Sense" as the in-panel title). Plus a **Settings** view (⚙️ gear icon in the header, not a nav tab — holds what used to be the "Data" tab, see `## Settings` below). Each section covers that tab's frontend component(s), the backend routes/modules feeding it, its SQLite tables, and its known gaps/scope boundaries together, so you don't have to cross-reference three different doc sections to understand one panel end-to-end. Cross-cutting stuff that doesn't belong to one tab (repo layout, conventions, running the app) lives in its own sections at the end.
+This doc is organized **by app tab** — the seven nav sections match `frontend/src/App.jsx`'s nav bar (the doc section order below is a stable reading order and does **not** track the nav bar's display order, which the user reorders freely; nav bar as of v2.29.0: Trading, Inventory, Money Supply, Money Management, Stack, CATCOR, OFAC — Research stopped being its own nav tab in v2.29.0 and is now a sub-pane of CATCOR; this doc keeps its `## Tab: Research` section as a stable reading unit). CoT's nav label is **"Trading"**, `key: "cot"` — renamed from "CoT" at the user's request; this doc's `## Tab: CoT` heading and internal cross-references keep the "CoT" name since that's still the underlying data/module naming (`silver_cot_tracker.jsx`, `cot_silver`/`cot_gold` tables, `/api/cot/db`) — same doc-heading-vs-display-label split Money Supply's tab already has ("Money Supply" in nav, "Dollars and Sense" as the in-panel title). Plus a **Settings** view (⚙️ gear icon in the header, not a nav tab — holds what used to be the "Data" tab, see `## Settings` below). Each section covers that tab's frontend component(s), the backend routes/modules feeding it, its SQLite tables, and its known gaps/scope boundaries together, so you don't have to cross-reference three different doc sections to understand one panel end-to-end. Cross-cutting stuff that doesn't belong to one tab (repo layout, conventions, running the app) lives in its own sections at the end.
 
 ## Standing architectural rules (apply to every tab below)
 
@@ -218,6 +218,109 @@ An overlay, not a new sub-panel: vertical event markers for OFAC sanctions desig
 
 ---
 
+## Tab: Money Management
+
+**Frontend**: `frontend/src/money_management.jsx`. **Backend**: `backend/fed_structure.py` (pure logic), `backend/collector.py`'s `_fetch_and_persist_fed_transmission`/`_fetch_and_persist_bank_registry`/`_fetch_and_persist_fed_governance_check`, `backend/main.py`'s `/fred/transmission/db`, `/bank-registry/db*`, `/fed-governance/db` routes, `seed_data/fed_governance.json`. Built v2.29.0 from `specs/money-management-spec.md`. Nav position: right after Money Supply, before Stack (user's placement).
+
+### Money Management: what it does
+
+Line of sight into how the Federal Reserve is structured and how that structure reaches ordinary banks. Three layers, kept visually distinct on purpose: **governance** (who the Fed is), **bank registry** (which district a bank sits in), and the **transmission chain** (how the policy rate reaches borrowers). Not a bank soundness screener, not a composite "policy stance" score, no alerting, US Fed only. The spec's open questions were resolved as: registry source = FDIC BankFind; registry scope = full history; SLOOS = representative subset; governance = hand-maintained seed plus a light scrape check.
+
+**In-tab screens (v2.29.0 follow-up)**: the tab has three screens, overview → district → bank. There's no router, so a screen is plain state in `MoneyManagement` (`screen.kind`). The overview stays **mounted but hidden** while a detail screen is open, so Bank Lookup's search text survives going back. Breadcrumbs and an "← Overview" button handle navigation.
+- Clicking a Reserve Bank row opens **`DistrictScreen`**: header (president, FOMC status), `DistrictComparison` cards, then an `AssetPie` of the district's bank assets (top 7 banks named, the rest folded into gray "Other"; filters apply) beside the `SizeProfile`, then the full sortable `BankTable`.
+- Clicking a bank (pie slice or legend row, district table row, Bank Lookup result, holding-company sibling) opens **`BankScreen`**, backed by `GET /api/bank-registry/db/bank/{cert}` (`db.get_bank`). It shows:
+  - assets/deposits/equity cards, and the bank's district rank among active sized banks (computed at read time; NULL for inactive or unsized banks, never manufactured)
+  - share of district assets, and a scale-only "size vs. Reserve Bank" figure (e.g. Citibank ≈32× Minneapolis's balance sheet)
+  - a two-slice pie (this bank vs. the rest of its district)
+  - charter/oversight details, and the other active banks under the same holding company
+
+  Per the user's call, the pie compares the bank to the rest of its district, the Reserve Bank's territory, **not** to the Reserve Bank's balance sheet. A bank's assets aren't a part of that balance sheet and can exceed it many times over, so that comparison is shown only as a ratio card.
+- **Pie palette** (`palette.js`'s `MM_PIE_COLORS`/`MM_PIE_OTHER_COLOR`/`MM_SURFACE`): the dataviz skill's reference dark palette, validated with its `validate_palette.js` against this app's actual `#141820` panel surface. Every check passes (adjacent-pair CVD ΔE 8.4, normal-vision 19.3); the first two slots also pass all-pairs.
+  - The app's older `VAULT_COLORS`/`MONEY_MGMT_COLORS` set **fails** that validator on this surface (lightness band; blue↔violet CVD ΔE 5.2), so it was deliberately not reused for pies.
+  - Mark specs: 2px surface-colored ring between slices, percent labels only on slices ≥4%, a full legend with $ and %, and a hover tooltip.
+  - Clickable names use `.mm-link` (text ink plus underline, never a series color).
+
+**Over time, 2002–now (v2.29.0 follow-up)**: quarterly bank Call Reports laid against each Reserve Bank's own weekly H.4.1 statement, so banks' relative size can be watched against the Fed's district balance sheets.
+- **Data**: `bank_financials` (FDIC `/banks/financials`, `(cert, repdte)` upsert, about 671k rows since 2002). 2002 is deliberate, not FDIC's full 1984+ depth: it's when FRED's per-district H.4.1 series begin.
+  - `fed_district` is **as of that quarter**. FDIC reports FED per filing; confirmed live, Citibank is District 2 through the 1980s and District 9 after moving to Sioux Falls. History never uses today's district.
+  - `fed_reserve_bank_h41` now pulls each series' full 2002+ history the first time it sees it, then only the trailing 3 years.
+- **The backfill runs detached.** `_schedule_loop` awaits fetch_fns one at a time, so a ~10–15 min, ~98-request backfill inline would stall every source, including `catcor_snapshot`, whose missed windows are permanent loss.
+  - `_fetch_and_persist_bank_financials` only starts `_bank_financials_sync` as an `asyncio` task (one per process), and the task records its own health (`self_recording=True`).
+  - Later runs fetch only unpersisted quarters plus the latest two, which FDIC amends.
+  - Don't trigger it from the api process while the collector is also running it: the guard is per process, so two concurrent syncs would double the request rate.
+- **Alignment**: each quarter-end takes the latest H.4.1 Wednesday on or before it (the *as-of* nearest-date variant). Quarters before a series' first observation are NULL, never filled. A System total, and so the Reserve Bank shares, needs all 12 Reserve Banks that quarter.
+- **Views** (all computed at read time; one y-axis per chart, and different scales get separate charts):
+  - **District screen** (`GET /api/fed-districts/db/history/{district}`):
+    - "Share of the country vs. share of the Fed": the district's share of U.S. bank assets (`us_bank_share`) vs. its Reserve Bank's share of the System's assets (`system_share`), from `fed_structure.districts_history()`. This was a 12-chart panel on the overview; it moved here at the user's request, and the all-districts route was dropped.
+    - district bank assets
+    - the Reserve Bank's assets vs. the reserves held there
+    - top-10 concentration
+    - a 100% stacked area of today's top 7 banks' share per quarter, plus "Other". A 0 band is a real zero: the bank wasn't in the district that quarter.
+  - **Bank screen** (`GET /api/bank-registry/db/bank/{cert}/history`, `db.get_bank_history`): total assets, plus share of its as-of district and of the U.S. District rank and U.S. rank are in the tooltip; dashed markers show district moves.
+- Mergers show as steps: an acquired bank's history ends under its own cert. No merger-event markers yet (FDIC's institution-history endpoint would supply them).
+
+**Panel structure**: plain non-collapsible `comex-panel` header ("Money Management", 2Y/5Y/10Y/20Y/Custom window + 📌 clear button), then three collapsible sub-panels, each with its own `ChartStaleness` badge:
+
+- **Reserve Banks & {year} FOMC votes** (its own collapsible section, split out of Governance at the user's request; `ReserveBanksPanel`):
+  - A pie of each Reserve Bank's **share of the Federal Reserve System**, from the 12 banks' latest H.4.1 lines, with a measure toggle: **Total assets** (default) or **Reserves held**.
+  - 12 entities vs. 8 validated hues: the 8 largest by total assets get hues and the 4 smallest each get their own neutral-gray slice. Colors are fixed per Reserve Bank from the total-assets ranking, so the toggle never repaints a bank.
+  - No share is shown unless all 12 have a figure.
+  - Below it is the Reserve Bank table (now with a Share of System column; bold = this year's FOMC voter). Slices, legend and rows open the district screen.
+- **Governance** (`fed_governance_check`): now the Board of Governors only. The original description follows: a Board of Governors table (role, role-term end, 14-year seat end); a table of the 12 Reserve Banks with president, this year's FOMC status (permanent / rotating voter / alternate), and active-bank and Fed-member counts joined in from the bank registry; and a "reviewed as of" caption. **Clicking a district row opens its district screen** (see In-tab screens above; banks fetched on open via `GET /api/bank-registry/db?district=N&limit=5000`, which allows an empty `q` when `district` is set; client-side filter box plus Active-only and Fed-members-only toggles; the same `BankTable` component Bank Lookup uses, minus the district column). Each district's drilldown also carries a **size comparison**:
+  - `DistrictComparison` shows the Reserve Bank's own H.4.1 balance sheet (total assets, reserves banks hold there, paid-in capital, surplus, Fed notes, from `fed_reserve_bank_h41`) against the district's summed FDIC bank assets and member-bank equity.
+  - `sizeProfile` shows largest, median and smallest bank, top-10 share, and a tier table at the regulatory lines $10B/$100B/$250B plus $1B.
+  - `BankTable` gains total assets, share of district, deposits and equity columns. Every column sorts; the drilldown defaults to assets descending, and NULLs always sort last.
+  - The two new Governance table columns are Reserve Bank assets and District bank assets.
+
+  Presidents marked † (`verified=false` in the seed) were not on the Fed's own FOMC page at review time (Boston, St. Louis, Kansas City on 2026-09-23, since they are neither 2026 voters nor alternates) and are carried from prior knowledge.
+- **Bank Lookup** (`bank_registry`): leads with **`TopBanksPie`**, the top 10 active banks by assets (the user first got a top-100 version, then clarified they meant top 10) (`GET /api/bank-registry/db/top?n=&members_only=`, `db.get_top_banks`). A toggle switches between Fed members (default: national plus state member banks, the banks holding Reserve Bank stock) and all FDIC-insured banks.
+  - #1–#8 get the 8 validated series hues (red added as slot 8, re-validated on `#141820`). #9–#10 each get their own slice in one neutral gray (never extra hues), and the rest of the population is a darker gray `MM_PIE_REST_COLOR` (see the palette note for its contrast WARN and relief). District pies and the history stack now name 8 banks for the same reason.
+  - A ranked table sits beside the pie (share and cumulative share). Slices, legend rows and table rows open the bank screen.
+- **Bank Lookup** (continued): a debounced name search (2+ characters), a district filter, and an "Active only" checkbox (default on). The results table shows district, regulator, Fed member Y/N, holding company, location, and status, capped at 100 rows with a scrolling sticky header. Nulls render as "—".
+- **Transmission Chain** (`fed_transmission` + `money_supply`): five independent small-multiple line charts, each on its own scale, never combined:
+  1. policy and overnight rates (IORB/EFFR/SOFR)
+  2. what borrowers pay (prime, 30-year mortgage, credit card)
+  3. total bank credit
+  4. discount window (WLCFLPCL, from money_supply's rows, millions → billions at read time)
+  5. SLOOS net % tightening, with a zero line
+
+  Standard click-to-highlight legend with click-revealed `eli5` text (UI_STANDARDS). Every chart can originate and display the **global** pin (`usePinnedDate()`, pin-snap via `nearestRowDate`), and each has a pinned tooltip box that uses the same tooltip component as hover. Lines use `connectNulls` across each series' own real points; the date-union merge does no forward-fill.
+
+### Money Management: data
+
+- **`bank_registry`**: FDIC BankFind `api.fdic.gov/banks/institutions`. `banks.data.fdic.gov/api/*` now 301s there, confirmed live 2026-09-23.
+  - `FED` is a **native** field (`"01"`..`"12"`), so district assignment needs no NIC join. This resolves the spec's blocking investigation; NIC was not needed.
+  - Full history, no `ACTIVE` filter: 27,834 rows live.
+  - Paged at FDIC's 10k maximum, `BANK_REGISTRY_PAGE_PAUSE_S`=3s between pages; upsert on `cert`.
+  - `ENDEFYMD`'s `12/31/9999` active sentinel is never persisted. An out-of-range, blank, or `0` district is stored as NULL.
+  - `fed_member` is **derived at read time** from `charter_class` (BKCLASS `N` or `SM`), never stored.
+- **FRED series** (`pipeline/config.py`'s `FRED_SERIES_TRANSMISSION`/`FRED_SERIES_SLOOS`), all confirmed live via `fred/series` metadata:
+  - Rates, all percent: IORB (from 2021-07-29), EFFR, SOFR, MPRIME, MORTGAGE30US, TERMCBCCALLNS. TOTBKCR is billions.
+  - SLOOS: DRTSCILM, DRTSCIS, DRTSCLCC, STDSAUTO, STDSOTHCONS, SUBLPDRCSC, SUBLPDHMSENQ. `DRTSCLNG`, a plausible guess for "other consumer", **does not exist** on FRED.
+  - All land in `fred_observations`, the same table money_supply owns. Two sources may list one table.
+- **Bank size**: FDIC `ASSET`/`DEP`/`EQ` (thousands of USD; `EQ` arrives as a string) plus `REPDTE`, from the latest quarterly Call Report. They're persisted as `total_assets_k`/`deposits_k`/`equity_k`/`financials_as_of` (columns added via guarded `ALTER TABLE`) and converted to USD at read time. For inactive banks these are the last filing. District sums cover **active, sized banks only**, and `sized_count` says how many that is.
+- **Reserve Bank balance sheets** (`fed_reserve_bank_h41`, `FRED_SERIES_RESERVE_BANK_H41`): `D{n}WATAL`, `H41RESPPLLDEF{nn}NWW`, `D{n}WCPIL`, `D{n}WCSL`, `D{n}WLNNBH` for n=1..12, all confirmed live, weekly, millions, from 2002. `fed_structure.reserve_bank_balance_sheet` takes each line's latest non-null value. No current per-district loans line exists: `D{n}WALL` was discontinued 2020-03-11.
+- **Governance**: `seed_data/fed_governance.json` is transcribed from each governor's federalreserve.gov bio page and from `monetarypolicy/fomc.htm`.
+  - It is loaded replace-all into `fed_board`/`fed_reserve_banks`/`fed_governance_meta` on every `fed_governance_check` run. `GET /api/fed-governance/db` also self-seeds on first read, so a `frozen` environment with no collector still shows it.
+  - **FOMC voters are computed at read time** (`fed_structure.fomc_voting_districts`) from the seed's statutory groups, keyed by `year % modulus`. That math is checked against the Fed's published 2026–2029 schedule in `tests/test_money_management.py`.
+  - The weekly check scrapes the Board page's `list-group-item` bio links (excluding `boardmembership.htm`) and compares slugs with the seed. On drift, or on a zero-member parse, it **raises**, so the badge goes red. It never rewrites the seed; a human edits the JSON and bumps `reviewed_as_of`.
+
+### Money Management: known gaps
+
+- 📌 **FDIC's district is not necessarily the Reserve Bank a bank actually deals with.** FDIC's `FED` field follows the main office's charter location. The drilldown's per-district aggregates, checked live 2026-09-23, strongly suggest the largest banks hold Reserve Bank stock and reserve accounts at New York regardless:
+  - Paid-in capital ÷ member equity is ~3% where it should be (Boston 2.95%, San Francisco 3.13%) but 7.11% at New York and 0.07% at Minneapolis. Minneapolis is where Citibank ($2T, Sioux Falls charter) is counted.
+  - New York holds $1.7T of reserves against $2.4T of district bank assets.
+
+  This is an inference, not a published mapping; the UI note says so. The authoritative membership district would need NIC's structure data.
+- 📌 Per-district discount-window borrowing is not available as a timely series. The Fed's per-loan disclosure lags about 2 years, so only the national WLCFLPCL total is shown.
+- 📌 Registry coverage is FDIC-insured institutions only. Non-FDIC entities such as holding companies themselves and non-insured branches would need NIC; holding company appears only as a name/RSSD on each bank row.
+- 📌 No recursive holding-company hierarchy, by design (spec non-goal).
+- 📌 The governance drift check covers Board members only. Reserve Bank presidents are hand-maintained with no automated check, and three were unverified at the first review.
+- 📌 Bank history has no merger markers. Acquisitions appear as unexplained steps; FDIC's institution-history endpoint has the events if wanted.
+- 📌 SLOOS is a 7-series subset. Adding more is a one-line addition to `FRED_SERIES_SLOOS`.
+
+---
+
 ## Tab: Inventory ("Stock & Flow" + Delivery Behavior)
 
 **Frontend**: `frontend/src/comex_inventory.jsx` (top-level `ComexInventoryDashboard`) + `frontend/src/delivery_behavior_panel.jsx` (nested inside it) + `frontend/src/market_balance.jsx`. **Backend**: `backend/main.py`'s exchange-inventory routes + `backend/delivery_behavior.py`.
@@ -336,7 +439,7 @@ Three core tables: `event_calendar` (event_id PK), `macro_price_reaction` (PK ev
 
 ## Tab: Research (CATCOR Research Pane, per `catcor-events-spec.md`)
 
-**Frontend**: `frontend/src/research_panel.jsx`. **Backend**: `backend/catcor_research.py`, `backend/db.py`'s research tables, `backend/prompts/*.py`.
+**Frontend**: `frontend/src/research_panel.jsx` — rendered as a collapsible **sub-pane of the CATCOR tab** (below Catalyst Correlation, same `app-shell` wrapper) since v2.29.0, at the user's request; it was its own nav tab before that, and `"research"` is no longer in `SECTIONS`/`_VALID_NAV_SECTIONS` (a stale `research` pin falls back to `cot`). The component itself is unchanged apart from dropping its own `app-shell` wrapper and re-opening/scrolling to itself on a CATCOR hotlink. **Backend**: `backend/catcor_research.py`, `backend/db.py`'s research tables, `backend/prompts/*.py`.
 
 ### Research: what it does
 
@@ -398,7 +501,7 @@ Tables: `research_sessions` (+ `memory_mode` column, tracks the session's curren
 
 A promoted session's `event_calendar` row (`event_type="observed"`) renders on the CATCOR timeline exactly like a government-seeded event, with two differences: it's a **circle**, not a diamond (government events keep the diamond shape — `makeLinkedShape`'s `diamond` param is now `type !== "observed"`), and its own palette color (`CATCOR_EVENT_COLORS.observed`, amber). Both `get_upcoming_events` and `get_event_reaction_series` (backing `/api/catcor/events/db` and `/api/catcor/reactions/db`) now select `research_session_id`/`direction`, which didn't used to be exposed at all.
 
-Clicking an `observed` point's dot in either CATCOR chart navigates straight to the Research tab and opens that point's originating session (via `App.jsx`'s `openResearchSessionId` state, threaded down to `CatcorPanel`'s `onOpenResearchSession` and `ResearchPanel`'s `openSessionId` prop) — a government-seeded point has no `research_session_id` and is a no-op on click. Both chart tooltips show a "Click to open the research record →" hint when a point has one.
+Clicking an `observed` point's dot in either CATCOR chart switches to the CATCOR tab's Research sub-pane (re-expanding it and scrolling it into view if collapsed — Research has lived inside the CATCOR tab since v2.29.0) and opens that point's originating session (via `App.jsx`'s `openResearchSessionId` state, threaded down to `CatcorPanel`'s `onOpenResearchSession` and `ResearchPanel`'s `openSessionId` prop) — a government-seeded point has no `research_session_id` and is a no-op on click. Both chart tooltips show a "Click to open the research record →" hint when a point has one.
 
 The CATCOR legend is now click-to-toggle (same convention as the CoT panel's line legend): clicking any event-type row hides/shows that type on both charts simultaneously (`hiddenTypes` state, filtered before grouping into `pointsByType`/`timelineByType`); a hidden type's legend row dims but the legend itself always shows every type regardless of what's currently plotted.
 
@@ -420,7 +523,7 @@ The CATCOR legend is now click-to-toggle (same convention as the CoT panel's lin
 
 ### Settings: the view mechanics (cleanup-spec.md Stage 1A)
 
-- **Not a nav tab.** `App.jsx`'s `SECTIONS` array has **7 entries** (cot, moneySupply, inventory, catcor, research, stack, sanctions) — `"data"` was removed. A ⚙️ gear icon in the header title row (next to `HeaderHealthDot`) toggles `showSettings` state; `SettingsView` is a **sibling of `activeSection`**, not a 7th section — an always-mounted, visibility-toggled panel (same pattern the tabs use), covering the whole content area when open. Any nav-button click sets `showSettings=false`. Closed via the ✕ in `SettingsView`'s own header or the gear again. **No 📌 affordance** — Settings is deliberately not a pinnable default-landing tab.
+- **Not a nav tab.** `App.jsx`'s `SECTIONS` array has **7 entries** (cot, inventory, moneySupply, moneyManagement, stack, catcor, sanctions as of v2.29.0 — `"research"` folded into CATCOR, `moneyManagement` added) — `"data"` was removed. A ⚙️ gear icon in the header title row (next to `HeaderHealthDot`) toggles `showSettings` state; `SettingsView` is a **sibling of `activeSection`**, not a 7th section — an always-mounted, visibility-toggled panel (same pattern the tabs use), covering the whole content area when open. Any nav-button click sets `showSettings=false`. Closed via the ✕ in `SettingsView`'s own header or the gear again. **No 📌 affordance** — Settings is deliberately not a pinnable default-landing tab.
 - **`_VALID_NAV_SECTIONS`↔`SECTIONS` sync is now mechanically guarded.** Both lists dropped `"data"` in the same change; `tests/test_conventions.py`'s `test_nav_sections_match_backend_allowlist` parses `App.jsx`'s `SECTIONS` block and asserts it exactly equals `main.py`'s `_VALID_NAV_SECTIONS` — the guard Stack's and OFAC's known-gaps sections both asked for (the two lists drifted twice before, pinning a tab silently). `test_data_is_not_a_pinnable_section` additionally pins that `"data"` is absent from both. `POST /api/ui/pinned-section {"section":"data"}` now returns 400; a stale `"data"` value in `ui_settings.pinned_section` falls through `App.jsx`'s existing `SECTIONS.some(...)` guard to the `"cot"` default.
 - **Configuration status panel** (`ConfigStatusPanel`, top of `SettingsView`, above `DataPanel`) — read-only, one row per env var AV uses (`FRED_API_KEY`, `GAPI_API_KEY`, `CENSUS_API_KEY`, `ANTHROPIC_API_KEY`, `AI_BACKEND`), **set/not-set only, the value is never read back or sent to the browser**. Backed by `GET /api/config/status` (`main.py`), which checks `os.environ` presence (not `python-dotenv` re-parsing) and derives each row's `used_by` list from the source registry's `requires_env` fields — no hand-duplicated key→source mapping. `AI_BACKEND` is not a secret, so it reports its effective value (`forge` default) directly. `ANTHROPIC_API_KEY` has no registered source (it's the Research chat backend, not a `SourceDefinition`), so its `used_by` is empty — expected, not a bug. **UI-editable keys are a deliberate non-feature for now** — cleanup-spec.md Stage 1B, deferred until containerization (Stage 4) settles how the container receives secrets.
 
@@ -448,8 +551,8 @@ A small always-visible header dot (`HeaderHealthDot` in `App.jsx`) polls `/api/h
 
 ### Data source catalog (durable record, folded in from the retired `api-split-spec.md` §2)
 
-A flattened, API-shaped view of `backend/sources.py`'s `SOURCE_REGISTRY` (**27 entries** as
-of this fold-in — grew from the 12 the original spec recorded once the exchange-inventory
+A flattened, API-shaped view of `backend/sources.py`'s `SOURCE_REGISTRY` (**32 entries** as
+of v2.29.0's Money Management sources; 27 at this fold-in — grew from the 12 the original spec recorded once the exchange-inventory
 sources below were folded into the formal registry, see the second table's note) cross-
 referenced against the tables each owns and the read/refresh routes that expose them. Route
 paths are the real `/api/v1/...` paths per Story 3.1's versioning migration (Standing rules'
@@ -486,6 +589,11 @@ the source of truth for narrative detail; this table is the lookup surface.
 | `shfe_gold_warehouses` | SHFE gold per-warehouse (confirmed permanently empty upstream) | interval (~25h) | `shfe_gold_warehouse` | `GET /api/v1/shfe/gold/db/warehouses`, `/warehouses/history` | via `POST /api/v1/refresh/force` | Real `200`/`data: []`, see Tab: Inventory |
 | `futures_curve_spread` | COMEX front/next-month settlement spread, both metals | interval (~25h) | `futures_curve_spread` | `GET /api/v1/curve-spread/db` | via `POST /api/v1/refresh/force` | Per-date liquidity-ranked, see Tab: CoT's Squeeze Context |
 | `pslv` | Sprott PSLV custodial oz | interval (~25h) | `pslv_snapshot` | `GET /api/v1/pslv/db` | via `POST /api/v1/refresh/force` | Fixed-index parse into Sprott's multi-fund array |
+| `fed_transmission` | FRED rate-transmission chain (IORB/EFFR/SOFR/prime/mortgage/card/bank credit) + 7 SLOOS series | interval (weekly), `fire_at_startup` | `fred_observations` | `GET /api/v1/fred/transmission/db` | via `POST /api/v1/refresh/force` | Requires `FRED_API_KEY`; WLCFLPCL read from money_supply's rows, not re-fetched |
+| `fed_reserve_bank_h41` | Each Reserve Bank's weekly H.4.1 lines (total assets, depository-institution deposits, capital paid in, surplus, Fed notes) — 60 series | interval (weekly), `fire_at_startup` | `fred_observations` | (joined into `GET /api/v1/fed-governance/db`) | via `POST /api/v1/refresh/force` | Millions → USD at read time; 3 years fetched |
+| `bank_registry` | FDIC BankFind institutions, full history, with native Fed district + Call Report size (assets/deposits/equity) | interval (weekly), `fire_at_startup` | `bank_registry` | `GET /api/v1/bank-registry/db`, `/db/district-counts`, `/db/bank/{cert}` | via `POST /api/v1/refresh/force` | ~27.8k rows, 3 pages of 10k, 3s apart |
+| `bank_financials` | FDIC quarterly Call Report history (assets/deposits/equity + as-of Fed district), 2002+ | interval (weekly), `fire_at_startup`, `self_recording` — runs as a detached task | `bank_financials` | `GET /api/v1/bank-registry/db/bank/{cert}/history`, `GET /api/v1/fed-districts/db/history/{district}` | via `POST /api/v1/refresh/force` | ~98 quarterly requests for the first backfill, then new + latest two quarters |
+| `fed_governance_check` | Governance seed load + federalreserve.gov Board roster drift check | interval (weekly), `fire_at_startup` | `fed_board`, `fed_reserve_banks`, `fed_governance_meta` | `GET /api/v1/fed-governance/db` | via `POST /api/v1/refresh/force` | Drift = error on the badge; never rewrites the seed |
 
 **Not in `SOURCE_REGISTRY`** — no periodic upstream fetch, so no `CadenceSpec` applies (pure
 DB reads over derived/static/user-CRUD data):
@@ -750,7 +858,8 @@ backend/
   price_instruments.py    Canonical price instrument identifiers (price-architecture-spec.md) — the closed set written to spot_price/settlement_price; see Cross-cutting data conventions' Price instrument registry entry. Stdlib-free, importable without the venv, same constraint units.py carries.
   yahoo_prices.py          Canonical Yahoo Finance chart-API caller (price-architecture-spec.md's Fetch consolidation) — one fetch_yahoo_bars() used by every Yahoo call site in main.py/catcor.py, replacing four near-duplicate HTTP-call-and-parse blocks.
   catcor.py               CATCOR tab backend (see Tab: CATCOR above)
-  catcor_research.py      Research tab backend (see Tab: Research above)
+  catcor_research.py      Research backend (see Tab: Research above)
+  fed_structure.py        Money Management's pure logic — FDIC BankFind row mapping, governance seed load, FOMC rotation math, Board-roster drift parsing (see Tab: Money Management above). No HTTP client of its own, so collector.py and main.py both import it.
   delivery_behavior.py    Delivery Behavior cross-check layer, feeds both Inventory and CoT tabs (see those sections above)
   stack_db.py              Stack Tracker's own SQLite file (runtime/stack.db) + schema — deliberately separate from db.py/argentvigil.db (see Tab: Stack above)
   stack.py                 Stack Tracker business logic — CRUD, bulk-entry expansion, melt valuation (cross-reads db.py's live spot prices, read-only), photo upload (see Tab: Stack above)
@@ -759,6 +868,7 @@ backend/
 
 seed_data/
   catcor_events_seed.py        Manually-maintained FOMC calendar only (dates cross-checked against the Fed's own meeting calendar) — CPI/NFP are fetched live from ALFRED (catcor.seed_events_from_alfred(), see Tab: CATCOR above), not listed here. Each event carries source_tier (currently "government" for all three types).
+  fed_governance.json          Manually maintained Fed Board roster, 12 Reserve Banks/presidents, FOMC rotation groups (Money Management tab) — reviewed by hand, drift-checked weekly against federalreserve.gov
   silver_market_balance.json   Manually maintained annual Silver Institute balance data (Inventory tab's Market Demand section)
   cme/112.pdf, cme/113.pdf     COMEX rulebook Chapters 112 (Silver)/113 (Gold) — reference only, confirms Delivery Behavior's Last Trade Day rule
 
@@ -781,7 +891,7 @@ tests/
 pytest.ini              testpaths=tests, asyncio_mode=auto (test deps live in the single requirements.txt — no separate dev file, see ## Tests)
 
 frontend/
-  src/App.jsx                 Top-level composition, owns activeSection tab state (SECTIONS: 7 entries — cot, inventory, moneySupply, stack, catcor, research, sanctions as of v2.17.0; "data" removed same version; nav-bar order is reordered freely by the user, so treat the exact sequence as volatile — only the set of keys is load-bearing, and it's guarded against _VALID_NAV_SECTIONS). All sections mounted unconditionally with a section-hidden class toggled by activeSection — never conditionally rendered/unmounted, so switching tabs never refires mount-time fetches/listeners. Also owns showSettings (⚙️ gear icon → SettingsView, a visibility-toggled sibling of activeSection, not a nav section — see ## Settings), pinnedSection (see Standing rules' pinned-default-tab entry) and openResearchSessionId (CATCOR-dot-click-to-Research-session hotlink state, threaded to CatcorPanel/ResearchPanel — see Tab: Research's integration subsection). Wraps the app in HealthProvider then PinnedDateProvider (the global cross-tab date pin — cleanup-spec.md Stage 1B).
+  src/App.jsx                 Top-level composition, owns activeSection tab state (SECTIONS: 7 entries — cot, inventory, moneySupply, moneyManagement, stack, catcor, sanctions as of v2.29.0; "data" removed in v2.17.0, "research" folded into the CATCOR section in v2.29.0 — ResearchPanel renders inside the catcor wrapper, below CatcorPanel; nav-bar order is reordered freely by the user, so treat the exact sequence as volatile — only the set of keys is load-bearing, and it's guarded against _VALID_NAV_SECTIONS). All sections mounted unconditionally with a section-hidden class toggled by activeSection — never conditionally rendered/unmounted, so switching tabs never refires mount-time fetches/listeners. Also owns showSettings (⚙️ gear icon → SettingsView, a visibility-toggled sibling of activeSection, not a nav section — see ## Settings), pinnedSection (see Standing rules' pinned-default-tab entry) and openResearchSessionId (CATCOR-dot-click-to-Research-session hotlink state, threaded to CatcorPanel/ResearchPanel — see Tab: Research's integration subsection). Wraps the app in HealthProvider then PinnedDateProvider (the global cross-tab date pin — cleanup-spec.md Stage 1B).
     - **`HeaderTicker`/`TickerRow`** (App.jsx, rendered once in the top header bar, outside SECTIONS entirely — appears above every tab, never unmounted on tab switch, unrelated to CoT's per-metal `SpotPriceBadge`). One collapsible row per metal (Ag/Au); collapsed shows label/price/absolute change only, expanded reveals a real `spot_price` tick chart via `/api/prices/db/ticks`. **This is the one place in the app with a spot-price range picker + Live toggle** (2026-09) — a short-lived CoT-tab equivalent (`MetalPriceHistoryChart`, inside each metal's own `<details>` body) was built the same week and then removed once this global version landed, per the user's call that a per-metal copy duplicating what's now always visible in the header was redundant (see the removal note under Tab: CoT's Silver/Gold sections above). Each `TickerRow` owns its own `PRICE_HISTORY_WINDOWS`/Custom/Live state (not shared across the two metals), reusing `comex-range-selector`/`live-toggle` CSS and the shared `PRICE_HISTORY_WINDOWS`/`PRICE_LIVE_POLL_MS` constants from `frontend/src/date_utils.js` — the one definition both this component and (while it existed) the CoT chart imported from, rather than drifting copies. Default: `Live=true` at a 6H window, matching the old always-on 60s-poll behavior this replaced (previously a hardcoded `TICKER_SPARKLINE_HOURS=3` with no picker at all). **A real behavior change from the old version**: the old `HeaderTicker` polled every 60s unconditionally regardless of whether either row was expanded (collapsed panes have no chart to update, so this was pure waste); the new version only fetches/polls while a given row is actually `open`, per-row — collapsing a pane now stops its polling instead of running invisibly in the background.
   src/settings_panel.jsx       SettingsView (gear-icon view) — ConfigStatusPanel (read-only GET /api/config/status env-var presence) + mounts DataPanel unchanged. See ## Settings above.
   src/silver_cot_tracker.jsx  CoT tab (see Tab: CoT above)
@@ -794,7 +904,8 @@ frontend/
   src/tic_holdings_panel.jsx  Money Supply's Foreign Holdings (TIC) sub-panel, extracted (cleanup-spec.md Stage 3.5) — fed tic_countries/tic_grand_total as props
   src/money_supply_shared.js  Shared helpers/consts for money_supply.jsx + its extracted sub-panels (xTicks, fmt* formatters, RATIO/WIN/LOSS/OUTLAYS_* colors)
   src/catcor_panel.jsx        CATCOR tab (see Tab: CATCOR above)
-  src/research_panel.jsx      Research tab (see Tab: Research above)
+  src/research_panel.jsx      Research workbench, mounted as a sub-pane of the CATCOR tab (see Tab: Research above)
+  src/money_management.jsx    Money Management tab (see Tab: Money Management above)
   src/stack_tracker.jsx       Stack tab (see Tab: Stack above)
   src/sanctions_panel.jsx     OFAC tab (see Tab: OFAC above)
   src/data_editorial.json      Settings/Data hand-written editorial map (prose/curl/field descriptions) -- THE file to edit; split from data_map.js per datasources-spec.md Story #1, JSON so tests/test_conventions.py's sync guard reads it too; operational metadata (cadence/rate-limit) lives in backend/sources.py (see ## Settings above)

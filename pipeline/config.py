@@ -119,3 +119,52 @@ FRED_SERIES_TIC_COUNTRIES = {
     "Total Caribbean": "FORLTTREASPOS34401",
 }
 FRED_SERIES_TIC_GRAND_TOTAL = "FORLTTREASPOS99996"  # all countries, LT Treasuries only (excludes bills)
+
+# Money Management tab — rate-transmission chain (money-management-spec.md
+# Story #3). All confirmed live 2026-09-23 via FRED's fred/series metadata:
+# every rate series is native percent; TOTBKCR is billions of USD (weekly).
+# WLCFLPCL (discount window) is deliberately NOT here — money_supply already
+# fetches it, and the transmission /db route just reads it back.
+FRED_SERIES_TRANSMISSION = {
+    "IORB": "IORB",                    # Interest on reserve balances, daily, from 2021-07-29
+    "EFFR": "EFFR",                    # Effective fed funds rate, daily
+    "SOFR": "SOFR",                    # Secured overnight financing rate, daily, from 2018-04
+    "MPRIME": "MPRIME",                # Bank prime loan rate, monthly
+    "MORTGAGE30US": "MORTGAGE30US",    # 30yr fixed mortgage average, weekly
+    "TERMCBCCALLNS": "TERMCBCCALLNS",  # Credit card plan rate, all accounts, monthly
+    "TOTBKCR": "TOTBKCR",              # Bank credit, all commercial banks, weekly, billions USD
+}
+# SLOOS representative subset — net % of domestic banks tightening standards,
+# quarterly. Positive = tightening, negative = easing. DRTSCLNG (a common
+# guess for "other consumer") does not exist on FRED — STDSOTHCONS is the real
+# id (confirmed live), starting 2011-04 rather than 1990.
+FRED_SERIES_SLOOS = {
+    "C&I — large/middle firms": "DRTSCILM",
+    "C&I — small firms": "DRTSCIS",
+    "Credit cards": "DRTSCLCC",
+    "Auto loans": "STDSAUTO",
+    "Other consumer": "STDSOTHCONS",
+    "CRE — construction & land": "SUBLPDRCSC",
+    "Mortgages — GSE-eligible": "SUBLPDHMSENQ",
+}
+
+# Per-Reserve-Bank H.4.1 statement of condition (Table 6), weekly Wednesday
+# levels, millions of USD — confirmed live 2026-09-23 for all 12 districts,
+# 2002-12-18 onward. Money Management's district comparison: a Reserve Bank's
+# own balance sheet (mostly its allocated share of the national SOMA
+# portfolio) next to the real links to its district's banks — the reserves
+# those banks hold there (deposits held by depository institutions) and the
+# capital member banks have paid in. No current per-district loans series
+# exists (folded into "securities, repos and loans"; the old D{n}WALL loans
+# line was discontinued 2020-03-11).
+FRED_SERIES_RESERVE_BANK_H41 = {
+    district: {
+        "total_assets": f"D{district}WATAL",
+        "depository_deposits": f"H41RESPPLLDEF{district:02d}NWW",
+        "capital_paid_in": f"D{district}WCPIL",
+        "surplus": f"D{district}WCSL",
+        "fed_notes": f"D{district}WLNNBH",
+    }
+    for district in range(1, 13)
+}
+RESERVE_BANK_H41_FETCH_YEARS = 3

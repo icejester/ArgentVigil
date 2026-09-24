@@ -64,6 +64,7 @@ from fastapi import HTTPException
 
 from . import catcor
 from . import db
+from . import fed_structure
 from . import sources
 from . import stack_db
 from .mc_token import authed_headers
@@ -88,10 +89,13 @@ from pipeline.config import (
     FRED_SERIES_DGS10,
     FRED_SERIES_DGS30,
     FRED_SERIES_M2,
+    FRED_SERIES_RESERVE_BANK_H41,
     FRED_SERIES_RRPONTSYD,
+    FRED_SERIES_SLOOS,
     FRED_SERIES_T10Y2Y,
     FRED_SERIES_TIC_COUNTRIES,
     FRED_SERIES_TIC_GRAND_TOTAL,
+    FRED_SERIES_TRANSMISSION,
     FRED_SERIES_WALCL,
     FRED_SERIES_WLCFLPCL,
     FRED_SERIES_WRESBAL,
@@ -99,12 +103,14 @@ from pipeline.config import (
     FRED_SERIES_WSHOSHO,
     FRED_SERIES_WSHOTSL,
     METAL_PRICE_FETCH_YEARS,
+    RESERVE_BANK_H41_FETCH_YEARS,
     XAG_TICKER,
     XAU_TICKER,
 )
 
 METALCHARTS = "https://metalcharts.org"
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+BANK_REGISTRY_PAGE_PAUSE_S = 3  # diagnostic-pacing rule, applied to the app fetch too — FDIC publishes no rate limit
 CENSUS_TRADE_BASE = "https://api.census.gov/data/timeseries/intltrade"
 # HS 7106 (silver, unwrought/semi-manufactured/powder) / HS 7108 (gold,
 # non-monetary — comparison-only per CLAUDE.md's "gold as context" rule).
@@ -2383,6 +2389,180 @@ async def _fetch_and_persist_money_supply():
         raise HTTPException(502, str(e))
 
 
+async def _fetch_and_persist_fed_transmission() -> dict:
+    """fed_transmission's fetch_fn (money-management-spec.md Story #3) — the
+    policy -> funding-cost -> lending chain plus the SLOOS subset, all FRED,
+    all into fred_observations. Same fetch/upsert helpers as money_supply;
+    a separate source only so its health/cadence are visible on their own.
+    Raises on failure; the scheduler records the outcome (self_recording=False)."""
+    if "FRED_API_KEY" not in os.environ:
+        raise RuntimeError("FRED_API_KEY environment variable is not set")
+    observation_start = str(date.today() - timedelta(days=365 * FRED_FETCH_YEARS))
+    series_ids = sorted(set(FRED_SERIES_TRANSMISSION.values()) | set(FRED_SERIES_SLOOS.values()))
+    counts = {}
+    for series_id in series_ids:
+        rows = await _fetch_fred_series(series_id, observation_start)
+        db.upsert_fred_observations(series_id, rows)
+        counts[series_id] = len(rows)
+    print(f"[fed_transmission] {counts}")
+    return counts
+
+
+async def _fetch_and_persist_reserve_bank_h41() -> int:
+    """fed_reserve_bank_h41's fetch_fn — each Reserve Bank's own weekly
+    H.4.1 statement lines (60 FRED series: 5 lines x 12 districts) into
+    fred_observations. Raises on failure (self_recording=False)."""
+    if "FRED_API_KEY" not in os.environ:
+        raise RuntimeError("FRED_API_KEY environment variable is not set")
+    # Full history (FRED starts these 2002-12-18) the first time a series is
+    # seen, so it lines up with bank_financials' 2002+ Call Reports; after
+    # that only the trailing RESERVE_BANK_H41_FETCH_YEARS (catches revisions)
+    # rather than re-pulling ~24 years of weekly rows every week.
+    recent_start = str(date.today() - timedelta(days=365 * RESERVE_BANK_H41_FETCH_YEARS))
+    n = 0
+    for lines in FRED_SERIES_RESERVE_BANK_H41.values():
+        for series_id in lines.values():
+            existing = db.get_fred_observations(series_id, "2002-01-01")
+            has_history = bool(existing) and existing[0]["date"] < "2003-06-01"
+            start = recent_start if has_history else "2002-01-01"
+            db.upsert_fred_observations(series_id, await _fetch_fred_series(series_id, start))
+            n += 1
+    print(f"[fed_reserve_bank_h41] series={n}")
+    return n
+
+
+_bank_financials_task: asyncio.Task | None = None
+
+
+async def _bank_financials_sync() -> dict:
+    """The real work behind bank_financials: FDIC Call Report history, one
+    request per quarter since 2002. Skips quarters already persisted except
+    the two most recent (FDIC amends/late-files those), and quarters FDIC
+    hasn't published yet (empty response) are simply left for next time.
+    Records its own health (self_recording=True) since it runs detached."""
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    persisted = db.get_bank_financials_quarter_counts()
+    refresh = set(sorted(persisted)[-2:])
+    done = rows_total = 0
+    try:
+        for q in fed_structure.quarter_ends(fed_structure.BANK_FINANCIALS_START_YEAR, date.today()):
+            iso = f"{q[:4]}-{q[4:6]}-{q[6:]}"
+            if iso in persisted and iso not in refresh:
+                continue
+            offset, total, rows = 0, None, []
+            while total is None or offset < total:
+                resp = await _client.get(
+                    fed_structure.FDIC_FINANCIALS_URL,
+                    params={
+                        "filters": f"REPDTE:{q}",
+                        "fields": fed_structure.FDIC_FINANCIALS_FIELDS,
+                        "limit": fed_structure.FDIC_PAGE_SIZE,
+                        "offset": offset,
+                        "sort_by": "CERT",
+                        "sort_order": "ASC",
+                    },
+                    timeout=90,
+                    follow_redirects=True,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                total = int(payload.get("meta", {}).get("total", 0))
+                page = payload.get("data", [])
+                if not page:
+                    break
+                rows += [r for r in (fed_structure.map_fdic_financials_row(i.get("data", {}), fetched_at) for i in page) if r]
+                offset += len(page)
+                await asyncio.sleep(BANK_REGISTRY_PAGE_PAUSE_S)
+            if rows:
+                db.upsert_bank_financials(rows)
+                done += 1
+                rows_total += len(rows)
+                print(f"[bank_financials] {iso}: {len(rows)} rows")
+        db.record_fetch_attempt("bank_financials", success=True)
+        return {"quarters": done, "rows": rows_total}
+    except Exception as e:
+        db.record_fetch_attempt("bank_financials", success=False, error=f"{type(e).__name__}: {e}")
+        raise
+
+
+async def _fetch_and_persist_bank_financials() -> str:
+    """bank_financials' fetch_fn. The first backfill is ~98 quarterly
+    requests paced 3s apart (roughly 10-15 min). _schedule_loop awaits
+    fetch_fns one at a time, so running that inline would stall every other
+    source — including catcor_snapshot, whose missed windows are permanent
+    loss. So this only STARTS the sync as a detached task (one at a time per
+    process) and returns; the task records its own outcome."""
+    global _bank_financials_task
+    if _bank_financials_task is not None and not _bank_financials_task.done():
+        return "already running"
+    _bank_financials_task = asyncio.create_task(_bank_financials_sync())
+    _bank_financials_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    return "started"
+
+
+async def _fetch_and_persist_bank_registry() -> int:
+    """bank_registry's fetch_fn (Story #2). FDIC BankFind institutions, FULL
+    history (no ACTIVE filter — inactive/merged institutions included, ~27.8k
+    rows confirmed live 2026-09-23), paged at FDIC's 10k maximum with a pause
+    between pages. Upsert keyed on CERT. Raises on failure."""
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    offset, total, persisted = 0, None, 0
+    while total is None or offset < total:
+        if offset:
+            await asyncio.sleep(BANK_REGISTRY_PAGE_PAUSE_S)
+        resp = await _client.get(
+            fed_structure.FDIC_INSTITUTIONS_URL,
+            params={
+                "fields": fed_structure.FDIC_FIELDS,
+                "limit": fed_structure.FDIC_PAGE_SIZE,
+                "offset": offset,
+                "sort_by": "CERT",
+                "sort_order": "ASC",
+            },
+            timeout=60,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        total = int(payload.get("meta", {}).get("total", 0))
+        page = payload.get("data", [])
+        if not page:
+            break
+        rows = [r for r in (fed_structure.map_fdic_row(item.get("data", {}), fetched_at) for item in page) if r]
+        db.upsert_bank_registry(rows)
+        persisted += len(rows)
+        offset += len(page)
+    print(f"[bank_registry] persisted={persisted} upstream_total={total}")
+    return persisted
+
+
+async def _fetch_and_persist_fed_governance_check() -> dict:
+    """fed_governance_check's fetch_fn (Story #1). Re-loads the hand-
+    maintained seed (idempotent), then scrapes federalreserve.gov's Board
+    page and compares its roster against the seed. Drift RAISES — so the
+    scheduler records an error and the health badge goes red — but never
+    rewrites the seed; a human reviews and edits seed_data/fed_governance.json."""
+    seed = fed_structure.persist_seed()
+    resp = await _client.get(
+        fed_structure.FED_BOARD_URL,
+        headers={"User-Agent": "ArgentVigil/1.0"},
+        timeout=20,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    live = fed_structure.parse_board_roster(resp.text)
+    if not live:
+        raise RuntimeError("Board page parsed to zero members — page layout likely changed")
+    drift = fed_structure.roster_drift(seed["board"], live)
+    if drift["missing_from_live"] or drift["new_on_live"]:
+        raise RuntimeError(
+            f"Board roster differs from seed (reviewed {seed.get('reviewed_as_of')}): "
+            f"not on live page {drift['missing_from_live']}, new on live page {drift['new_on_live']} "
+            f"— review seed_data/fed_governance.json"
+        )
+    return {"members": len(live)}
+
+
 async def _fetch_and_persist_yahoo_daily_close() -> dict:
     """Real daily (not month-end) Yahoo closes for both metals — one
     settlement_price instrument (XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE)
@@ -2685,6 +2865,47 @@ def register_sources() -> None:
         tables=["ofac_designations", "ofac_aliases", "ofac_addresses", "ofac_id_documents"],
         cadence=CadenceSpec(trigger="interval", interval_seconds=ofac_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
         rate_limit=RateLimitSpec(kind="undocumented", note="Official Treasury bulk XML download, no published rate limit, no auth/key required. User-Agent header required (403 without one). ~126MB SDN Advanced file + a smaller Consolidated Advanced file fetched and parsed daily; only the diff (new designations, delistings) is persisted for the parent table, while the three entity-detail child tables (aliases/addresses/ID documents) are fully replaced per entity on every fetch."),
+    ))
+    # Money Management (money-management-spec.md). Three sources, one per
+    # data layer so each has its own health badge. fed_transmission rides
+    # money_supply's FRED table/key posture; bank_registry is a weekly full
+    # sync (bank structure changes aren't daily-urgent); fed_governance_check
+    # re-loads the seed and flags roster drift weekly.
+    sources.register(SourceDefinition(
+        key="fed_transmission", label="FRED — Rate Transmission + SLOOS",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_fed_transmission,
+        tables=["fred_observations"], requires_env=["FRED_API_KEY"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern. 14 series, one request each."),
+    ))
+    sources.register(SourceDefinition(
+        key="fed_reserve_bank_h41", label="FRED — Each Reserve Bank's H.4.1 Statement",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_reserve_bank_h41,
+        tables=["fred_observations"], requires_env=["FRED_API_KEY"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="FRED's public API has no documented hard rate limit for this usage pattern. 60 series (5 lines x 12 districts), 3 years back, one request each."),
+    ))
+    sources.register(SourceDefinition(
+        key="bank_registry", label="FDIC BankFind — Institution Registry",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_bank_registry,
+        tables=["bank_registry"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="api.fdic.gov publishes no rate limit and needs no key. Full sync = ~3 requests of 10k rows, 3s apart."),
+    ))
+    sources.register(SourceDefinition(
+        key="bank_financials", label="FDIC BankFind — Quarterly Call Report History (2002+)",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_bank_financials,
+        tables=["bank_financials"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="api.fdic.gov publishes no rate limit and needs no key. One request per quarter, 3s apart: ~98 for the first 2002+ backfill (~671k rows), then only new quarters plus the latest two (amendments). Runs as a detached task so it never blocks the scheduler."),
+        self_recording=True,
+    ))
+    sources.register(SourceDefinition(
+        key="fed_governance_check", label="Federal Reserve — Governance Seed + Roster Check",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_fed_governance_check,
+        tables=["fed_board", "fed_reserve_banks", "fed_governance_meta"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="One HTML page fetch per week from federalreserve.gov; User-Agent sent."),
     ))
     # catcor_startup: previously fired by a hand-written asyncio.create_task(...)
     # call in lifespan, outside the scheduler entirely — a real, separate
