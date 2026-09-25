@@ -67,6 +67,7 @@ from . import db
 from . import fed_structure
 from . import sources
 from . import stack_db
+from . import mc_token
 from .mc_token import authed_headers
 from .sources import CadenceSpec, RateLimitSpec, SourceDefinition
 from .price_instruments import (
@@ -486,11 +487,9 @@ def _parse_aggregate_row(row: dict) -> dict:
 async def _backfill_if_needed():
     if db.count_aggregate() == 0:
         try:
-            hdrs = await authed_headers(_client)
-            resp = await _client.get(
+            resp = await _mc_get(
                 f"{METALCHARTS}/api/comex/inventory",
                 params={"symbol": "XAG", "range": "ALL"},
-                headers=hdrs,
                 timeout=30,
             )
             resp.raise_for_status()
@@ -501,11 +500,9 @@ async def _backfill_if_needed():
             print(f"[backfill] warning: {e}")
     if db.count_gold_aggregate() == 0:
         try:
-            hdrs = await authed_headers(_client)
-            resp = await _client.get(
+            resp = await _mc_get(
                 f"{METALCHARTS}/api/comex/inventory",
                 params={"symbol": "XAU", "range": "ALL"},
-                headers=hdrs,
                 timeout=30,
             )
             resp.raise_for_status()
@@ -516,12 +513,26 @@ async def _backfill_if_needed():
             print(f"[backfill] warning (gold): {e}")
 
 
+async def _mc_get(url: str, **kwargs) -> httpx.Response:
+    """GET a metalcharts.org endpoint with the x-mc-token auth header. On a
+    401, drops the cached token and retries ONCE with a fresh one — the
+    server sometimes rejects a token before its stated expiry, and without
+    this every metalcharts source in that window failed and (for the ~daily
+    sources) didn't retry for up to 25h. A second 401 is returned as-is, so
+    a real auth change still surfaces as an error. Calls this module's
+    authed_headers name so tests that monkeypatch it keep working."""
+    resp = await _client.get(url, headers=await authed_headers(_client), **kwargs)
+    if resp.status_code == 401:
+        print(f"[metalcharts] 401 on {url} — refreshing token and retrying once")
+        mc_token.invalidate_token()
+        resp = await _client.get(url, headers=await authed_headers(_client), **kwargs)
+    return resp
+
+
 async def _fetch_and_persist_silver_history(range: str = "ALL") -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/inventory",
         params={"symbol": "XAG", "range": range},
-        headers=hdrs,
         timeout=30,
     )
     resp.raise_for_status()
@@ -549,11 +560,9 @@ def _depository_rows(raw: list[dict]) -> list[dict]:
 
 
 async def _fetch_and_persist_silver_depositories() -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/inventory",
         params={"symbol": "XAG", "type": "depositories"},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -563,11 +572,9 @@ async def _fetch_and_persist_silver_depositories() -> list[dict]:
 
 
 async def _fetch_and_persist_silver_leverage() -> dict:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/volume-oi",
         params={"symbol": "XAG"},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -609,11 +616,9 @@ async def _fetch_and_persist_silver_leverage() -> dict:
 
 
 async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/inventory",
         params={"symbol": "XAU", "range": range},
-        headers=hdrs,
         timeout=30,
     )
     resp.raise_for_status()
@@ -624,11 +629,9 @@ async def _fetch_and_persist_gold_history(range: str = "ALL") -> list[dict]:
 
 
 async def _fetch_and_persist_gold_depositories() -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/inventory",
         params={"symbol": "XAU", "type": "depositories"},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -638,11 +641,9 @@ async def _fetch_and_persist_gold_depositories() -> list[dict]:
 
 
 async def _fetch_and_persist_gold_leverage() -> dict:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/volume-oi",
         params={"symbol": "XAU"},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -678,11 +679,9 @@ async def _fetch_and_persist_gold_leverage() -> dict:
 
 
 async def _fetch_and_persist_delivery(type: str = "mtd") -> dict:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/delivery-notices",
         params={"symbol": "XAG", "type": type},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -715,11 +714,9 @@ async def _fetch_and_persist_delivery(type: str = "mtd") -> dict:
 # RECLASSIFICATION_SUPPORTED_METALS in delivery_behavior.py, extended to XAU
 # in the same change that added this function.
 async def _fetch_and_persist_gold_delivery(type: str = "mtd") -> dict:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/comex/delivery-notices",
         params={"symbol": "XAU", "type": type},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -751,11 +748,9 @@ async def _fetch_and_persist_gold_delivery_ytd():
 
 
 async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/shfe/inventory",
         params={"symbol": "AG", "range": range},
-        headers=hdrs,
         timeout=20,
     )
     resp.raise_for_status()
@@ -774,11 +769,9 @@ async def _fetch_and_persist_shfe_history(range: str = "ALL") -> list[dict]:
 
 
 async def _fetch_and_persist_shfe_gold_history(range: str = "ALL") -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/shfe/inventory",
         params={"symbol": "AU", "range": range},
-        headers=hdrs,
         timeout=20,
     )
     resp.raise_for_status()
@@ -797,11 +790,9 @@ async def _fetch_and_persist_shfe_gold_history(range: str = "ALL") -> list[dict]
 
 
 async def _fetch_and_persist_shfe_warehouses() -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/shfe/inventory",
         params={"symbol": "AG", "type": "warehouses"},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -829,11 +820,9 @@ async def _fetch_and_persist_shfe_warehouses() -> list[dict]:
 
 
 async def _fetch_and_persist_shfe_gold_warehouses() -> list[dict]:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/shfe/inventory",
         params={"symbol": "AU", "type": "warehouses"},
-        headers=hdrs,
         timeout=15,
     )
     resp.raise_for_status()
@@ -941,10 +930,8 @@ def _metals_market_closed(now: datetime | None = None) -> bool:
 
 
 async def _fetch_and_persist_prices() -> dict:
-    hdrs = await authed_headers(_client)
-    resp = await _client.get(
+    resp = await _mc_get(
         f"{METALCHARTS}/api/prices",
-        headers=hdrs,
         timeout=10,
     )
     resp.raise_for_status()

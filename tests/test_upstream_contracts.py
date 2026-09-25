@@ -671,3 +671,50 @@ async def test_pslv_502s_on_id_based_response_shape(tmp_db, upstream_client):
             await collector._fetch_and_persist_pslv()
 
     assert exc_info.value.status_code == 502
+
+
+# --- metalcharts.org token rejected before its stated expiry -----------------
+# Confirmed 2026-09-24 in both test and prod collector logs: a burst where
+# every metalcharts source 401'd in one cycle, plus isolated spot 401s, while
+# a freshly-fetched token worked immediately. _mc_get must refresh + retry once.
+
+async def test_metalcharts_401_refreshes_token_and_retries_once(tmp_db, upstream_client, monkeypatch):
+    from backend import mc_token
+    tokens = iter(["stale", "fresh"])
+    monkeypatch.setattr(mc_token, "_token", "stale")
+    monkeypatch.setattr(mc_token, "_expires_at", 10**15)  # cached "valid" token
+
+    async def _headers(_client):
+        if mc_token._token is None:          # invalidated -> fetch a new one
+            mc_token._token = next(tokens)
+        return {"x-mc-token": mc_token._token}
+
+    monkeypatch.setattr(collector, "authed_headers", _headers)
+    next(tokens)  # "stale" is already cached
+    seen = []
+
+    def _cb(request):
+        seen.append(request.headers["x-mc-token"])
+        if request.headers["x-mc-token"] == "stale":
+            return httpx.Response(401)
+        return httpx.Response(200, json={"data": {"date": "2026-09-24", "volume": 1}})
+
+    with respx.mock:
+        respx.get(url__startswith=f"{collector.METALCHARTS}/api/comex/volume-oi").mock(side_effect=_cb)
+        resp = await collector._mc_get(f"{collector.METALCHARTS}/api/comex/volume-oi", params={"symbol": "XAG"})
+    assert resp.status_code == 200
+    assert seen == ["stale", "fresh"]
+
+
+async def test_metalcharts_second_401_is_returned_not_retried_forever(tmp_db, upstream_client, monkeypatch):
+    calls = []
+
+    async def _headers(_client):
+        return {"x-mc-token": "t"}
+
+    monkeypatch.setattr(collector, "authed_headers", _headers)
+    with respx.mock:
+        route = respx.get(f"{collector.METALCHARTS}/api/prices").mock(return_value=httpx.Response(401))
+        resp = await collector._mc_get(f"{collector.METALCHARTS}/api/prices")
+    assert resp.status_code == 401
+    assert route.call_count == 2  # original + exactly one retry

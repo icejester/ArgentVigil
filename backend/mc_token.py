@@ -27,6 +27,18 @@ async def get_token(client: httpx.AsyncClient) -> str:
     return _token
 
 
+def invalidate_token() -> None:
+    """Drop the cached token so the next authed_headers() fetches a fresh
+    one. metalcharts.org occasionally rejects a token (401) well inside its
+    stated ~5-minute expiresAt — confirmed 2026-09-24 in the collector logs
+    (every metalcharts source in one cycle 401'd together, isolated spot
+    401s otherwise) while a freshly-fetched token worked immediately. Without
+    this, the rejected token kept being reused until expiresAt passed."""
+    global _token, _expires_at
+    _token = None
+    _expires_at = 0
+
+
 async def authed_headers(client: httpx.AsyncClient) -> dict:
     token = await get_token(client)
     return {**HEADERS_BASE, "x-mc-token": token}
