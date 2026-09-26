@@ -1,6 +1,6 @@
 # ArgentVigil v2.29.0
 
-Silver speculative-positioning monitor, with gold as comparative context. Not a trading system: no price targets, no predictions, no risk commentary — instrumentation built to be right about what already happened.
+Silver market observability, with gold as comparative context. AV exists to help understand the silver market as it actually is — paper positioning, physical movement, and the currency it's priced in — not to trade it. No price targets, no predictions, no risk commentary: instrumentation built to be right about what already happened.
 
 This doc has three altitudes: **Business Level** (what the app does and why, for someone who knows the market but not the code), **Tech Level** (how it's built and run), and **Next Up** (where it's headed). Exhaustive per-panel behavior, data quirks, and development history live in `CLAUDE.md` — the durable engineering record. `backend/README.md` and `frontend/README.md` carry per-layer tech orientation.
 
@@ -10,15 +10,37 @@ This doc has three altitudes: **Business Level** (what the app does and why, for
 
 ## BUSINESS LEVEL
 
-### Overview & Goals
+### The Story, Overview & Goals
 
-*(Intentionally left blank — this section will be iterated on. The one-sentence seed: the governing idea is **selling dollars, not buying metals** — separating "the futures crowd changed its mind" from "metal is actually moving" from "the currency itself is being debased," instead of blurring all three into one number.)*
+All of this started with my 50th birthday. Literally to the day — stroke of midnight — my social media feed became little other than "boner pills" and "monetary debasement." While "male enhancement" wasn't something I believed I needed, I can't say the same for the panic that ensued from watching all the bullion pushers on YouTube. I bought into the idea that we, collectively as a nation, and a planet, were running out of silver.
+
+As a "good greek boy," I was raised with a heavy respect for silver. It was valuable. It was "lucky." If you ever found a silver quarter, you stashed it away for when you really **needed** it.
+
+I bought "heavy" into the ramp-up of February 2026. The numbers aren't **really** important, especially because the definition of "heavy" changes more or less per person.
+
+That being said, I quickly realized that unless I was willing to lose a LOT, I wasn't going to make money in the short term, so I switched my thinking on it, (some may call that "cope") and decided that the money was deteriorating anyway. Dollars, in my mind, became useless for anything other than a means of transacting.
+
+**I'm not buying silver. I'm selling dollars.**
+
+That reframe is the governing idea behind AV: separating "the futures crowd changed its mind" from "metal is actually moving" from "the currency itself is being debased," instead of blurring all three into one number and one feeling.
+
+AV is an observability layer over the silver market, built on the idea that silver and gold are the measuring stick, not the thing being measured. The metal doesn't move — the dollar does. Every panel here is ultimately reading the dollar's condition off of something that holds still: paper positioning, physical supply, and the money it's all priced in.
 
 ### Functions / Panels
 
 #### Trading ("Paper Games")
 
-The paper market. Weekly CFTC Commitment of Traders positioning for COMEX silver and gold, normalized as **net-long % of open interest** so a reading from 2011 and one from today are directly comparable, then ranked against rolling 2-year and 5-year percentile windows: ≥90th percentile means the speculative crowd is crowded long (caution), ≤10th means genuinely capitulated (historically the more interesting zone). Around that core sit the supporting reads: the gold/silver ratio; a breakdown of *who* actually holds the long positions (producers/merchants vs. swap dealers vs. managed money vs. other reportables) — because "specs are long" means something different when it's hedge funds vs. commercials; **paper leverage** (total open interest in ounces vs. registered deliverable vault metal — silver runs roughly 5–6× more paper claims than deliverable ounces); the **futures curve spread** (front vs. next contract month, contango vs. backwardation — a physical-tightness tell); and daily trading volume. The question the panel answers: is speculative positioning stretched or washed out, and how does that paper stack up against the metal that could actually settle it?
+Silver doesn't move — traders' opinions of the dollar do. This panel reads those opinions off the paper market, but not every sub-panel is reading the same thing. **CoT positioning** is the actual sentiment read: weekly CFTC Commitment of Traders data, normalized as **net-long % of open interest** so a 2011 reading and today's are directly comparable, then ranked against rolling 2-year and 5-year percentiles — ≥90th means the crowd is crowded long (a bet the dollar keeps sliding), ≤10th means genuinely capitulated (that bet unwound). *Who* holds the longs (producers/merchants vs. swap dealers vs. managed money vs. other reportables) sharpens that read further — a hedge fund and a commercial aren't saying the same thing. **Daily volume** adds conviction to it: a positioning shift on heavy volume is a stronger signal than the same shift on thin trading.
+
+The rest of the panel isn't sentiment, and doesn't pretend to be. **Paper leverage** (open interest in ounces vs. registered deliverable metal — silver runs ~5–6× more paper claims than metal that could actually settle them) is structural, not a mood — it moves with the paper market's own growth or shrinkage. The **futures curve spread** (contango vs. backwardation) is a physical-tightness tell, not a feeling — it's useful precisely because it can agree or disagree with what the crowd is doing (capitulated positioning *and* deepening backwardation together is a much stronger story than either alone). Daily highs/lows are price action, downstream of sentiment plus everything else that moves a market that day — reading a wide range as "traders were scared" is an inferential leap this panel deliberately doesn't make on its own.
+
+None of it is a price call — it's a read on how stretched the crowd's dollar-skepticism currently is, and whether the metal underneath, and the market it trades in, actually back that read up.
+
+#### Inventory ("Stock & Flow")
+
+Trading is opinion. Inventory is the thing the opinion would eventually have to settle against — metal actually changing state or location, not sentiment about it. COMEX (New York) registered vs. eligible inventory by individual vault — **registered is warranted for delivery, eligible is just stored** — plus SHFE (Shanghai) warehouse stocks, PSLV's custodial holdings as an investment-demand proxy, and daily delivery notices. A nested **Delivery Behavior** layer is the honesty check on the paper story: it flags days where registered inventory jumped but almost no real delivery volume came with it — paper reshuffling wearing an inflow costume, not actual metal movement — and computes First Notice Day / Last Trade Day from COMEX's own contract rules.
+
+This tab also answers the question that started all of this: are we actually running out of silver? Not with a take — with the Silver Institute's annual supply/demand balance (the real structural deficit, kept deliberately separate from short-term noise), estimated above-ground stock with an honest ±20% uncertainty band, and U.S. **trade flow** by country from Census data, so import mix can be checked against the shortage story rather than taken on a YouTube bullion pusher's word. A personal stack calculator sits alongside it, for scale.
 
 #### Money Supply ("Dollars and Sense")
 
@@ -27,10 +49,6 @@ The denominator side of every metals chart. M2 money stock with the Fed's balanc
 #### Money Management
 
 How the Fed is actually put together, and how that reaches the banks people use. **Governance**: the Board of Governors, the 12 regional Reserve Banks and their presidents, and this year's FOMC voters (computed from the statutory rotation). **Bank lookup**: search any FDIC-insured institution, active or long gone, to see its Federal Reserve district, regulator, Fed membership, and holding company. **Transmission chain**: the policy rate → overnight funding → prime/mortgage/card rates → bank credit → discount window → loan officers' own reported lending standards (SLOOS), each charted on its own scale. No composite score, no soundness ratings.
-
-#### Inventory ("Stock & Flow")
-
-The physical layer. COMEX (New York) registered vs. eligible inventory by individual vault — registered is warranted for delivery, eligible is just stored, and sharp registered drops or reclassification spikes are delivery-pressure signals; SHFE (Shanghai) warehouse stocks for the eastern flow; PSLV's custodial holdings as an investment-demand reference; daily delivery notices (issued/stopped). A nested **Delivery Behavior** layer cross-checks these against each other — flagging days where registered inventory jumped but almost no actual delivery volume accompanied it (paper reshuffling wearing an inflow costume), and computing First Notice Day / Last Trade Day from COMEX's own contract rules. Longer-horizon context: the Silver Institute's annual supply/demand balance (the structural deficit, kept deliberately separate from short-term blips), estimated above-ground stock with explicit ±20% uncertainty, a personal stack calculator, and U.S. **trade flow** — where American silver supply actually comes from, by country, from Census import/export data.
 
 #### CATCOR (Catalyst Correlation)
 
