@@ -18,7 +18,7 @@ As a "good greek boy," I was raised with a heavy respect for silver. It was valu
 
 I bought "heavy" into the ramp-up of February 2026. The numbers aren't **really** important, especially because the definition of "heavy" changes more or less per person.
 
-That being said, I quickly realized that unless I was willing to lose a LOT, I wasn't going to make money in the short term, so I switched my thinking on it, (some may call that "cope") and decided that the money was deteriorating anyway. Dollars, in my mind, became useless for anything other than a means of transacting.
+That being said, I quickly realized that I wasn't going to make money "flipping" silver, so I switched my thinking on it, (some may call that "cope") and decided that "the money sucks anyway." Dollars, in my mind, became useless for anything other than a means of transacting.
 
 **I'm not buying silver. I'm selling dollars.**
 
