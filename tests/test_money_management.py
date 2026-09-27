@@ -483,3 +483,190 @@ async def test_top_banks_route_members_vs_all(tmp_db, client):
     d = (await client.get("/api/v1/bank-registry/db/top", params={"members_only": "false"})).json()["data"]
     assert [b["name"] for b in d["banks"]] == ["Nat", "NonMember", "StateMember"]
     assert d["population_assets"] == 1_200_000
+
+
+# --- Repo/reverse-repo net daily (2026-09 follow-up to soma-bank-growth) ---
+
+def _repo_op(operation_id, operation_date, operation_type, total_amt_accepted, **kw):
+    row = {
+        "operation_id": operation_id, "operation_date": operation_date, "operation_type": operation_type,
+        "term": "Overnight", "term_calendar_days": 1, "settlement_date": operation_date,
+        "maturity_date": operation_date, "total_amt_submitted": total_amt_accepted,
+        "total_amt_accepted": total_amt_accepted, "award_rate": None, "offering_rate": None,
+    }
+    row.update(kw)
+    return row
+
+
+def test_repo_net_daily_nets_repo_minus_reverse_repo_same_day(tmp_db):
+    db.insert_fed_repo_operations_rows([
+        _repo_op("RP1", "2024-01-05", "Repo", 100.0),
+        _repo_op("RRP1", "2024-01-05", "Reverse Repo", 30.0),
+    ])
+    rows = db.get_fed_repo_net_daily()
+    assert rows == [{"date": "2024-01-05", "net_repo": 70.0}]
+
+
+def test_repo_net_daily_reverse_repo_only_day_is_negative(tmp_db):
+    db.insert_fed_repo_operations_rows([_repo_op("RRP2", "2024-01-06", "Reverse Repo", 500.0)])
+    rows = db.get_fed_repo_net_daily()
+    assert rows == [{"date": "2024-01-06", "net_repo": -500.0}]
+
+
+def test_repo_net_daily_skips_null_amounts(tmp_db):
+    db.insert_fed_repo_operations_rows([_repo_op("RP2", "2024-01-07", "Repo", None)])
+    assert db.get_fed_repo_net_daily() == []
+
+
+async def test_repo_net_daily_route(tmp_db, client):
+    db.insert_fed_repo_operations_rows([
+        _repo_op("RP3", "2024-02-01", "Repo", 10.0),
+        _repo_op("RRP3", "2024-02-01", "Reverse Repo", 4.0),
+    ])
+    r = await client.get("/api/v1/fed-operational-flow/db/repo-net-daily")
+    assert r.status_code == 200
+    assert r.json()["data"] == [{"date": "2024-02-01", "net_repo": 6.0}]
+
+
+# --- Story A: bank growth vs. SOMA growth (soma-bank-growth-spec.md) --------
+
+def _bf_row(cert, repdte, assets_k):
+    return {"cert": cert, "repdte": repdte, "fed_district": 1, "total_assets_k": assets_k,
+            "deposits_k": None, "equity_k": None, "fetched_at": "t"}
+
+
+def test_bank_growth_vs_soma_growth_sums_every_real_filing_per_quarter(tmp_db):
+    db.upsert_bank_financials([
+        _bf_row(1, "2020-03-31", 1000.0), _bf_row(2, "2020-03-31", 500.0),
+        _bf_row(1, "2020-06-30", 1100.0), _bf_row(2, "2020-06-30", None),  # unsized bank contributes nothing
+        _bf_row(3, "2020-06-30", 200.0),  # a bank that didn't file in Q1 shows up honestly, no manufactured Q1 row
+    ])
+    rows = db.get_bank_growth_vs_soma_growth()
+    assert [r["quarter"] for r in rows] == ["2020-03-31", "2020-06-30"]
+    assert rows[0]["total_bank_assets"] == 1_500_000
+    assert rows[0]["bank_assets_qoq_change"] is None  # first quarter: no prior quarter to diff against
+    assert rows[1]["total_bank_assets"] == 1_300_000
+    assert rows[1]["bank_assets_qoq_change"] == -200_000
+
+
+def _soma_row(as_of_date, total):
+    return {"as_of_date": as_of_date, "total": total, "bills": None, "notesbonds": None, "tips": None,
+            "tips_inflation_compensation": None, "frn": None, "mbs": None, "cmbs": None, "agencies": None}
+
+
+def test_bank_growth_vs_soma_growth_resamples_soma_as_of_quarter_end(tmp_db):
+    db.upsert_bank_financials([_bf_row(1, "2020-03-31", 1000.0), _bf_row(1, "2020-06-30", 1000.0)])
+    db.upsert_fed_soma_holdings_rows([
+        _soma_row("2020-01-08", 4_000_000_000.0),
+        _soma_row("2020-03-25", 4_100_000_000.0),  # latest real reading on/before 03-31
+        _soma_row("2020-07-01", 4_500_000_000.0),  # AFTER 06-30, must not be used for that quarter
+    ])
+    rows = db.get_bank_growth_vs_soma_growth()
+    assert rows[0]["soma_holdings"] == 4_100_000_000.0
+    assert rows[0]["soma_qoq_change"] is None
+    assert rows[1]["soma_holdings"] == 4_100_000_000.0  # 06-30's on/before reading is still the 03-25 one
+    assert rows[1]["soma_qoq_change"] == 0.0
+
+
+async def test_bank_growth_vs_soma_growth_route(tmp_db, client):
+    db.upsert_bank_financials([_bf_row(1, "2021-12-31", 2000.0)])
+    r = await client.get("/api/v1/fed-money-creation-vs-bank-growth/db")
+    assert r.status_code == 200
+    assert r.json()["data"] == [{
+        "quarter": "2021-12-31", "total_bank_assets": 2_000_000.0,
+        "bank_assets_qoq_change": None, "soma_holdings": None, "soma_qoq_change": None,
+    }]
+
+
+# --- Story B: top-N cohort growth distribution (soma-bank-growth-spec.md) --
+
+def test_bank_growth_distribution_cohort_is_fixed_by_latest_size(tmp_db):
+    db.upsert_bank_financials([
+        # Q1: bank 2 is bigger than bank 1. Q2: bank 1 overtakes bank 2 and is now the latest-quarter
+        # #1 by size — the cohort should be picked from Q2 (latest), not Q1.
+        _bf_row(1, "2020-03-31", 100.0), _bf_row(2, "2020-03-31", 200.0),
+        _bf_row(1, "2020-06-30", 500.0), _bf_row(2, "2020-06-30", 200.0),
+    ])
+    d = db.get_bank_growth_distribution(n=1)
+    assert [c["cert"] for c in d["cohort"]] == [1]  # latest-quarter #1 by size, not Q1's #1
+    # the fixed cohort (bank 1) still contributes its OWN Q1 total_assets_k, even though it
+    # wasn't the top bank that quarter — the cohort is fixed by size, tracked across all quarters.
+    assert d["series"][0]["top_n_total"] == 100_000.0
+    assert d["series"][1]["top_n_total"] == 500_000.0
+
+
+def test_bank_growth_distribution_share_is_against_net_system_growth(tmp_db):
+    db.upsert_bank_financials([
+        _bf_row(1, "2020-03-31", 1000.0), _bf_row(2, "2020-03-31", 1000.0),
+        _bf_row(1, "2020-06-30", 1200.0), _bf_row(2, "2020-06-30", 1000.0),
+    ])
+    d = db.get_bank_growth_distribution(n=1)
+    q2 = d["series"][1]
+    # system grew by 200k (2200k - 2000k); cohort (bank 1 alone) grew by 200k too -> share 1.0
+    assert q2["system_qoq_change"] == 200_000.0
+    assert q2["top_n_qoq_change"] == 200_000.0
+    assert q2["top_n_growth_share"] == 1.0
+
+
+def test_bank_growth_distribution_share_is_none_when_denominator_is_zero_or_null(tmp_db):
+    db.upsert_bank_financials([
+        _bf_row(1, "2020-03-31", 1000.0),
+        _bf_row(1, "2020-06-30", 1000.0),  # no change quarter-over-quarter -> system_qoq_change == 0
+    ])
+    d = db.get_bank_growth_distribution(n=1)
+    assert d["series"][0]["top_n_growth_share"] is None  # first quarter: no prior to diff
+    assert d["series"][1]["system_qoq_change"] == 0.0
+    assert d["series"][1]["top_n_growth_share"] is None  # never divide by zero
+
+
+async def test_bank_growth_distribution_route(tmp_db, client):
+    db.upsert_bank_financials([_bf_row(1, "2022-03-31", 900.0)])
+    r = await client.get("/api/v1/fed-bank-growth-distribution/db", params={"n": 1})
+    assert r.status_code == 200
+    d = r.json()["data"]
+    assert d["cohort"] == [{"cert": 1, "name": "FDIC cert 1", "total_assets_k": 900.0}]
+    assert d["series"][0]["quarter"] == "2022-03-31"
+
+
+# --- CUSIP-level per-operation drill-down (soma-bank-growth-spec.md precursor #1) ---
+
+def _soma_txn(operation_id, operation_date, direction="P", detail_json=None, **kw):
+    row = {
+        "operation_id": operation_id, "operation_date": operation_date, "security_type": "Treasury",
+        "operation_type": "Purchase", "direction": direction, "settlement_date": operation_date,
+        "total_amt_submitted": 100.0, "total_amt_accepted": 100.0, "detail_json": detail_json,
+    }
+    row.update(kw)
+    return row
+
+
+def test_get_fed_soma_transaction_detail_parses_raw_details_verbatim(tmp_db):
+    db.insert_fed_soma_transactions_rows([
+        _soma_txn("RP 092526 25", "2025-09-26", detail_json='{"cusip": "912828XG8", "parAmount": 1000}'),
+    ])
+    d = db.get_fed_soma_transaction_detail("RP 092526 25")
+    assert d["operation_id"] == "RP 092526 25"
+    assert d["raw_details"] == {"cusip": "912828XG8", "parAmount": 1000}
+
+
+def test_get_fed_soma_transaction_detail_null_detail_json_is_not_an_error(tmp_db):
+    db.insert_fed_soma_transactions_rows([_soma_txn("RP1", "2025-01-01", detail_json=None)])
+    d = db.get_fed_soma_transaction_detail("RP1")
+    assert d is not None
+    assert d["raw_details"] is None
+
+
+def test_get_fed_soma_transaction_detail_missing_operation_is_none(tmp_db):
+    assert db.get_fed_soma_transaction_detail("NOPE") is None
+
+
+async def test_fed_soma_transaction_detail_route(tmp_db, client):
+    db.insert_fed_soma_transactions_rows([
+        _soma_txn("RP2", "2025-02-02", detail_json='{"cusip": "912828AB1"}'),
+    ])
+    r = await client.get("/api/v1/fed-operational-flow/db/transactions/RP2/detail")
+    assert r.status_code == 200
+    assert r.json()["data"]["raw_details"] == {"cusip": "912828AB1"}
+
+    r404 = await client.get("/api/v1/fed-operational-flow/db/transactions/NOPE/detail")
+    assert r404.status_code == 404

@@ -1,4 +1,4 @@
-# ArgentVigil v2.29.0
+# ArgentVigil v2.36.0
 
 Silver market observability, with gold as comparative context. AV exists to help understand the silver market as it actually is — paper positioning, physical movement, and the currency it's priced in — not to trade it. No price targets, no predictions, no risk commentary: instrumentation built to be right about what already happened.
 
