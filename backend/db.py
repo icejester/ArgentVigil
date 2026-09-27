@@ -659,6 +659,85 @@ CREATE TABLE IF NOT EXISTS fed_governance_meta (
     rotation_json TEXT,
     loaded_at TEXT
 );
+
+-- Fed Operational Flow (more-fed-spec.md, Money Management Story #5a).
+-- NY Fed Markets Data API's repo/reverse-repo operations — a TEMPORARY
+-- liquidity operation (same-day- or term-reversing), never changes SOMA's
+-- size or the balance sheet total, structurally different from an outright
+-- purchase/sale (see fed_soma_transactions below). Append-only: a published
+-- operation result is a historical fact NY Fed never revises, same category
+-- as CFTC's CoT reports. operation_id is a real NY Fed-issued unique string
+-- (confirmed live, e.g. "RP 092526 25") shared across both repo and reverse
+-- repo rows, so it alone is PK — no composite-key collision risk.
+CREATE TABLE IF NOT EXISTS fed_repo_operations (
+    operation_id TEXT PRIMARY KEY,
+    operation_date TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    term TEXT,
+    term_calendar_days INTEGER,
+    settlement_date TEXT,
+    maturity_date TEXT,
+    total_amt_submitted REAL,
+    total_amt_accepted REAL,
+    award_rate REAL,
+    offering_rate REAL,
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
+
+-- NY Fed Markets Data API's Treasury Securities / Agency MBS (AMBS)
+-- outright purchase/sale operations — the PERMANENT operations that
+-- actually grow/shrink SOMA, and by extension WALCL (unlike
+-- fed_repo_operations above). Append-only, same reasoning. security_type
+-- distinguishes the "treasury" vs "ambs" endpoint family (their real field
+-- names differ — confirmed live: treasury uses totalParAmtAccepted, ambs
+-- uses totalAmtAcceptedPar — so total_amt_accepted below is normalized at
+-- persist time, not a shared upstream field name). detail_json carries the
+-- per-CUSIP/security breakdown verbatim (treasury's `details` array) rather
+-- than fully normalizing it in v1, per the spec's explicit "don't
+-- over-engineer the first cut" call (same move program_tags took in OFAC).
+CREATE TABLE IF NOT EXISTS fed_soma_transactions (
+    operation_id TEXT PRIMARY KEY,
+    operation_date TEXT NOT NULL,
+    security_type TEXT NOT NULL,
+    operation_type TEXT,
+    direction TEXT,
+    settlement_date TEXT,
+    total_amt_submitted REAL,
+    total_amt_accepted REAL,
+    detail_json TEXT,
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
+
+-- NY Fed's own published SOMA total-holdings snapshot
+-- (markets.newyorkfed.org/api/soma/summary.json), weekly, real history back
+-- to 2003-07-09. This is the AUTHORITATIVE "how much has the Fed created
+-- and is currently holding" level — sourced directly, not derived from
+-- fed_soma_transactions' operation log. A real, confirmed discrepancy
+-- exists between the two: summing fed_soma_transactions' purchases minus
+-- sales overstates real net growth by roughly 2x (confirmed live: ~$10.5T
+-- derived vs. this table's real ~$5.6T growth since 2007), because a
+-- maturing security rolls off SOMA silently — it's never recorded as a
+-- "sale" in the operations log — so routine reinvestment purchases (buying
+-- a replacement for something that just matured) are indistinguishable
+-- from genuine new-money QE purchases in that data. This table exists
+-- specifically so the UI can show the real number and flag that gap,
+-- rather than either hiding it or manufacturing a corrected-but-invented
+-- figure. Upsert (not append-only) — asOfDate rows can in principle be
+-- revised by NY Fed, and a re-fetch of the same range should always leave
+-- the latest real value in place.
+CREATE TABLE IF NOT EXISTS fed_soma_holdings (
+    as_of_date TEXT PRIMARY KEY,
+    total REAL,
+    bills REAL,
+    notesbonds REAL,
+    tips REAL,
+    tips_inflation_compensation REAL,
+    frn REAL,
+    mbs REAL,
+    cmbs REAL,
+    agencies REAL,
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1738,6 +1817,249 @@ def get_treasury_auctions(security_type: str | None = None, since: str | None = 
         query += " AND auction_date >= ?"
         params.append(since)
     query += " ORDER BY auction_date"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+_FED_REPO_OPERATIONS_COLUMNS = [
+    "operation_id", "operation_date", "operation_type", "term", "term_calendar_days",
+    "settlement_date", "maturity_date", "total_amt_submitted", "total_amt_accepted",
+    "award_rate", "offering_rate",
+]
+
+
+def insert_fed_repo_operations_rows(rows: list[dict]):
+    """Append-only: a published NY Fed repo/reverse-repo operation result is
+    a historical fact never revised, same category as CFTC's CoT reports —
+    see fed_repo_operations' own DDL comment. operation_id is a real
+    NY Fed-issued unique string, confirmed live, shared across both repo and
+    reverse-repo rows."""
+    with get_conn() as conn:
+        conn.executemany(
+            f"""INSERT OR IGNORE INTO fed_repo_operations ({", ".join(_FED_REPO_OPERATIONS_COLUMNS)})
+               VALUES ({", ".join(f":{c}" for c in _FED_REPO_OPERATIONS_COLUMNS)})""",
+            rows,
+        )
+
+
+def get_fed_repo_operations(since: str | None = None) -> list[dict]:
+    """Rows ordered oldest-to-newest by operation_date. since (ISO date)
+    filters to the trailing window the frontend actually renders — the full
+    table can hold real history back to 2007."""
+    query = "SELECT * FROM fed_repo_operations WHERE 1=1"
+    params: list = []
+    if since is not None:
+        query += " AND operation_date >= ?"
+        params.append(since)
+    query += " ORDER BY operation_date"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_fed_repo_operations_earliest_date() -> str | None:
+    """MIN(operation_date), or None if empty. Used to tell 'genuinely
+    backfilled to FED_OPERATIONAL_FLOW_BACKFILL_START' apart from 'has a
+    few rows from a partial/failed prior attempt' — a real live bug found
+    on Test AV: gating the backfill decision on table-non-empty alone let a
+    partially-failed run (a few rows landed, most didn't) look
+    indistinguishable from a real full backfill, permanently stranding the
+    table on the narrow rolling-window path. See
+    _fetch_and_persist_fed_operational_flow's own docstring for the full
+    story."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT MIN(operation_date) AS d FROM fed_repo_operations").fetchone()
+        return row["d"] if row and row["d"] else None
+
+
+def get_fed_repo_net_daily(since: str | None = None) -> list[dict]:
+    """Net repo minus reverse-repo total_amt_accepted, one row per real
+    operation_date. Repo = the Fed lending cash against collateral (adds
+    liquidity that day); reverse repo = the Fed borrowing cash, taking a
+    security as collateral (drains liquidity that day) — confirmed live
+    against markets.newyorkfed.org/api/rp/results/search.json that
+    operation_type is exactly the literal strings "Repo"/"Reverse Repo".
+    A FLOW, not a running balance like get_fed_soma_cumulative_net — repo
+    positions unwind on their own term, so there's no meaningful cumulative
+    total to accumulate (unlike an outright purchase, which sits on the
+    balance sheet until sold or matured). Positive = net repo (Fed added
+    liquidity that day), negative = net reverse repo (Fed drained it)."""
+    query = "SELECT operation_date, operation_type, total_amt_accepted FROM fed_repo_operations WHERE 1=1"
+    params: list = []
+    if since is not None:
+        query += " AND operation_date >= ?"
+        params.append(since)
+    query += " ORDER BY operation_date"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    by_date: dict[str, float] = {}
+    for r in rows:
+        amt = r["total_amt_accepted"]
+        if amt is None:
+            continue
+        sign = 1 if r["operation_type"] == "Repo" else -1 if r["operation_type"] == "Reverse Repo" else 0
+        by_date[r["operation_date"]] = by_date.get(r["operation_date"], 0.0) + sign * amt
+    return [{"date": d, "net_repo": v} for d, v in sorted(by_date.items())]
+
+
+_FED_SOMA_TRANSACTIONS_COLUMNS = [
+    "operation_id", "operation_date", "security_type", "operation_type", "direction",
+    "settlement_date", "total_amt_submitted", "total_amt_accepted", "detail_json",
+]
+
+
+def insert_fed_soma_transactions_rows(rows: list[dict]):
+    """Append-only, same reasoning as insert_fed_repo_operations_rows — an
+    outright Treasury/AMBS purchase or sale result is never revised once
+    published."""
+    with get_conn() as conn:
+        conn.executemany(
+            f"""INSERT OR IGNORE INTO fed_soma_transactions ({", ".join(_FED_SOMA_TRANSACTIONS_COLUMNS)})
+               VALUES ({", ".join(f":{c}" for c in _FED_SOMA_TRANSACTIONS_COLUMNS)})""",
+            rows,
+        )
+
+
+def get_fed_soma_transactions(since: str | None = None) -> list[dict]:
+    """Rows ordered oldest-to-newest by operation_date. since (ISO date)
+    filters to the trailing window the frontend actually renders."""
+    query = "SELECT * FROM fed_soma_transactions WHERE 1=1"
+    params: list = []
+    if since is not None:
+        query += " AND operation_date >= ?"
+        params.append(since)
+    query += " ORDER BY operation_date"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_fed_soma_transactions_earliest_date() -> str | None:
+    """MIN(operation_date), or None if empty — same purpose as
+    get_fed_repo_operations_earliest_date, for the soma table."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT MIN(operation_date) AS d FROM fed_soma_transactions").fetchone()
+        return row["d"] if row and row["d"] else None
+
+
+def get_fed_soma_cumulative_net() -> list[dict]:
+    """Running net of outright Fed Desk purchases minus sales, one point per
+    real operation_date that had at least one transaction. Repo/reverse-repo
+    deliberately excluded — see fed_soma_transactions' own DDL comment: repo
+    is a same-day- or term-reversing collateralized loan, not money
+    creation, and blending it in here would misrepresent the one series that
+    actually is.
+
+    CONFIRMED NOT the true net balance-sheet change, by roughly 2x — a real
+    finding, not a bug in this math (see fed_soma_holdings' own DDL comment
+    for the full story): a maturing security rolls off SOMA silently,
+    never recorded as a "sale" anywhere in this operations log, so a routine
+    reinvestment purchase (buying a replacement for something that just
+    matured) is indistinguishable here from a genuine new-money QE purchase.
+    This function is kept — and its result deliberately still labeled
+    "gross purchases minus gross sales" wherever the frontend renders it,
+    never "money created" — as a cross-check against fed_soma_holdings'
+    real published level, specifically so that ~2x gap stays visible on the
+    page rather than silently reconciled or hidden. get_fed_soma_holdings is
+    the authoritative "how much has the Fed created and is holding" figure.
+    Computed at read time, never persisted, per the standing derived-values
+    convention — a cumulative sum over an append-only table is cheap to
+    recompute on every request at this row count (thousands, not
+    millions)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT operation_date,
+                      SUM(CASE WHEN direction = 'P' THEN total_amt_accepted ELSE 0 END) AS purchased,
+                      SUM(CASE WHEN direction = 'S' THEN total_amt_accepted ELSE 0 END) AS sold
+               FROM fed_soma_transactions
+               WHERE total_amt_accepted IS NOT NULL
+               GROUP BY operation_date
+               ORDER BY operation_date"""
+        ).fetchall()
+    cumulative = 0.0
+    out = []
+    for r in rows:
+        daily_net = (r["purchased"] or 0.0) - (r["sold"] or 0.0)
+        cumulative += daily_net
+        out.append({"date": r["operation_date"], "cumulative_net": cumulative, "daily_net": daily_net})
+    return out
+
+
+def get_fed_soma_transaction_detail(operation_id: str) -> dict | None:
+    """Per-operation drill-down over fed_soma_transactions.detail_json
+    (soma-bank-growth-spec.md precursor item #1) — a minimal read-only
+    pass-through, not a step toward full CUSIP-level holdings
+    reconstruction (out of scope, see the spec). Returns None only if
+    operation_id doesn't exist in the table at all; an existing row with no
+    stored detail_json (the common case — NY Fed's details-mode response
+    only ever covers a recent treasury purchase within a rolling window,
+    never AMBS, never the historical backfill) returns a real dict with
+    raw_details: None, which the frontend should render as "no detail
+    available" rather than treat as an error.
+
+    raw_details is the parsed JSON exactly as stored (detail_json is a
+    verbatim json.dumps(op["details"]) of NY Fed's raw response, see
+    backend/collector.py's _fed_soma_txn_row) — no assumed field names.
+    No test fixture, doc, or code anywhere in this repo confirms a fixed
+    per-CUSIP schema, so this is intentionally unnormalized."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT operation_id, operation_date, security_type, direction,
+                      total_amt_accepted, detail_json
+               FROM fed_soma_transactions WHERE operation_id = ?""",
+            (operation_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    raw_details = json.loads(row["detail_json"]) if row["detail_json"] else None
+    return {
+        "operation_id": row["operation_id"],
+        "operation_date": row["operation_date"],
+        "security_type": row["security_type"],
+        "direction": row["direction"],
+        "total_amt_accepted": row["total_amt_accepted"],
+        "raw_details": raw_details,
+    }
+
+
+_FED_SOMA_HOLDINGS_COLUMNS = [
+    "as_of_date", "total", "bills", "notesbonds", "tips",
+    "tips_inflation_compensation", "frn", "mbs", "cmbs", "agencies",
+]
+
+
+def upsert_fed_soma_holdings_rows(rows: list[dict]):
+    """Upsert keyed on as_of_date — NY Fed's summary.json always returns
+    its full real history in one call (no incremental/delta fetch exists),
+    so every fetch naturally re-sends every row; upsert makes re-sending an
+    already-persisted date a no-op rather than a duplicate-key error, and
+    correctly picks up a real revision if NY Fed ever republishes a past
+    week's total."""
+    with get_conn() as conn:
+        conn.executemany(
+            f"""INSERT INTO fed_soma_holdings ({", ".join(_FED_SOMA_HOLDINGS_COLUMNS)})
+               VALUES ({", ".join(f":{c}" for c in _FED_SOMA_HOLDINGS_COLUMNS)})
+               ON CONFLICT (as_of_date) DO UPDATE SET
+                   {", ".join(f"{c} = excluded.{c}" for c in _FED_SOMA_HOLDINGS_COLUMNS if c != "as_of_date")},
+                   fetched_at = datetime('now')""",
+            rows,
+        )
+
+
+def get_fed_soma_holdings(since: str | None = None) -> list[dict]:
+    """Rows ordered oldest-to-newest by as_of_date. This is the real,
+    NY-Fed-published SOMA total-holdings level — the authoritative "how
+    much has the Fed created and is holding" series (see this table's own
+    DDL comment and get_fed_soma_cumulative_net's docstring for the
+    cross-check story)."""
+    query = "SELECT * FROM fed_soma_holdings WHERE 1=1"
+    params: list = []
+    if since is not None:
+        query += " AND as_of_date >= ?"
+        params.append(since)
+    query += " ORDER BY as_of_date"
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
@@ -2945,6 +3267,121 @@ def get_bank_history(cert: int) -> list[dict]:
         })
     return out
 
+
+
+def _national_bank_asset_totals() -> list[dict]:
+    """Per quarter, every real filing summed nationally (active, sized
+    banks only — meaning every (cert, repdte) row with a non-NULL
+    total_assets_k for that quarter; a bank that stops filing after being
+    acquired/closed naturally drops out of later quarters on its own, no
+    manufactured carry-forward, per the nulls-over-zeros convention). Same
+    shape as get_district_quarter_totals but summed nationally rather than
+    per-district — factored out as its own function since both
+    get_bank_growth_vs_soma_growth and get_bank_growth_distribution need
+    this exact per-quarter total and should compute it once, not twice."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT repdte, SUM(total_assets_k) AS assets_k
+               FROM bank_financials WHERE total_assets_k IS NOT NULL
+               GROUP BY repdte ORDER BY repdte"""
+        ).fetchall()
+    return [{"repdte": r["repdte"], "total_assets": r["assets_k"] * 1000} for r in rows]
+
+
+def get_bank_growth_vs_soma_growth() -> list[dict]:
+    """Story A (soma-bank-growth-spec.md): one quarterly row pairing total
+    U.S. bank assets (bank_financials, every real filing that quarter,
+    summed) against Fed SOMA holdings (fed_soma_holdings, the real
+    NY-Fed-published level, resampled to quarter-end via the AS-OF
+    nearest-date-on-or-before convention — see fed_structure._asof, the
+    same helper districts_history() already uses for H.4.1 vs.
+    bank_financials). A read-time join of two independently-measured,
+    already-ingested series — no new upstream fetch. Two real totals shown
+    side by side for comparison; this function computes no causal claim and
+    none should be drawn from its output."""
+    from . import fed_structure  # local import: fed_structure imports db, avoids a circular import at module load
+
+    totals = _national_bank_asset_totals()
+    soma_asof_rows = [{"date": h["as_of_date"], "value": h["total"]} for h in get_fed_soma_holdings() if h["total"] is not None]
+
+    out = []
+    prev_bank_assets = None
+    prev_soma = None
+    for t in totals:
+        soma_level = fed_structure._asof(soma_asof_rows, t["repdte"])
+        out.append({
+            "quarter": t["repdte"],
+            "total_bank_assets": t["total_assets"],
+            "bank_assets_qoq_change": (t["total_assets"] - prev_bank_assets) if prev_bank_assets is not None else None,
+            "soma_holdings": soma_level,
+            "soma_qoq_change": (soma_level - prev_soma) if (soma_level is not None and prev_soma is not None) else None,
+        })
+        prev_bank_assets = t["total_assets"]
+        prev_soma = soma_level if soma_level is not None else prev_soma
+    return out
+
+
+def get_bank_growth_distribution(n: int = 10) -> dict:
+    """Story B (soma-bank-growth-spec.md): does a fixed cohort of the N
+    largest banks (by CURRENT/latest total_assets_k — a stable cohort
+    tracked across all quarters, not re-ranked each quarter, so the trend
+    line reads as "these same banks over time" rather than a noisier
+    different-banks-each-quarter series) capture a disproportionate share
+    of the system's quarterly growth, and does that share move alongside
+    Fed SOMA activity? Growth share is against NET SYSTEM-WIDE growth (this
+    quarter's total_bank_assets delta from get_bank_growth_vs_soma_growth,
+    reused rather than recomputed) — matches Story A's own delta exactly,
+    can legitimately exceed 100% or go negative in an odd quarter (that's a
+    real, informative reading, never clamped or hidden). Correlation only;
+    no causal claim is supported by this data, per the same standing rule
+    as Story A."""
+    with get_conn() as conn:
+        latest = conn.execute(
+            "SELECT MAX(repdte) FROM bank_financials WHERE total_assets_k IS NOT NULL"
+        ).fetchone()[0]
+        cohort_rows = [] if latest is None else conn.execute(
+            """SELECT f.cert, COALESCE(r.name, 'FDIC cert ' || f.cert) AS name, f.total_assets_k
+               FROM bank_financials f LEFT JOIN bank_registry r ON r.cert = f.cert
+               WHERE f.repdte = ? AND f.total_assets_k IS NOT NULL
+               ORDER BY f.total_assets_k DESC LIMIT ?""",
+            (latest, n),
+        ).fetchall()
+        cohort = [{"cert": r["cert"], "name": r["name"], "total_assets_k": r["total_assets_k"]} for r in cohort_rows]
+        certs = [c["cert"] for c in cohort]
+
+        per_quarter_top_n: dict[str, float] = {}
+        if certs:
+            marks = ",".join("?" * len(certs))
+            for r in conn.execute(
+                f"""SELECT repdte, SUM(total_assets_k) AS assets_k FROM bank_financials
+                    WHERE cert IN ({marks}) AND total_assets_k IS NOT NULL GROUP BY repdte""",
+                certs,
+            ).fetchall():
+                per_quarter_top_n[r["repdte"]] = r["assets_k"] * 1000
+
+    system_series = get_bank_growth_vs_soma_growth()  # reuse Story A's own per-quarter totals, never recomputed twice
+    series = []
+    prev_top_n_total = None
+    for q in system_series:
+        top_n_total = per_quarter_top_n.get(q["quarter"])
+        top_n_qoq_change = (top_n_total - prev_top_n_total) if (top_n_total is not None and prev_top_n_total is not None) else None
+        system_qoq_change = q["bank_assets_qoq_change"]
+        top_n_growth_share = (
+            top_n_qoq_change / system_qoq_change
+            if (top_n_qoq_change is not None and system_qoq_change not in (None, 0))
+            else None
+        )
+        series.append({
+            "quarter": q["quarter"],
+            "top_n_total": top_n_total,
+            "top_n_qoq_change": top_n_qoq_change,
+            "top_n_growth_share": top_n_growth_share,
+            "system_qoq_change": system_qoq_change,
+            "soma_qoq_change": q["soma_qoq_change"],
+        })
+        if top_n_total is not None:
+            prev_top_n_total = top_n_total
+    return {"cohort": cohort, "series": series}
 
 
 def get_top_banks(n: int = 100, members_only: bool = True) -> dict:

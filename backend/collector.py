@@ -54,6 +54,7 @@ handlers, unaffected by this split.
 """
 
 import asyncio
+import json
 import os
 import signal
 import xml.etree.ElementTree as ET
@@ -152,6 +153,31 @@ TREASURY_AUCTIONS_BASE = "https://api.fiscaldata.treasury.gov/services/api/fisca
 # announcement lead time + settlement lag with margin, without re-pulling
 # the full 11,000+-row history on every fetch.
 TREASURY_AUCTIONS_WINDOW_DAYS = 120
+
+# NY Fed Markets Data API (more-fed-spec.md) — public, no key, no
+# documented rate limit, confirmed live no User-Agent header required
+# (unlike OFAC's sanctionslistservice.ofac.treas.gov, which 403s without
+# one). Real endpoint shapes confirmed live 2026-09 by direct request
+# against the API, NOT the spec's own guessed paths — two corrections from
+# the spec's open questions: the historical search endpoint is
+# /api/rp/results/search.json (not /api/rp/repo/all/results/search.json,
+# which 400s), and Treasury/AMBS operations need a `results/{include}/`
+# segment (details|summary) the spec didn't know about
+# (/api/{tsy|ambs}/{purchases|sales}/results/{details|summary}/....json).
+NY_FED_MARKETS_BASE = "https://markets.newyorkfed.org/api"
+# Real history confirmed live back to 2007-01-02 (repo) — used once, on
+# first deploy, to seed real multi-year history in one pass rather than
+# accumulating forward-only from deployment day (the way futures_curve_spread
+# had to, for lack of a backfill-capable source). A single search.json
+# request over the full range is ~5.5MB/6,279 rows for repo, trivial for one
+# HTTP call — no per-quarter pagination needed the way bank_financials'
+# backfill required.
+FED_OPERATIONAL_FLOW_BACKFILL_START = "2007-01-01"
+# Each tick re-requests a trailing window (not just "since last fetch") to
+# catch same-day corrections/late-posted results — cheap (a few hundred KB)
+# and INSERT OR IGNORE makes re-seeing an already-persisted operation_id a
+# no-op.
+FED_OPERATIONAL_FLOW_TICK_LOOKBACK_DAYS = 14
 
 
 _MONTH_NAME_TO_NUM = {
@@ -2614,6 +2640,301 @@ async def _refresh_cot_pipeline():
     await asyncio.to_thread(pipeline_run.run_pipeline_once)
 
 
+# Fed Operational Flow (more-fed-spec.md, Money Management Story #5). NY Fed
+# Markets Data API — the "watch it happen" layer Transmission Chain doesn't
+# cover: repo/reverse-repo (temporary, never changes SOMA/WALCL) and outright
+# Treasury/AMBS purchases/sales (permanent, what actually grows/shrinks
+# SOMA). Two real, structurally different mechanisms — kept in separate
+# tables/functions/UI rows per the spec's explicit "never visually merge
+# these" rule, sharing one SourceDefinition (fed_operational_flow) since
+# both are cheap daily pulls from the same host, same pattern ofac_sanctions
+# already uses for four tables under one source key.
+
+
+def _fed_repo_op_row(op: dict) -> dict:
+    """One fed_repo_operations row from a raw NY Fed /api/rp/results/
+    search.json operation. details[] carries a per-security-type rate
+    breakdown (Treasury/Agency/Mortgage-Backed for repo, just Treasury for
+    reverse repo) — award/offering rate is taken from the first detail row
+    with a real numeric rate, since a single operation has one economically
+    meaningful rate for this table's purposes (the per-security-type split
+    isn't lost — details[] itself isn't persisted here, matching the spec's
+    'don't over-engineer the first cut' call for the SOMA side; this table
+    has no detail_json column since repo/reverse-repo's per-security split
+    is materially smaller/less interesting than SOMA's per-CUSIP breakdown)."""
+    details = op.get("details") or []
+    award_rate = offering_rate = None
+    for d in details:
+        ar = d.get("percentAwardRate")
+        orate = d.get("percentOfferingRate")
+        if award_rate is None and isinstance(ar, (int, float)):
+            award_rate = ar
+        if offering_rate is None and isinstance(orate, (int, float)):
+            offering_rate = orate
+        if award_rate is not None and offering_rate is not None:
+            break
+    return {
+        "operation_id": op["operationId"],
+        "operation_date": op.get("operationDate"),
+        "operation_type": op.get("operationType"),
+        "term": op.get("term"),
+        "term_calendar_days": op.get("termCalenderDays"),
+        "settlement_date": op.get("settlementDate"),
+        "maturity_date": op.get("maturityDate"),
+        "total_amt_submitted": op.get("totalAmtSubmitted"),
+        "total_amt_accepted": op.get("totalAmtAccepted"),
+        "award_rate": award_rate,
+        "offering_rate": offering_rate,
+    }
+
+
+async def _fetch_and_persist_fed_repo_operations(since: str) -> int:
+    """Confirmed live: /api/rp/results/search.json?startDate=&endDate=
+    returns BOTH repo and reverse-repo operations in one call (operationType
+    distinguishes them) — the spec's own guessed path,
+    /api/rp/repo/all/results/search.json, 400s; this is the real endpoint,
+    found in the NY Fed markets-api MCP server's source (trygordian/
+    mcp-newyorkfed) and confirmed against a live request before writing this
+    function, same 'confirm live, don't guess the shape' discipline every
+    other AV source follows. No auth/key required, confirmed no User-Agent
+    header needed either (unlike OFAC's source)."""
+    resp = await _client.get(
+        f"{NY_FED_MARKETS_BASE}/rp/results/search.json",
+        params={"startDate": since},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    ops = resp.json().get("repo", {}).get("operations", [])
+    rows = [_fed_repo_op_row(op) for op in ops if op.get("operationId")]
+    if rows:
+        db.insert_fed_repo_operations_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_fed_repo_operations_backfill() -> int:
+    return await _fetch_and_persist_fed_repo_operations(FED_OPERATIONAL_FLOW_BACKFILL_START)
+
+
+def _fed_soma_txn_row(op: dict, security_type: str, direction: str) -> dict:
+    """One fed_soma_transactions row. Treasury and AMBS responses use
+    different field names for the same concept (confirmed live:
+    totalParAmtAccepted for treasury, totalAmtAcceptedPar for ambs) —
+    normalized to this table's shared total_amt_submitted/total_amt_accepted
+    columns rather than persisting either upstream name verbatim. details[]
+    (per-CUSIP for treasury, absent for ambs' summary-mode response used
+    here) is stashed as detail_json verbatim, per the spec's explicit
+    'store the raw breakdown as JSON, don't fully normalize it in v1' call."""
+    if security_type == "treasury":
+        total_submitted = op.get("totalParAmtSubmitted")
+        total_accepted = op.get("totalParAmtAccepted")
+    else:  # ambs
+        total_submitted = op.get("totalAmtSubmittedPar") or None
+        total_accepted = op.get("totalAmtAcceptedPar") or None
+    return {
+        "operation_id": op["operationId"],
+        "operation_date": op.get("operationDate"),
+        "security_type": security_type,
+        "operation_type": op.get("operationType"),
+        "direction": direction,
+        "settlement_date": op.get("settlementDate"),
+        "total_amt_submitted": total_submitted,
+        "total_amt_accepted": total_accepted,
+        "detail_json": json.dumps(op["details"]) if op.get("details") else None,
+    }
+
+
+# Real bug found live on Test AV (2026-09-27): 'details' mode has an
+# upstream response-size cap search.json's 'summary' mode doesn't share —
+# confirmed live by bisection, treasury/purchases/details/search.json 400s
+# with content-length: 0 for any startDate before ~2025-10 (61 operations x
+# ~25 CUSIPs/operation already trips it at 2025-09-15; 'summary' mode
+# handles the SAME 61-operation window, and the full 2007-present range,
+# fine). This is NOT a documented limit — no error body, just a bare 400 —
+# so rather than guess a day-count threshold that could still trip on a
+# denser future window, 'details' mode is only ever requested for the
+# narrow FED_OPERATIONAL_FLOW_TICK_LOOKBACK_DAYS steady-state window
+# (confirmed live that window's real range succeeds); every wide backfill
+# pull uses 'summary' unconditionally. The real consequence found live: the
+# original always-details-for-treasury version silently never backfilled
+# fed_soma_transactions at all on first deploy — the backfill tick's wide
+# range 400'd, the exception aborted _fetch_and_persist_fed_soma_family
+# before persisting anything, and _fetch_and_persist_fed_operational_flow's
+# own "is this the first run" gate looks at fed_repo_operations only (which
+# HAD succeeded), so every later tick saw a non-empty repo table and
+# downgraded straight to the narrow rolling window — soma's full history
+# was never going to land, ever, without this fix.
+FED_OPERATIONAL_FLOW_DETAILS_SAFE_DAYS = FED_OPERATIONAL_FLOW_TICK_LOOKBACK_DAYS
+
+
+async def _fetch_and_persist_fed_soma_family(security_type: str, since: str) -> int:
+    """One security_type ('treasury'|'ambs') x both directions
+    (purchases|sales). Confirmed live path shape:
+    /api/{tsy|ambs}/{purchases|sales}/results/{details|summary}/search.json
+    — the spec's open question #2 (exact endpoint paths) resolved by reading
+    the NY Fed markets-api MCP server's source and confirming live; the
+    `results/{include}/` segment (details vs summary) wasn't in the spec's
+    own guessed shape at all. 'details' mode (treasury's real per-CUSIP
+    breakdown, the granularity the spec calls out) is only used when `since`
+    is within FED_OPERATIONAL_FLOW_DETAILS_SAFE_DAYS of today — see the
+    module comment above for the real 400 this avoids on a wide range.
+    ambs' summary-mode response never carries a details[] array regardless
+    of `include` (confirmed live), so ambs always uses 'summary'."""
+    since_days_ago = (date.today() - date.fromisoformat(since)).days
+    include = (
+        "details"
+        if security_type == "treasury" and since_days_ago <= FED_OPERATIONAL_FLOW_DETAILS_SAFE_DAYS
+        else "summary"
+    )
+    # Real bug found live on Test AV: the URL path segment ("tsy") and the
+    # response body's own top-level key ("treasury") are NOT the same string
+    # — confirmed live, every tsy/* response is keyed "treasury" regardless
+    # of purchases/sales or details/summary. They only coincidentally match
+    # for ambs (URL segment "ambs", body key "ambs"). Using the URL segment
+    # to index the body silently returned an empty list for every treasury
+    # call (no exception — an empty list is valid JSON, not an error), so
+    # fed_soma_transactions was persisting AMBS rows only, one security_type
+    # entirely missing with no error anywhere.
+    endpoint_group = "tsy" if security_type == "treasury" else "ambs"
+    response_key = "treasury" if security_type == "treasury" else "ambs"
+    rows: list[dict] = []
+    for operation, direction in (("purchases", "P"), ("sales", "S")):
+        resp = await _client.get(
+            f"{NY_FED_MARKETS_BASE}/{endpoint_group}/{operation}/results/{include}/search.json",
+            params={"startDate": since},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        ops = resp.json().get(response_key, {}).get("auctions", [])
+        rows += [
+            _fed_soma_txn_row(op, security_type, direction)
+            for op in ops if op.get("operationId")
+        ]
+    if rows:
+        db.insert_fed_soma_transactions_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_fed_soma_transactions(since: str) -> int:
+    """treasury and ambs are independently try/excepted — a real 400 from
+    one (see the module comment above) must not prevent the other from
+    persisting what it successfully fetched. This was itself part of the
+    live-found bug: the original version let a treasury exception propagate
+    up uncaught, which also aborted ambs (sequenced after it) even though
+    ambs' own request would have succeeded."""
+    treasury_n = ambs_n = 0
+    try:
+        treasury_n = await _fetch_and_persist_fed_soma_family("treasury", since)
+    except Exception as e:
+        print(f"[fed_operational_flow] treasury warning: {e}")
+    try:
+        ambs_n = await _fetch_and_persist_fed_soma_family("ambs", since)
+    except Exception as e:
+        print(f"[fed_operational_flow] ambs warning: {e}")
+    return treasury_n + ambs_n
+
+
+async def _fetch_and_persist_fed_soma_transactions_backfill() -> int:
+    return await _fetch_and_persist_fed_soma_transactions(FED_OPERATIONAL_FLOW_BACKFILL_START)
+
+
+def _fed_soma_holdings_row(r: dict) -> dict:
+    def _num(v):
+        # Confirmed live: some fields (e.g. "frn" in early history) are the
+        # empty string "" rather than "0.00" or absent — coerced to NULL,
+        # never a fabricated 0, per the standing nulls-over-zeros convention.
+        if v in (None, ""):
+            return None
+        return float(v)
+
+    return {
+        "as_of_date": r["asOfDate"],
+        "total": _num(r.get("total")),
+        "bills": _num(r.get("bills")),
+        "notesbonds": _num(r.get("notesbonds")),
+        "tips": _num(r.get("tips")),
+        "tips_inflation_compensation": _num(r.get("tipsInflationCompensation")),
+        "frn": _num(r.get("frn")),
+        "mbs": _num(r.get("mbs")),
+        "cmbs": _num(r.get("cmbs")),
+        "agencies": _num(r.get("agencies")),
+    }
+
+
+async def _fetch_and_persist_fed_soma_holdings() -> int:
+    """NY Fed's own published SOMA total-holdings snapshot — confirmed live
+    always returns its full real history (2003-07-09 to present, ~1,212
+    rows, ~320KB) in one call, no date-range param, no pagination. This is
+    the authoritative level fed_soma_transactions' derived cumulative_net is
+    cross-checked against (see fed_soma_holdings' own DDL comment and
+    get_fed_soma_cumulative_net's docstring for the real ~2x discrepancy
+    this exists to surface, not hide)."""
+    resp = await _client.get(f"{NY_FED_MARKETS_BASE}/soma/summary.json", timeout=30)
+    resp.raise_for_status()
+    rows = [_fed_soma_holdings_row(r) for r in resp.json().get("soma", {}).get("summary", []) if r.get("asOfDate")]
+    if rows:
+        db.upsert_fed_soma_holdings_rows(rows)
+    return len(rows)
+
+
+async def _fetch_and_persist_fed_operational_flow():
+    """fed_operational_flow's fetch_fn — one source key owning both
+    fed_repo_operations and fed_soma_transactions (same 'one source key,
+    several tables' shape ofac_sanctions already uses), since both are
+    cheap daily pulls from the same host and neither needs its own health
+    badge to be useful (the frontend sub-panel shows one ChartStaleness for
+    the whole Operational Flow panel, per the spec's own 'own ChartStaleness
+    badge' framing for the panel as a whole). First-run backfill seeds real
+    history back to FED_OPERATIONAL_FLOW_BACKFILL_START (2007) in the SAME
+    request shape as a steady-state tick (search.json handles both — unlike
+    bank_financials' per-quarter-paginated backfill, this source's search
+    endpoint returns a wide multi-year range in one call, confirmed live at
+    ~5.5MB/6,279 rows for repo's full 2007-present history, so no detached
+    task or pagination is needed here). Each table gates its OWN backfill
+    independently (not "if repo is backfilled, assume soma is too") — a real
+    live bug found on Test AV: soma's wide backfill 400'd (see
+    FED_OPERATIONAL_FLOW_DETAILS_SAFE_DAYS' comment) while repo's succeeded
+    in the same tick, and a single shared `since` gated on repo's table alone
+    would have left soma silently stuck on the narrow rolling window forever
+    — it would never again see `since` = FED_OPERATIONAL_FLOW_BACKFILL_START
+    once repo's own table was non-empty, regardless of whether soma's table
+    ever got its own real history. A SECOND real bug found in the same
+    incident: gating on table-non-empty (rather than "has this table's
+    earliest row actually reached back to FED_OPERATIONAL_FLOW_BACKFILL_START")
+    let a partially-failed backfill (a handful of rows landed from a narrow
+    window before the fix, none from the real 2007 range) look
+    indistinguishable from a genuine full backfill — the table wasn't
+    empty, so the gate never re-attempted the wide pull. Gating on earliest
+    real date instead means a partial/broken prior attempt self-heals on
+    the next tick rather than being permanently mistaken for "done"."""
+    def _needs_backfill(earliest: str | None) -> bool:
+        if earliest is None:
+            return True
+        # Real upstream coverage can start a few days after the nominal
+        # backfill-start date (e.g. a holiday), so "within a month" is a
+        # generous but still meaningful signal of "this actually reached
+        # back to 2007", not just "has some rows".
+        return earliest > str(date.fromisoformat(FED_OPERATIONAL_FLOW_BACKFILL_START) + timedelta(days=31))
+
+    repo_since = (
+        FED_OPERATIONAL_FLOW_BACKFILL_START
+        if _needs_backfill(db.get_fed_repo_operations_earliest_date())
+        else str(date.today() - timedelta(days=FED_OPERATIONAL_FLOW_TICK_LOOKBACK_DAYS))
+    )
+    soma_since = (
+        FED_OPERATIONAL_FLOW_BACKFILL_START
+        if _needs_backfill(db.get_fed_soma_transactions_earliest_date())
+        else str(date.today() - timedelta(days=FED_OPERATIONAL_FLOW_TICK_LOOKBACK_DAYS))
+    )
+    repo_n = await _fetch_and_persist_fed_repo_operations(repo_since)
+    soma_n = await _fetch_and_persist_fed_soma_transactions(soma_since)
+    holdings_n = 0
+    try:
+        holdings_n = await _fetch_and_persist_fed_soma_holdings()
+    except Exception as e:
+        print(f"[fed_operational_flow] soma_holdings warning: {e}")
+    print(f"[fed_operational_flow] repo/reverse-repo={repo_n} (since={repo_since}) treasury/ambs={soma_n} (since={soma_since}) soma_holdings={holdings_n}")
+
+
 # Canonical registry population (datasources-spec.md Story #1 + #3), moved
 # here from backend/main.py on 2026-09-17 — real bug found and fixed, not a
 # preemptive refactor: sources.register(...) originally only ran as a
@@ -2893,6 +3214,24 @@ def register_sources() -> None:
         tables=["fed_board", "fed_reserve_banks", "fed_governance_meta"],
         cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
         rate_limit=RateLimitSpec(kind="undocumented", note="One HTML page fetch per week from federalreserve.gov; User-Agent sent."),
+    ))
+    # Fed Operational Flow (more-fed-spec.md, Story #5). Two tables under
+    # one source key, same shape ofac_sanctions already uses for four —
+    # repo/reverse-repo operations are TEMPORARY (never change SOMA/WALCL),
+    # Treasury/AMBS outright purchases/sales are PERMANENT (what actually
+    # grows/shrinks SOMA); kept in separate tables/UI rows, never merged,
+    # per the spec's explicit rule. Daily interval, same shape as
+    # treasury_auctions — operations post same-day, a daily poll isn't a
+    # meaningful lag. fire_at_startup=True so the real multi-year backfill
+    # (see FED_OPERATIONAL_FLOW_BACKFILL_START) runs on first deploy without
+    # waiting a full day for the first tick.
+    fed_operational_flow_interval_s = 86400
+    sources.register(SourceDefinition(
+        key="fed_operational_flow", label="NY Fed Markets Data API — Repo/Reverse Repo + Treasury/AMBS Operations + SOMA Holdings",
+        affinity_group="gov_regulatory", fetch_fn=_fetch_and_persist_fed_operational_flow,
+        tables=["fed_repo_operations", "fed_soma_transactions", "fed_soma_holdings"],
+        cadence=CadenceSpec(trigger="interval", interval_seconds=fed_operational_flow_interval_s, fire_at_startup=True, enabled_flag="slow_enabled"),
+        rate_limit=RateLimitSpec(kind="undocumented", note="markets.newyorkfed.org publishes no rate limit and needs no key/auth (confirmed live: no User-Agent header required either). First run backfills real history to 2007-01-01 in one request per endpoint family (~5.5MB/6,279 rows for repo's full range); each subsequent tick re-requests a 14-day trailing window to catch same-day corrections — cheap, and INSERT OR IGNORE makes re-seeing an already-persisted operation_id a no-op."),
     ))
     # catcor_startup: previously fired by a hand-written asyncio.create_task(...)
     # call in lifespan, outside the scheduler entirely — a real, separate

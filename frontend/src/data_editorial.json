@@ -1705,5 +1705,118 @@
         ]
       }
     ]
+  },
+  {
+    "key": "fed_operational_flow",
+    "label": "NY Fed Markets Data API \u2014 Repo/Reverse Repo + Treasury/AMBS Operations + SOMA Holdings",
+    "origin": "markets.newyorkfed.org/api \u2014 the New York Fed's public Markets Data API, no key, no auth, no published rate limit (confirmed live: no User-Agent header required either, unlike OFAC's sanctionslistservice.ofac.treas.gov, which 403s without one). Powers Money Management tab's Operational Flow sub-panel (more-fed-spec.md, Story #5) \u2014 the actual daily mechanics of Fed liquidity operations, distinct from Transmission Chain's levels-only rate series. Three structurally different tables: repo/reverse-repo operations (TEMPORARY \u2014 a same-day- or term-reversing liquidity operation, never changes SOMA's size or the balance sheet total); outright Treasury/Agency MBS purchases and sales (an operation LOG, not a level); and SOMA total holdings, NY Fed's own published level snapshot. Real endpoint shapes were confirmed live before building (the feature spec's own guessed paths \u2014 /api/rp/repo/all/results/search.json and a bare /api/tsy/... with no results/{include}/ segment \u2014 both 400; the real paths are /api/rp/results/search.json for repo/reverse-repo history, /api/{tsy|ambs}/{purchases|sales}/results/{details|summary}/search.json for outright operations, and /api/soma/summary.json for the real holdings level). A second real finding, confirmed live: summing fed_soma_transactions' purchases minus sales overstates real net SOMA growth by roughly 1.9x (confirmed: $10.5T derived vs. $5.6T real growth since 2007) \u2014 a maturing security rolls off SOMA silently, never recorded as a \"sale\" in the operations log, so a routine reinvestment purchase (replacing something that just matured) is indistinguishable there from a genuine new-money purchase. fed_soma_holdings exists specifically so the real number is available directly, not derived \u2014 the frontend shows both, with the gap labeled, rather than picking one and hiding the discrepancy. 'details' mode additionally has an undocumented response-size cap the wide 2007 backfill trips (confirmed live by bisection: any startDate before ~2025-10 400s with an empty body) that 'summary' mode does not share \u2014 the backfill uses 'summary' unconditionally; 'details' mode (treasury's real per-CUSIP breakdown) is only requested for the narrow steady-state tick window, where it's confirmed to succeed. First run backfills repo/soma_transactions real history to 2007-01-01 in one request per endpoint family (confirmed live: ~5.5MB/6,279 rows for repo's full 2007-present range); soma_holdings always fetches its full real history in one call (no date-range param exists \u2014 confirmed live, ~320KB/1,212 rows back to 2003-07-09). Each subsequent daily tick re-requests a 14-day trailing window for repo/soma_transactions to catch same-day corrections, and INSERT OR IGNORE makes re-seeing an already-persisted operation_id a no-op; each table's own backfill gates independently on whether its earliest persisted row actually reaches back to 2007 (not just table-non-empty \u2014 a real live bug found and fixed: a partially-failed backfill with only a few stray recent rows looked indistinguishable from 'done' under a non-empty check, permanently stranding that table on the narrow rolling window). Per-CUSIP/security detail from Treasury's 'details' response mode is stashed verbatim as JSON in detail_json rather than fully normalized \u2014 not built into a dedicated UI this pass, per the spec's own scope.",
+    "sourceKeys": [
+      "fed_operational_flow"
+    ],
+    "curl": "# Repo/reverse-repo, both types in one call, real history since 2007\ncurl \"https://markets.newyorkfed.org/api/rp/results/search.json?startDate=2007-01-01\"\n# Outright Treasury purchases — wide range MUST use summary (details 400s past ~1yr)\ncurl \"https://markets.newyorkfed.org/api/tsy/purchases/results/summary/search.json?startDate=2007-01-01\"\n# Outright Agency MBS purchases, summary only (ambs never carries per-CUSIP detail)\ncurl \"https://markets.newyorkfed.org/api/ambs/purchases/results/summary/search.json?startDate=2007-01-01\"\n# SOMA total holdings — always full real history, no date param\ncurl \"https://markets.newyorkfed.org/api/soma/summary.json\"",
+    "tables": [
+      {
+        "name": "fed_repo_operations",
+        "fields": [
+          [
+            "operation_id",
+            "PK \u2014 NY Fed's own unique operation identifier (confirmed live, e.g. \"RP 092526 25\"), shared numbering across repo and reverse-repo."
+          ],
+          [
+            "operation_date",
+            "The date the operation was conducted."
+          ],
+          [
+            "operation_type",
+            "\"Repo\" or \"Reverse Repo\"."
+          ],
+          [
+            "term",
+            "\"Overnight\" or a term length; term_calendar_days gives the exact day count."
+          ],
+          [
+            "term_calendar_days",
+            "Calendar days from settlement to maturity."
+          ],
+          [
+            "settlement_date / maturity_date",
+            "When cash/collateral exchange hands, and when it reverses."
+          ],
+          [
+            "total_amt_submitted / total_amt_accepted",
+            "USD submitted vs. actually accepted across all counterparties."
+          ],
+          [
+            "award_rate / offering_rate",
+            "The award (clearing) rate and offering rate, taken from the operation's first detail row with a real numeric value \u2014 a single operation has one economically meaningful rate for this table's purposes."
+          ]
+        ],
+        "note": "Append-only \u2014 a published operation result is a historical fact NY Fed never revises, same category as CFTC's CoT reports. A repo/reverse-repo operation does NOT change SOMA's size or the balance sheet total \u2014 it's a same-day- or term-reversing liquidity operation, never conflated with fed_soma_transactions below in the UI."
+      },
+      {
+        "name": "fed_soma_transactions",
+        "fields": [
+          [
+            "operation_id",
+            "PK \u2014 NY Fed's own unique operation identifier."
+          ],
+          [
+            "operation_date",
+            "The date the operation was conducted."
+          ],
+          [
+            "security_type",
+            "\"treasury\" or \"ambs\" \u2014 the two upstream endpoint families, which use different real field names for the same concepts (normalized at persist time)."
+          ],
+          [
+            "operation_type",
+            "e.g. \"Outright Bill Purchase\", \"Outright TBA Purchase\", \"Outright Coupon Sale\"."
+          ],
+          [
+            "direction",
+            "\"P\" (purchase) or \"S\" (sale)."
+          ],
+          [
+            "settlement_date",
+            "When the trade settles."
+          ],
+          [
+            "total_amt_submitted / total_amt_accepted",
+            "USD par amount submitted vs. accepted across the operation."
+          ],
+          [
+            "detail_json",
+            "Verbatim per-CUSIP/security breakdown (treasury's own 'details' array) as JSON text, where the upstream response provides one \u2014 not fully normalized in v1, per the feature spec's explicit scope call. NULL for ambs (its summary-mode response never carries this detail)."
+          ]
+        ],
+        "note": "Append-only, same reasoning as fed_repo_operations. This is the PERMANENT-operations table \u2014 an outright purchase or sale is what actually grows or shrinks SOMA, and by extension WALCL. Never visually merged with fed_repo_operations in the UI (see Money Management's Operational Flow sub-panel)."
+      },
+      {
+        "name": "fed_soma_holdings",
+        "fields": [
+          [
+            "as_of_date",
+            "PK \u2014 the Wednesday (weekly) the snapshot is as of."
+          ],
+          [
+            "total",
+            "SOMA's total holdings across every security type, USD. The AUTHORITATIVE \u2018how much has the Fed created and is holding\u2019 figure \u2014 see this source's own origin note for the confirmed ~1.9x gap against fed_soma_transactions' derived cumulative_net."
+          ],
+          [
+            "bills / notesbonds / tips / tips_inflation_compensation / frn",
+            "Treasury holdings by instrument type, USD."
+          ],
+          [
+            "mbs / cmbs",
+            "Agency (and agency-guaranteed) mortgage-backed securities holdings, USD."
+          ],
+          [
+            "agencies",
+            "Direct agency debt holdings, USD."
+          ]
+        ],
+        "note": "Upsert keyed on as_of_date, not append-only \u2014 every fetch re-sends the full real history (no date-range param exists on this endpoint), so upsert makes re-sending an already-persisted date a no-op and correctly picks up a real revision if NY Fed ever republishes a past week. Nulls over zeros \u2014 a field that arrives as the empty string (confirmed live, e.g. early-history frn) persists as NULL, never a fabricated 0."
+      }
+    ]
   }
 ]

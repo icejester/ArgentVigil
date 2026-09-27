@@ -1142,6 +1142,98 @@ async def fed_governance_db(year: int | None = Query(None, ge=1936, le=2100)):
     return {"success": True, "data": fed_structure.governance_view(year)}
 
 
+@api_router.get("/fed-operational-flow/db")
+async def fed_operational_flow_db(since: str | None = Query(None)):
+    """Money Management's Operational Flow sub-panel (more-fed-spec.md).
+    Four independent keys, never merged — a repo operation and an outright
+    purchase/sale mean structurally different things for the balance sheet
+    (see fed_repo_operations/fed_soma_transactions' own DDL comments), so
+    this route keeps them separate rather than one combined 'operations'
+    list a frontend consumer could misread as one undifferentiated feed.
+
+    soma_holdings is NY Fed's own published SOMA total-holdings level — the
+    AUTHORITATIVE "how much has the Fed created and is holding" series.
+    cumulative_net is a derived cross-check (running net of outright
+    purchases minus sales from fed_soma_transactions,
+    db.get_fed_soma_cumulative_net) — confirmed to overstate real growth by
+    roughly 2x (see that function's own docstring for why: maturing
+    securities roll off SOMA silently, never recorded as a "sale", so a
+    reinvestment purchase looks identical to a genuine new-money purchase in
+    the operations log). Both are returned so the frontend can show the real
+    number AND the gap, rather than picking one and hiding the discrepancy.
+    Both cumulative_net and soma_holdings deliberately ignore `since` (a
+    partial-range sum, or trimming the real published level, would
+    misrepresent the true cumulative picture) and both deliberately exclude
+    repo/reverse-repo entirely (a same-day- or term-reversing loan is not
+    money creation). No live upstream call — reads whatever
+    fed_operational_flow has already persisted, per the standing
+    persist-on-fetch rule."""
+    return {
+        "success": True,
+        "data": {
+            "repo_operations": db.get_fed_repo_operations(since=since),
+            "soma_transactions": db.get_fed_soma_transactions(since=since),
+            "cumulative_net": db.get_fed_soma_cumulative_net(),
+            "soma_holdings": db.get_fed_soma_holdings(),
+        },
+    }
+
+
+@api_router.get("/fed-operational-flow/db/transactions/{operation_id}/detail")
+async def fed_soma_transaction_detail_db(operation_id: str):
+    """Per-operation CUSIP-level drill-down (soma-bank-growth-spec.md
+    precursor item #1, minimal scope) — a read-only pass-through of one
+    outright Treasury/AMBS operation's stored detail_json. 404 only if
+    operation_id doesn't exist at all; an existing row with no real detail
+    (the common case — see db.get_fed_soma_transaction_detail's own
+    docstring) is a normal 200 with raw_details: null, not an error. Not a
+    step toward full CUSIP-holdings reconstruction — that stays explicitly
+    out of scope."""
+    detail = db.get_fed_soma_transaction_detail(operation_id)
+    if detail is None:
+        raise HTTPException(404, f"No operation found with operation_id={operation_id!r}")
+    return {"success": True, "data": detail}
+
+
+@api_router.get("/fed-money-creation-vs-bank-growth/db")
+async def fed_money_creation_vs_bank_growth_db():
+    """Story A (soma-bank-growth-spec.md) — Money Management's new "Fed
+    Purchases vs. Bank Growth" sub-panel. A read-time join of two real,
+    independently-measured quarterly totals: total U.S. bank assets
+    (bank_financials) and Fed SOMA holdings (fed_soma_holdings, resampled
+    to quarter-end). No new upstream source. Correlation only, never a
+    causal claim — no data exists to support one (see the spec's own
+    §1 for why: no source discloses which banks received Fed-created
+    reserves, only these two independent system-wide aggregates)."""
+    return {"success": True, "data": db.get_bank_growth_vs_soma_growth()}
+
+
+@api_router.get("/fed-bank-growth-distribution/db")
+async def fed_bank_growth_distribution_db(n: int = Query(10, ge=1, le=100)):
+    """Story B (soma-bank-growth-spec.md) — the same new sub-panel's second
+    chart. A fixed cohort (by current/latest size, tracked consistently
+    across quarters) of the N largest banks, and what share of the system's
+    net quarterly growth (from Story A) that cohort captured. Correlation
+    only, same caveats as Story A — no data exists to attribute growth to
+    any specific bank's Fed-related activity, only to compare two aggregate
+    series."""
+    return {"success": True, "data": db.get_bank_growth_distribution(n=n)}
+
+
+@api_router.get("/fed-operational-flow/db/repo-net-daily")
+async def fed_operational_flow_repo_net_daily_db(since: str | None = Query(None)):
+    """Repo/reverse-repo as a time series, replacing the flat operations
+    table (per the user's 2026-09-27 request — that table was hard to read
+    as a trend). Net repo minus reverse-repo total_amt_accepted per day:
+    positive = the Fed added liquidity that day (net repo), negative = the
+    Fed drained it (net reverse repo). Deliberately NOT a running total like
+    cumulative_net — repo positions unwind on their own term, so there is no
+    real cumulative balance to accumulate the way an outright, still-held
+    purchase has one. See db.get_fed_repo_net_daily's docstring for the real
+    operation_type string values this nets against."""
+    return {"success": True, "data": db.get_fed_repo_net_daily(since=since)}
+
+
 @api_router.get("/fred/money-supply/db")
 async def fred_money_supply_db(
     window: str = Query("5y"),

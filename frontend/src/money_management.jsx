@@ -1,14 +1,16 @@
 import { useState, useEffect, useMemo } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
-  PieChart, Pie, Cell, AreaChart, Area,
+  PieChart, Pie, Cell, AreaChart, Area, ComposedChart, Bar,
 } from "recharts";
 import ChartStaleness from "./chart_staleness";
 import { apiFetch } from "./api_client";
-import { nearestRowDate, xTicks } from "./date_utils";
+import { nearestRowDate, xTicks, windowToSinceUntil, inDateRange } from "./date_utils";
 import { usePinnedDate } from "./pinned_date_context";
 import { MONEY_MGMT_COLORS, MM_PIE_COLORS, MM_PIE_OTHER_COLOR, MM_PIE_REST_COLOR, MM_SURFACE } from "./palette";
+import { WIN_COLOR, LOSS_COLOR } from "./money_supply_shared";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
+import FedBankGrowthPanel from "./fed_bank_growth_panel";
 
 // Money Management tab (money-management-spec.md). Three layers kept
 // visually distinct on purpose — governance (who the Fed is), bank registry
@@ -267,7 +269,7 @@ function TransmissionPanel({ window_, customStart, customEnd, pinnedDate, onPin 
   }, [data]);
 
   return (
-    <details className="collapsible-pane" open>
+    <details className="collapsible-pane">
       <summary className="collapsible-pane-title">
         <ChartStaleness sourceKey={["fed_transmission", "money_supply"]} />
         <span>Transmission Chain</span>
@@ -300,6 +302,389 @@ function TransmissionPanel({ window_, customStart, customEnd, pinnedDate, onPin 
             onPin={onPin}
           />
         ))}
+      </div>
+    </details>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Operational Flow (more-fed-spec.md, Story #5) — the "watch it happen"
+// layer Transmission Chain doesn't cover. Two structurally different
+// mechanisms, both now shown as time-series charts rather than flat
+// operations tables (the tables were replaced 2026-09 at the user's
+// request, "I still don't get where that fits in or how to visualize it"):
+// repo/reverse-repo (TEMPORARY — never changes SOMA/WALCL, see
+// RepoNetDailyChart below) and outright Treasury/AMBS purchases/sales
+// (PERMANENT — what actually grows/shrinks SOMA, see MoneyCreationChart).
+
+// Respects the panel-wide window/Custom-range selector the same way
+// TransmissionPanel does — but client-side, not a server round-trip:
+// /api/fed-operational-flow/db has no window param (it's a modest,
+// already-fully-fetched dataset, thousands of rows not FRED's many-series
+// pull), so this panel fetches once and filters locally, same pattern
+// CoT's own panel-wide selector uses for its charts (buildCombinedChartData
+// etc. all filter client-side against one shared fetch). windowToSinceUntil/
+// inDateRange live in date_utils.js so fed_bank_growth_panel.jsx (an
+// extracted sibling file) can share the same implementation.
+
+// "Where does the money come from?" — the headline visualization. Two
+// series on one chart, deliberately shown TOGETHER rather than picking one:
+// soma_holdings (NY Fed's own published total, solid line — the real,
+// authoritative "how much has the Fed created and is holding" level) and
+// cumulative_net (derived from fed_soma_transactions, dashed line — see
+// db.get_fed_soma_cumulative_net's docstring for why it runs high). The gap
+// between the two lines IS the finding: reinvestment purchases replacing
+// matured securities are indistinguishable from genuine new-money purchases
+// in the operations log, so the derived line overstates real growth by
+// roughly 2x. Showing both, with that gap labeled rather than hidden or
+// silently reconciled, is what "confirmed live" prose does everywhere else
+// in this app when two data paths disagree — see e.g. CoT's leverage
+// CFTC-vs-metalcharts.org discrepancy.
+
+function fmtUsdFull(v) {
+  if (v == null) return "—";
+  return `$${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+}
+
+function MoneyCreationTooltip({ active, label, merged }) {
+  if (!active || !label) return null;
+  const row = merged.find((r) => r.date === label);
+  if (!row) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      {row.holdings != null && (
+        <div style={{ color: "#4ac6ff" }}>SOMA holdings (real): {fmtUsdCompact(row.holdings)}</div>
+      )}
+      {row.derived != null && (
+        <div style={{ color: "#e8b04a" }}>Purchases − sales (derived): {fmtUsdCompact(row.derived)}</div>
+      )}
+      {row.daily_net != null && (
+        <div style={{ color: row.daily_net >= 0 ? WIN_COLOR : LOSS_COLOR }}>
+          That date's net: {row.daily_net >= 0 ? "+" : ""}{fmtUsdCompact(row.daily_net)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MoneyCreationChart({ holdings, cumulativeNet, pinnedDate, onPin }) {
+  const [clickedKey, setClickedKey] = useState(null);
+  const merged = useMemo(() => {
+    const byDate = new Map();
+    for (const h of holdings) {
+      if (h.total == null) continue;
+      byDate.set(h.as_of_date, { date: h.as_of_date, holdings: h.total });
+    }
+    for (const c of cumulativeNet) {
+      const existing = byDate.get(c.date) || { date: c.date };
+      existing.derived = c.cumulative_net;
+      existing.daily_net = c.daily_net;
+      byDate.set(c.date, existing);
+    }
+    return [...byDate.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+  }, [holdings, cumulativeNet]);
+  const ticks = useMemo(() => xTicks(merged, 8), [merged]);
+  const pinnedSnap = pinnedDate ? nearestRowDate(merged, pinnedDate) : null;
+
+  const latestHoldings = [...holdings].reverse().find((h) => h.total != null);
+  const latestDerived = cumulativeNet.length ? cumulativeNet[cumulativeNet.length - 1] : null;
+  const gapPct = latestHoldings && latestDerived
+    ? ((latestDerived.cumulative_net - latestHoldings.total) / latestHoldings.total) * 100
+    : null;
+
+  // Pin > latest, same priority convention every other sub-panel summary in
+  // this tab already follows — a pinned date should be reflected here, not
+  // silently overridden by "today" while the chart below shows something else.
+  const pinnedRow = pinnedSnap ? merged.find((r) => r.date === pinnedSnap) : null;
+  const headlineHoldings = pinnedRow?.holdings ?? latestHoldings?.total ?? null;
+  const headlineLabel = pinnedRow ? `SOMA holdings, ${pinnedSnap} (pinned)` : "SOMA holdings today (real, NY Fed-published)";
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 24, flexWrap: "wrap", marginBottom: 10 }}>
+        <div>
+          <div style={{ fontSize: 12, color: MUTED }}>{headlineLabel}</div>
+          <div style={{ fontSize: 26, fontWeight: 600, color: "#4ac6ff" }}>
+            {headlineHoldings != null ? fmtUsdFull(headlineHoldings) : "—"}
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: MUTED }}>Purchased on credit — never repaid from anywhere</div>
+          <div style={{ fontSize: 13, color: MUTED }}>
+            That balance exists because the Fed's Open Market Desk credited a counterparty's reserve account —
+            an accounting entry, not a transfer from savers, taxpayers, or any other pool of money. Nothing
+            was debited to create it.
+          </div>
+        </div>
+      </div>
+      {merged.length === 0 ? (
+        <div className="comex-empty">No data persisted yet.</div>
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={280}>
+            <ComposedChart
+              data={merged}
+              margin={{ top: 4, right: 48, left: 12, bottom: 4 }}
+              onClick={(state) => state?.activeLabel && onPin(state.activeLabel)}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={ticks} tick={{ fill: MUTED, fontSize: 11 }} />
+              {/* Plain linear axis, real dollars — a log-scale attempt here
+                  (both Recharts' native scale="log" and a pre-transformed
+                  log10-then-un-transform approach) produced degenerate "0T"
+                  tick labels across several tries, confirmed live, and could
+                  not be root-caused without a real browser to inspect
+                  Recharts' internal tick/domain computation. Reverted to
+                  the same plain domain={["auto","auto"]} shape
+                  RepoNetDailyChart's YAxis already uses successfully. Real
+                  cost: the pre-2008 era ($651B) reads as a near-flat sliver
+                  against today's $6.4T+ scale — an accepted tradeoff over a
+                  broken axis. */}
+              <YAxis
+                yAxisId="level"
+                domain={["auto", "auto"]}
+                tickFormatter={(v) => fmtUsdCompact(v)}
+                tick={{ fill: MUTED, fontSize: 11 }}
+                width={70}
+              />
+              {/* Hidden scale for the per-date net bars — its own axis so a
+                  day's $ purchase/sale magnitude doesn't compress the two
+                  cumulative-level lines onto a flatter range. domain spans
+                  negative (sale-heavy days are real, confirmed live ~117 of
+                  them) to positive; includeHidden is required for a hidden
+                  axis to actually size a Bar series — see CoT's
+                  MetalLeverageCurveVolumeChart's own confirmed Recharts
+                  workaround for this exact bug. */}
+              <YAxis yAxisId="daily" domain={["auto", "auto"]} hide includeHidden />
+              <Tooltip content={<MoneyCreationTooltip merged={merged} />} />
+              <ReferenceLine yAxisId="daily" y={0} stroke="#5a6278" strokeDasharray="2 4" />
+              {pinnedSnap && (
+                <ReferenceLine yAxisId="level" x={pinnedSnap} stroke={PIN_LINE_COLOR} strokeDasharray="3 3" />
+              )}
+              <Bar
+                yAxisId="daily"
+                dataKey="daily_net"
+                barSize={2}
+                isAnimationActive={false}
+                name="daily_net"
+              >
+                {merged.map((row) => (
+                  <Cell
+                    key={row.date}
+                    fill={row.daily_net >= 0 ? WIN_COLOR : LOSS_COLOR}
+                    fillOpacity={clickedKey && clickedKey !== "daily_net" ? 0.15 : 0.55}
+                  />
+                ))}
+              </Bar>
+              <Line
+                yAxisId="level"
+                type="monotone"
+                dataKey="holdings"
+                stroke="#4ac6ff"
+                dot={false}
+                strokeWidth={clickedKey === "holdings" ? 3 : 2}
+                strokeOpacity={clickedKey && clickedKey !== "holdings" ? 0.3 : 1}
+                connectNulls
+                isAnimationActive={false}
+              />
+              <Line
+                yAxisId="level"
+                type="monotone"
+                dataKey="derived"
+                stroke="#e8b04a"
+                strokeDasharray="4 3"
+                dot={false}
+                strokeWidth={clickedKey === "derived" ? 2.5 : 1.5}
+                strokeOpacity={clickedKey && clickedKey !== "derived" ? 0.3 : 1}
+                connectNulls
+                isAnimationActive={false}
+              />
+            </ComposedChart>
+          </ResponsiveContainer>
+          {pinnedSnap && (
+            <div style={{ marginTop: 4 }}>
+              <MoneyCreationTooltip active label={pinnedSnap} merged={merged} />
+            </div>
+          )}
+          <div className="comex-legend-list comex-legend-list--horizontal">
+            <button
+              className={`comex-legend-item legend-btn-row${clickedKey === "holdings" ? " legend-btn-row--baseline" : ""}`}
+              onClick={() => setClickedKey((k) => (k === "holdings" ? null : "holdings"))}
+            >
+              <span className="comex-legend-swatch" style={{ background: "#4ac6ff" }} />
+              <span><strong>SOMA holdings</strong> — real, published directly by the NY Fed. The authoritative figure.</span>
+            </button>
+            <button
+              className={`comex-legend-item legend-btn-row${clickedKey === "derived" ? " legend-btn-row--baseline" : ""}`}
+              onClick={() => setClickedKey((k) => (k === "derived" ? null : "derived"))}
+            >
+              <span className="comex-legend-swatch" style={{ background: "#e8b04a" }} />
+              <span><strong>Purchases − sales (derived)</strong> — summed from the operations log below, dashed since it's a cross-check, not the real number.</span>
+            </button>
+            <button
+              className={`comex-legend-item legend-btn-row${clickedKey === "daily_net" ? " legend-btn-row--baseline" : ""}`}
+              onClick={() => setClickedKey((k) => (k === "daily_net" ? null : "daily_net"))}
+            >
+              <span className="comex-legend-swatch" style={{ background: `linear-gradient(90deg, ${WIN_COLOR} 50%, ${LOSS_COLOR} 50%)` }} />
+              <span><strong>That date's net</strong> — per-operation-date purchases minus sales, own linear scale. Green = net purchased that day, red = net sold. Sale days are real but proportionally tiny next to the largest purchase days (confirmed: often 100x+ smaller) — a red bar can be a sliver at this scale on purpose, not a rendering bug.</span>
+            </button>
+          </div>
+          {gapPct != null && (
+            <div className="comex-panel-note" style={{ marginTop: 8 }}>
+              The dashed line runs {gapPct.toFixed(0)}% above the real solid line — confirmed: maturing
+              securities roll off SOMA silently (never recorded as a "sale" in the operations log below), so a
+              routine reinvestment purchase — replacing something that just matured — looks identical here to a
+              genuine new-money purchase. That gap is a real property of this data, not a display bug. The solid
+              line is the one to trust for "how much has the Fed actually created and is holding."
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Repo/reverse repo as a time series (2026-09 follow-up) — replaced the flat
+// operations table below at the user's request ("I still don't get where
+// that fits in or how to visualize it"). Net repo minus reverse-repo per
+// day: positive (green) = the Fed added liquidity that day (net repo),
+// negative (red) = it drained liquidity (net reverse repo). Deliberately NOT
+// a running cumulative total the way MoneyCreationChart's two lines are —
+// a repo position unwinds on its own term, so there's no real balance to
+// accumulate the way an outright, still-held purchase has one.
+function RepoNetDailyTooltip({ active, label, rows }) {
+  if (!active || !label) return null;
+  const row = rows.find((r) => r.date === label);
+  if (!row) return null;
+  return (
+    <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px", fontSize: 12 }}>
+      <div style={{ color: "#c8d0de", marginBottom: 4 }}>{label}</div>
+      <div style={{ color: row.net_repo >= 0 ? WIN_COLOR : LOSS_COLOR }}>
+        {row.net_repo >= 0 ? "Net repo (added liquidity): " : "Net reverse repo (drained liquidity): "}
+        {fmtUsdCompact(Math.abs(row.net_repo))}
+      </div>
+    </div>
+  );
+}
+
+function RepoNetDailyChart({ rows, pinnedDate, onPin }) {
+  const ticks = useMemo(() => xTicks(rows, 8), [rows]);
+  const pinnedSnap = pinnedDate ? nearestRowDate(rows, pinnedDate) : null;
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div className="comex-panel-header" style={{ fontSize: 13 }}>Repo / Reverse Repo — net daily</div>
+      <div className="comex-panel-note">
+        A separate mechanism from the chart above — does not appear there at all. Repo is the Fed
+        lending cash against collateral for a fixed term (adds liquidity that day); reverse repo is
+        the Fed borrowing cash against a security it holds (drains liquidity that day). Neither adds
+        to or removes anything from SOMA, and neither creates or destroys reserves the way an
+        outright purchase does — both self-reverse on their own term. This chart nets the two: green
+        bars mean the Fed added liquidity that day, red bars mean it drained liquidity that day.
+      </div>
+      {rows.length === 0 ? (
+        <div className="comex-empty">No data persisted yet.</div>
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={220}>
+            <ComposedChart
+              data={rows}
+              margin={{ top: 4, right: 20, left: 12, bottom: 4 }}
+              onClick={(state) => state?.activeLabel && onPin(state.activeLabel)}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
+              <XAxis dataKey="date" ticks={ticks} tick={{ fill: MUTED, fontSize: 11 }} />
+              <YAxis
+                domain={["auto", "auto"]}
+                tickFormatter={(v) => fmtUsdCompact(v)}
+                tick={{ fill: MUTED, fontSize: 11 }}
+                width={70}
+              />
+              <Tooltip content={<RepoNetDailyTooltip rows={rows} />} />
+              <ReferenceLine y={0} stroke="#5a6278" strokeDasharray="2 4" />
+              {pinnedSnap && <ReferenceLine x={pinnedSnap} stroke={PIN_LINE_COLOR} strokeDasharray="3 3" />}
+              <Bar dataKey="net_repo" barSize={3} isAnimationActive={false}>
+                {rows.map((row) => (
+                  <Cell key={row.date} fill={row.net_repo >= 0 ? WIN_COLOR : LOSS_COLOR} />
+                ))}
+              </Bar>
+            </ComposedChart>
+          </ResponsiveContainer>
+          {pinnedSnap && (
+            <div style={{ marginTop: 4 }}>
+              <RepoNetDailyTooltip active label={pinnedSnap} rows={rows} />
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function OperationalFlowPanel({ window_, customStart, customEnd, pinnedDate, onPin }) {
+  const [data, setData] = useState(null);
+  const [repoNetDaily, setRepoNetDaily] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const load = () => {
+      apiFetch("/api/fed-operational-flow/db")
+        .then((r) => r.json())
+        .then((j) => {
+          if (!j.success) throw new Error(j.detail || "Failed to load operational flow data");
+          setData(j.data);
+          setError(null);
+        })
+        .catch((e) => setError(e.message));
+      apiFetch("/api/fed-operational-flow/db/repo-net-daily")
+        .then((r) => r.json())
+        .then((j) => {
+          if (!j.success) throw new Error(j.detail || "Failed to load repo net daily data");
+          setRepoNetDaily(j.data);
+        })
+        .catch((e) => setError((prev) => prev ?? e.message));
+    };
+    load();
+    window.addEventListener(FORCE_REFRESH_EVENT, load);
+    return () => window.removeEventListener(FORCE_REFRESH_EVENT, load);
+  }, []);
+
+  const { since, until, incomplete } = useMemo(
+    () => windowToSinceUntil(window_, customStart, customEnd),
+    [window_, customStart, customEnd]
+  );
+
+  const holdingsRows = useMemo(
+    () => incomplete ? [] : (data?.soma_holdings ?? []).filter((r) => inDateRange(r.as_of_date, since, until)),
+    [data, since, until, incomplete]
+  );
+  const cumulativeNetRows = useMemo(
+    () => incomplete ? [] : (data?.cumulative_net ?? []).filter((r) => inDateRange(r.date, since, until)),
+    [data, since, until, incomplete]
+  );
+  const repoNetDailyRows = useMemo(
+    () => incomplete ? [] : (repoNetDaily ?? []).filter((r) => inDateRange(r.date, since, until)),
+    [repoNetDaily, since, until, incomplete]
+  );
+
+  return (
+    <details className="collapsible-pane">
+      <summary className="collapsible-pane-title">
+        <ChartStaleness sourceKey="fed_operational_flow" />
+        <span>Operational Flow</span>
+      </summary>
+      <div className="collapsible-pane-body">
+        {error && <div className="error-box">{error}</div>}
+        {incomplete && <div className="comex-panel-note">Set both a From and To date to see Custom range data.</div>}
+
+        <MoneyCreationChart
+          holdings={holdingsRows}
+          cumulativeNet={cumulativeNetRows}
+          pinnedDate={pinnedDate}
+          onPin={onPin}
+        />
+        <RepoNetDailyChart rows={repoNetDailyRows} pinnedDate={pinnedDate} onPin={onPin} />
       </div>
     </details>
   );
@@ -1206,7 +1591,7 @@ function GovernancePanel() {
   const chair = gov?.board?.find((b) => b.role === "Chair");
 
   return (
-    <details className="collapsible-pane" open>
+    <details className="collapsible-pane">
       <summary className="collapsible-pane-title">
         <ChartStaleness sourceKey="fed_governance_check" />
         <span>Governance</span>
@@ -1315,7 +1700,7 @@ function ReserveBanksPanel({ onOpenDistrict }) {
   };
 
   return (
-    <details className="collapsible-pane" open>
+    <details className="collapsible-pane">
       <summary className="collapsible-pane-title">
         <ChartStaleness sourceKey={["fed_reserve_bank_h41", "fed_governance_check", "bank_registry"]} />
         <span>Reserve Banks &amp; {gov?.year ?? ""} FOMC votes</span>
@@ -1484,7 +1869,7 @@ function BankLookupPanel({ onOpenBank }) {
   }, [debounced, activeOnly, district]);
 
   return (
-    <details className="collapsible-pane" open>
+    <details className="collapsible-pane">
       <summary className="collapsible-pane-title">
         <ChartStaleness sourceKey="bank_registry" />
         <span>Bank Lookup</span>
@@ -1795,6 +2180,20 @@ export default function MoneyManagement() {
         <ReserveBanksPanel onOpenDistrict={openDistrict} />
         <BankLookupPanel onOpenBank={openBank} />
         <TransmissionPanel
+          window_={window_}
+          customStart={customStart}
+          customEnd={customEnd}
+          pinnedDate={pinnedDate}
+          onPin={togglePinnedDate}
+        />
+        <OperationalFlowPanel
+          window_={window_}
+          customStart={customStart}
+          customEnd={customEnd}
+          pinnedDate={pinnedDate}
+          onPin={togglePinnedDate}
+        />
+        <FedBankGrowthPanel
           window_={window_}
           customStart={customStart}
           customEnd={customEnd}

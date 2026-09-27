@@ -34,6 +34,33 @@ export function xTicks(data, maxTicks = 8) {
   return data.filter((_, i) => i % step === 0).map((r) => r.date);
 }
 
+// Money Management's panel-wide 2Y/5Y/10Y/20Y/Custom window selector,
+// resolved to a since/until pair. Client-side filtering only — the panels
+// that use this (TransmissionPanel, OperationalFlowPanel, FedBankGrowthPanel)
+// each fetch their own full dataset once and filter locally rather than
+// round-tripping the server per window change, same pattern CoT's own
+// panel-wide selector uses for its charts. Originally defined once inline
+// in money_management.jsx for OperationalFlowPanel; lifted here so
+// fed_bank_growth_panel.jsx (an extracted sibling file) can share it rather
+// than duplicating a second copy.
+export function windowToSinceUntil(window_, customStart, customEnd) {
+  if (window_ === "custom") {
+    if (!customStart || !customEnd || customStart > customEnd) return { since: null, until: null, incomplete: true };
+    return { since: customStart, until: customEnd, incomplete: false };
+  }
+  const years = { "2y": 2, "5y": 5, "10y": 10, "20y": 20 }[window_];
+  if (years == null) return { since: null, until: null, incomplete: false };
+  const since = new Date();
+  since.setFullYear(since.getFullYear() - years);
+  return { since: since.toISOString().slice(0, 10), until: null, incomplete: false };
+}
+
+export function inDateRange(dateStr, since, until) {
+  if (since != null && dateStr < since) return false;
+  if (until != null && dateStr > until) return false;
+  return true;
+}
+
 // Shared range-picker/live-toggle constants for any tick-resolution price
 // chart reading /api/prices/db/ticks (its since/until params). Originally
 // defined once inline in silver_cot_tracker.jsx's MetalPriceHistoryChart,
