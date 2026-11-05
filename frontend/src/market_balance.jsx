@@ -14,7 +14,7 @@ import {
   Cell,
   ReferenceLine,
 } from "recharts";
-import { VAULT_COLORS } from "./palette";
+import { VAULT_COLORS, TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 import { apiFetch } from "./api_client";
 
 // Silver Institute publishes World Silver Survey headline figures each April,
@@ -58,11 +58,11 @@ function NetBalanceBarChart({ rows }) {
     <ResponsiveContainer width="100%" height={280}>
       <ComposedChart data={rows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-        <XAxis dataKey="year" tick={{ fill: "#8a94a6", fontSize: 11 }} />
+        <XAxis dataKey="year" tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
         <YAxis
           tickFormatter={(v) => `${v}`}
-          tick={{ fill: "#8a94a6", fontSize: 11 }}
-          label={{ value: "Moz", position: "insideTopLeft", fill: "#5a6278", fontSize: 11 }}
+          tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+          label={{ value: "Moz", position: "insideTopLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
         />
         <Tooltip
           contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
@@ -121,10 +121,10 @@ function DemandCompositionChart({ rows }) {
       <ResponsiveContainer width="100%" height={260}>
         <AreaChart data={pctRows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-          <XAxis dataKey="year" tick={{ fill: "#8a94a6", fontSize: 11 }} />
+          <XAxis dataKey="year" tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
           <YAxis
             tickFormatter={(v) => `${v}%`}
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
+            tick={{ fill: TEXT_MUTED, fontSize: 11 }}
           />
           <Tooltip
             contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}

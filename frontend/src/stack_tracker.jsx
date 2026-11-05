@@ -3,7 +3,7 @@ import {
   ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
 } from "recharts";
-import { VAULT_COLORS } from "./palette";
+import { VAULT_COLORS, TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 import { apiFetch } from "./api_client";
 
 // Stack Tracker (specs/stackTracker-spec.md) — a personal CRUD inventory of
@@ -44,7 +44,7 @@ function formIcon(form) {
 // text) since there's no pre-existing "silver" accent color to reuse.
 const METAL_ICON_COLOR = { gold: "#c9a227" };
 function metalIconColor(metal) {
-  return METAL_ICON_COLOR[metal] || "#8a94a6";
+  return METAL_ICON_COLOR[metal] || TEXT_MUTED;
 }
 const SERIES = [
   "American Eagle",
@@ -678,10 +678,10 @@ function SummaryStrip({ summary }) {
 // not "am I up or down," per the user's explicit correction.
 function DcaLine({ label, dca, spot }) {
   if (dca === null || dca === undefined) return null;
-  const color = spot === null || spot === undefined ? "#8a94a6" : dca > spot ? "#4caf76" : "#e05252";
+  const color = spot === null || spot === undefined ? TEXT_MUTED : dca > spot ? "#4caf76" : "#e05252";
   return (
     <span style={{ fontSize: 15, fontWeight: 700, whiteSpace: "nowrap" }}>
-      <span style={{ color: "#5a6278", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+      <span style={{ color: TEXT_SUBTLE, fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>
         {label} DCA{" "}
       </span>
       <span style={{ color }}>{fmtUsd(dca)}/oz</span>
@@ -773,7 +773,7 @@ function SeriesPieTooltip({ active, payload }) {
   return (
     <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "6px 10px" }}>
       <div style={{ color: "#c8d0de", fontWeight: 600 }}>{d.name}</div>
-      <div style={{ color: "#8a94a6" }}>{fmtOz(d.value)}</div>
+      <div style={{ color: TEXT_MUTED }}>{fmtOz(d.value)}</div>
     </div>
   );
 }
@@ -1182,7 +1182,7 @@ function StackCharts({
                 <XAxis dataKey="date" stroke="#5a6278" fontSize={11} minTickGap={40} />
                 <YAxis stroke="#5a6278" fontSize={11} width={60} />
                 <Tooltip content={<OzGrowthTooltip />} />
-                {pinnedDate && <ReferenceLine x={pinnedDate} stroke="#8a94a6" strokeDasharray="3 3" />}
+                {pinnedDate && <ReferenceLine x={pinnedDate} stroke={TEXT_MUTED} strokeDasharray="3 3" />}
                 {ozSeriesKeys.map((key) => (
                   <Area
                     key={key}
@@ -1955,7 +1955,7 @@ function AddForm({ onDone, onCancel, knownSeries, knownSubTypes }) {
 // its own upload/add-link action distinct from the main Save).
 function FormField({ label, children }) {
   return (
-    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, color: "#5a6278" }}>
+    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, color: TEXT_SUBTLE }}>
       {label}
       {children}
     </label>

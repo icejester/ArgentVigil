@@ -14,7 +14,7 @@ import {
   ReferenceLine,
   ResponsiveContainer,
 } from "recharts";
-import { TRADE_FLOW_COLORS } from "./palette";
+import { TRADE_FLOW_COLORS, TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 import { apiFetch } from "./api_client";
 
 // Country-mix and net-flow are silver-only; the comparator is the one
@@ -108,9 +108,9 @@ function CountryMixChart({ rows, unit }) {
       <ResponsiveContainer width="100%" height={260}>
         <AreaChart data={chartRows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-          <XAxis dataKey="ym" tick={{ fill: "#8a94a6", fontSize: 11 }} minTickGap={40} />
+          <XAxis dataKey="ym" tick={{ fill: TEXT_MUTED, fontSize: 11 }} minTickGap={40} />
           <YAxis
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
+            tick={{ fill: TEXT_MUTED, fontSize: 11 }}
             tickFormatter={(v) => (unit === "oz" ? v.toLocaleString() : "$" + v.toLocaleString())}
           />
           <Tooltip
@@ -200,11 +200,11 @@ function ComparatorChart({ xagRows, xauRows, unit }) {
     <ResponsiveContainer width="100%" height={260}>
       <LineChart data={chartRows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-        <XAxis dataKey="ym" tick={{ fill: "#8a94a6", fontSize: 11 }} minTickGap={40} />
+        <XAxis dataKey="ym" tick={{ fill: TEXT_MUTED, fontSize: 11 }} minTickGap={40} />
         <YAxis
-          tick={{ fill: "#8a94a6", fontSize: 11 }}
+          tick={{ fill: TEXT_MUTED, fontSize: 11 }}
           tickFormatter={(v) => v.toFixed(0)}
-          label={{ value: "Indexed to 100", position: "insideTopLeft", fill: "#5a6278", fontSize: 11 }}
+          label={{ value: "Indexed to 100", position: "insideTopLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
         />
         <Tooltip
           contentStyle={{ background: "#1a1f2b", border: "1px solid #2e3547" }}
@@ -244,9 +244,9 @@ function NetFlowChart({ rows, unit }) {
     <ResponsiveContainer width="100%" height={260}>
       <ComposedChart data={chartRows} margin={{ top: 4, right: 20, left: 12, bottom: 4 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-        <XAxis dataKey="ym" tick={{ fill: "#8a94a6", fontSize: 11 }} minTickGap={40} />
+        <XAxis dataKey="ym" tick={{ fill: TEXT_MUTED, fontSize: 11 }} minTickGap={40} />
         <YAxis
-          tick={{ fill: "#8a94a6", fontSize: 11 }}
+          tick={{ fill: TEXT_MUTED, fontSize: 11 }}
           tickFormatter={(v) => (unit === "oz" ? v.toLocaleString() : "$" + v.toLocaleString())}
         />
         <Tooltip

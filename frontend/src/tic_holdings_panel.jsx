@@ -13,7 +13,7 @@ import {
   Cell,
   ReferenceLine,
 } from "recharts";
-import { VAULT_COLORS } from "./palette";
+import { VAULT_COLORS, TEXT_MUTED, TEXT_SUBTLE, TEXT_BODY } from "./palette";
 import { nearestRowDate } from "./date_utils";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
@@ -116,7 +116,7 @@ export default function TicHoldingsPanel({ ticCountries, ticGrandTotal }) {
         <ChartStaleness sourceKey="money_supply" />
         <span>Foreign Holdings of U.S. Treasuries</span>
         {ticMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+          <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
             {(() => {
               const row = pinnedDate ? ticMerged.find((r) => r.date === nearestRowDate(ticMerged, pinnedDate)) : ticMerged[ticMerged.length - 1];
               if (!row) return null;
@@ -184,15 +184,15 @@ export default function TicHoldingsPanel({ ticCountries, ticGrandTotal }) {
                             if (state?.activeLabel) togglePinnedDate(state.activeLabel);
                           }}>
                             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-                            <XAxis dataKey="date" ticks={ticTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+                            <XAxis dataKey="date" ticks={ticTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
                             <YAxis
                               // Solo mode: auto-scale to the one country's real range
                               // (the whole point of soloing). Full mode: from 0, so
                               // the stacked bands read as absolute magnitudes.
                               domain={soloCountry ? ["auto", "auto"] : [0, "auto"]}
                               tickFormatter={(v) => `$${v.toFixed(soloCountry ? 2 : 1)}T`}
-                              tick={{ fill: "#8a94a6", fontSize: 11 }}
-                              label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                              tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                              label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
                             />
                             <Tooltip content={<TicHoldingsTooltipContent ticMerged={ticMerged} hiddenCountries={hiddenTicCountries} soloCountry={soloCountry} />} />
                             {pinnedDateTic && <ReferenceLine x={pinnedDateTic} stroke={RATIO_COLOR} strokeDasharray="3 3" />}
@@ -272,7 +272,7 @@ export default function TicHoldingsPanel({ ticCountries, ticGrandTotal }) {
                           </PieChart>
                         </ResponsiveContainer>
                         {ticPieRow?.date && (
-                          <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+                          <div style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4 }}>
                             As of {ticPieRow.date}
                             {ticPieRow.grand_total != null && (
                               <>

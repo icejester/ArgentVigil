@@ -18,6 +18,7 @@ from . import collector
 from . import db
 from . import delivery_behavior
 from . import fed_structure
+from . import margin_sim
 from . import models
 from . import sources
 from . import stack
@@ -1140,6 +1141,54 @@ async def fed_district_history_db(district: int):
 @api_router.get("/fed-governance/db")
 async def fed_governance_db(year: int | None = Query(None, ge=1936, le=2100)):
     return {"success": True, "data": fed_structure.governance_view(year)}
+
+
+@api_router.get("/futures-margins/db")
+async def futures_margins_db():
+    """Trading Simulator's margin figures (margin-simulator-spec.md Story #5):
+    per-contract size + latest seeded margin row, plus full history. Hand-
+    maintained seed, self-loads on first read — see margin_sim.margins_view."""
+    return {"success": True, "data": margin_sim.margins_view()}
+
+
+@api_router.get("/margin-sim/scenarios/db")
+async def margin_sim_scenarios_db():
+    return {"success": True, "data": db.get_margin_sim_scenarios()}
+
+
+@api_router.get("/margin-sim/scenarios/{scenario_id}/db")
+async def margin_sim_scenario_db(scenario_id: int):
+    row = db.get_margin_sim_scenario(scenario_id)
+    if row is None:
+        raise HTTPException(404, "scenario not found")
+    return {"success": True, "data": row}
+
+
+@api_router.post("/margin-sim/scenarios")
+async def margin_sim_scenario_create(body: dict = Body(...)):
+    try:
+        fields = margin_sim.validate_scenario(body)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"success": True, "data": {"id": db.create_margin_sim_scenario(fields)}}
+
+
+@api_router.put("/margin-sim/scenarios/{scenario_id}")
+async def margin_sim_scenario_update(scenario_id: int, body: dict = Body(...)):
+    try:
+        fields = margin_sim.validate_scenario(body)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not db.update_margin_sim_scenario(scenario_id, fields):
+        raise HTTPException(404, "scenario not found")
+    return {"success": True, "data": None}
+
+
+@api_router.delete("/margin-sim/scenarios/{scenario_id}")
+async def margin_sim_scenario_delete(scenario_id: int):
+    if not db.delete_margin_sim_scenario(scenario_id):
+        raise HTTPException(404, "scenario not found")
+    return {"success": True, "data": None}
 
 
 @api_router.get("/fed-operational-flow/db")

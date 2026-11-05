@@ -15,6 +15,7 @@ import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { nearestRowDate } from "./date_utils";
 import { apiFetch } from "./api_client";
 
+import { TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 // Same shape/cutoffs as comex_inventory.jsx's own filterBySFWindow — kept as
 // a local copy rather than a shared import, matching this codebase's
 // established per-file xTicks-style duplication convention (each file that
@@ -168,7 +169,7 @@ function ReclassificationTooltipContent({ active, label, rows }) {
           ? "Normal — delivery activity covers the decrease"
           : "No registered change"}
       </div>
-      <div style={{ color: "#8a94a6", marginTop: 4 }}>
+      <div style={{ color: TEXT_MUTED, marginTop: 4 }}>
         Registered change: {fmt_oz(d.registered_delta)}
       </div>
       <div
@@ -179,8 +180,8 @@ function ReclassificationTooltipContent({ active, label, rows }) {
       >
         Total vault change: {fmt_oz(d.total_delta)}
       </div>
-      <div style={{ color: "#8a94a6" }}>Delivery volume: {fmt_oz(d.delivery_volume_oz)}</div>
-      <div style={{ color: "#8a94a6" }}>Total in vault: {fmt_oz(d.total_oz)}</div>
+      <div style={{ color: TEXT_MUTED }}>Delivery volume: {fmt_oz(d.delivery_volume_oz)}</div>
+      <div style={{ color: TEXT_MUTED }}>Total in vault: {fmt_oz(d.total_oz)}</div>
     </div>
   );
 }
@@ -269,7 +270,7 @@ function ReclassificationChart({ reclassification, sfWindow, sfCustomStart, sfCu
             dataKey="date"
             tickFormatter={fmt_year_month}
             ticks={xTicks(rows, 10)}
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
+            tick={{ fill: TEXT_MUTED, fontSize: 11 }}
           />
           <YAxis
             yAxisId="delta"
@@ -288,8 +289,8 @@ function ReclassificationChart({ reclassification, sfWindow, sfCustomStart, sfCu
             domain={deltaAxis.domain}
             tickFormatter={(v) => `${(v / 1_000_000).toFixed(1)}M`}
             ticks={deltaAxis.ticks}
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
-            label={{ value: "Δ oz", position: "insideTopLeft", fill: "#5a6278", fontSize: 11 }}
+            tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+            label={{ value: "Δ oz", position: "insideTopLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
           />
           <YAxis
             yAxisId="total"

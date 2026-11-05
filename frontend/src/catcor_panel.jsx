@@ -9,7 +9,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { CATCOR_EVENT_COLORS } from "./palette";
+import { CATCOR_EVENT_COLORS, TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { apiFetch } from "./api_client";
 
@@ -132,7 +132,7 @@ function CatcorTooltip({ active, payload }) {
       <div style={{ color: "#c8d0de", marginBottom: 4 }}>
         <strong>{p.event_name}</strong>
       </div>
-      <div style={{ color: "#8a94a6" }}>{fmtDateTime(p.scheduled_time)}</div>
+      <div style={{ color: TEXT_MUTED }}>{fmtDateTime(p.scheduled_time)}</div>
       <div>Surprise magnitude: {p.x.toFixed(3)}</div>
       <div>Price reaction: {fmtPct(p.y)}</div>
       <RecordHotlinkHint researchSessionId={p.research_session_id} />
@@ -149,8 +149,8 @@ function TimelineTooltip({ active, payload }) {
         <div style={{ color: "#c8d0de", marginBottom: 4 }}>
           <strong>{p.event_name}</strong>
         </div>
-        <div style={{ color: "#8a94a6" }}>{fmtDateTime(p.scheduled_time)}</div>
-        <div style={{ color: "#8a94a6" }}>Scheduled — hasn't happened yet, no reaction to show</div>
+        <div style={{ color: TEXT_MUTED }}>{fmtDateTime(p.scheduled_time)}</div>
+        <div style={{ color: TEXT_MUTED }}>Scheduled — hasn't happened yet, no reaction to show</div>
         <RecordHotlinkHint researchSessionId={p.research_session_id} />
       </div>
     );
@@ -160,12 +160,12 @@ function TimelineTooltip({ active, payload }) {
       <div style={{ color: "#c8d0de", marginBottom: 4 }}>
         <strong>{p.event_name}</strong>
       </div>
-      <div style={{ color: "#8a94a6" }}>{fmtDateTime(p.scheduled_time)}</div>
+      <div style={{ color: TEXT_MUTED }}>{fmtDateTime(p.scheduled_time)}</div>
       <div>Price reaction: {fmtPct(p.y)}</div>
       {p.surprise_magnitude != null ? (
         <div>Surprise magnitude: {p.surprise_magnitude.toFixed(3)}</div>
       ) : (
-        <div style={{ color: "#8a94a6" }}>No consensus source yet — surprise magnitude unknown</div>
+        <div style={{ color: TEXT_MUTED }}>No consensus source yet — surprise magnitude unknown</div>
       )}
       <RecordHotlinkHint researchSessionId={p.research_session_id} />
     </div>
@@ -202,8 +202,8 @@ function makeLinkedShape(color, hoveredEventId, baseRadius, diamond) {
 }
 
 // Shared axis styling for both scatter charts (was repeated inline 4x).
-const AXIS_TICK = { fill: "#8a94a6", fontSize: 11 };
-const AXIS_LABEL_FILL = "#5a6278";
+const AXIS_TICK = { fill: TEXT_MUTED, fontSize: 11 };
+const AXIS_LABEL_FILL = TEXT_SUBTLE;
 
 // The two charts on this tab — Catalyst Timeline and Surprise vs. Reaction
 // — are the same shape: a ScatterChart of `${type}: point[]` groups, each

@@ -1818,5 +1818,72 @@
         "note": "Upsert keyed on as_of_date, not append-only \u2014 every fetch re-sends the full real history (no date-range param exists on this endpoint), so upsert makes re-sending an already-persisted date a no-op and correctly picks up a real revision if NY Fed ever republishes a past week. Nulls over zeros \u2014 a field that arrives as the empty string (confirmed live, e.g. early-history frn) persists as NULL, never a fabricated 0."
       }
     ]
+  },
+  {
+    "key": "futures_margins",
+    "label": "COMEX Silver Margin Requirements (hand-maintained)",
+    "origin": "Hand-maintained seed file seed_data/futures_margins.json. There is no automated source: cmegroup.com refuses automated requests (a 403 that flags the IP for scraping, confirmed 2026-10-02) and its terms prohibit them. Each row is transcribed from a CME notice or reputable reporting of one, with the source cited on the row. Since 2026-01-13 CME sets precious-metals margins as a percent of contract value, so the requirement in dollars moves with price. Loaded replace-all into futures_margin_requirements at startup and on Re-run now. Feeds the Trading Simulator (Trading tab), which lets you override the rate and labels any override as user-entered.",
+    "sourceKeys": [
+      "futures_margins"
+    ],
+    "curl": "curl \"http://localhost:<API_PORT>/api/v1/futures-margins/db\"  # AV's own read route; there is no upstream to curl",
+    "tables": [
+      {
+        "name": "futures_margin_requirements",
+        "fields": [
+          [
+            "contract",
+            "PK part — SI (5,000 oz) or SIL (Micro, 1,000 oz).",
+            "Trading Simulator — contract picker"
+          ],
+          [
+            "effective_date",
+            "PK part — date the margin took effect (after that day's close where the notice says so).",
+            "Trading Simulator — shown beside the rate"
+          ],
+          [
+            "basis",
+            "pct_notional (percent of contract value, CME's method since 2026-01-13) or usd (fixed dollars per contract, the older method).",
+            "Trading Simulator — decides which fields apply"
+          ],
+          [
+            "initial_pct",
+            "Initial margin as % of contract value; NULL when the source didn't state it.",
+            "Trading Simulator — initial margin each participant posts"
+          ],
+          [
+            "maintenance_pct",
+            "Maintenance margin as % of contract value; NULL when not stated.",
+            "Trading Simulator — margin-call line"
+          ],
+          [
+            "initial_margin_usd",
+            "Initial margin per contract in dollars, for usd-basis rows; NULL otherwise.",
+            "Trading Simulator"
+          ],
+          [
+            "maintenance_margin_usd",
+            "Maintenance margin per contract in dollars, for usd-basis rows; NULL otherwise.",
+            "Trading Simulator"
+          ],
+          [
+            "source_note",
+            "What the cited source says, including any disagreement between sources.",
+            "Trading Simulator — source line under the rate"
+          ],
+          [
+            "source_url",
+            "Link to the cited source.",
+            "Trading Simulator — source link"
+          ],
+          [
+            "loaded_at",
+            "When the seed was last loaded into this table.",
+            "Not shown"
+          ]
+        ],
+        "note": "Replace-all from the seed on every load; the seed file is the record. Only confirmed rows are entered, so gaps (the 2026-01-30 and 2026-02-02 levels, anything after 2026-02-06, any Micro Silver figure) stay gaps rather than guesses."
+      }
+    ]
   }
 ]

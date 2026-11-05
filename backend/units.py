@@ -13,6 +13,7 @@ carries.
 
 # COMEX contract sizes, troy oz per contract.
 SILVER_CONTRACT_OZ = 5_000
+SILVER_MICRO_CONTRACT_OZ = 1_000  # COMEX Micro Silver (SIL)
 GOLD_CONTRACT_OZ = 100
 
 # SHFE reports kg; AV's display convention is troy oz everywhere.

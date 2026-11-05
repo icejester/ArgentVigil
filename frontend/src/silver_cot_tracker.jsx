@@ -19,10 +19,11 @@ import {
   Cell,
 } from "recharts";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
-import { VAULT_COLORS } from "./palette";
+import { VAULT_COLORS, TEXT_MUTED, TEXT_SUBTLE, TEXT_BODY } from "./palette";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
 import { apiFetch } from "./api_client";
+import MarginSimulator from "./margin_simulator";
 
 // Fire a GET, unwrap { data }, hand it to a setter; any failure leaves the
 // setter at `fallback` (default []). MetalLeverageCurveVolumeChart's four
@@ -136,7 +137,7 @@ function StalenessLabel({ cotAsOfDate }) {
 function signalDetailColor(classification) {
   if (classification.includes("crowded")) return "#e05252";
   if (classification.includes("capitulated")) return "#4caf76";
-  return "#8a94a6";
+  return TEXT_MUTED;
 }
 
 function SignalDetail({ latest, windows }) {
@@ -154,21 +155,21 @@ function SignalDetail({ latest, windows }) {
     ? "#e05252"
     : w2.classification.includes("capitulated") || w5.classification.includes("capitulated")
     ? "#4caf76"
-    : "#8a94a6";
+    : TEXT_MUTED;
 
   return (
     <div className="signal-detail">
       <div>
-        <span style={{ color: "#8a94a6" }}>Net Long % of Open Interest:</span>{" "}
+        <span style={{ color: TEXT_MUTED }}>Net Long % of Open Interest:</span>{" "}
         <strong style={{ color: rawValueColor }}>{latest.net_long_pct_oi?.toFixed(2)}%</strong>
       </div>
       <div>
-        <span style={{ color: "#8a94a6" }}>2-Year:</span>{" "}
+        <span style={{ color: TEXT_MUTED }}>2-Year:</span>{" "}
         <strong style={{ color: signalDetailColor(w2.classification) }}>
           {w2.percentile}th pct
         </strong>
         <span className="signal-detail-gap">·</span>
-        <span style={{ color: "#8a94a6" }}>5-Year:</span>{" "}
+        <span style={{ color: TEXT_MUTED }}>5-Year:</span>{" "}
         <strong style={{ color: signalDetailColor(w5.classification) }}>
           {w5.percentile}th pct
         </strong>
@@ -377,7 +378,7 @@ function CombinedChart({ silverSeries, goldSeries, since, until, silverLatest, s
             dataKey="date"
             ticks={ticks}
             tickFormatter={(d) => new Date(d).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-            tick={{ fill: "#8a94a6", fontSize: 11 }}
+            tick={{ fill: TEXT_MUTED, fontSize: 11 }}
           />
           <YAxis
             yAxisId="left"
@@ -432,7 +433,7 @@ function CombinedChart({ silverSeries, goldSeries, since, until, silverLatest, s
           <CombinedChartTooltipContent active label={pinnedDateSnapped} chartData={chartData} />
         </div>
       )}
-      <div className="comex-panel-note" style={{ fontSize: 10, color: "#8a94a6", marginTop: 4 }}>
+      <div className="comex-panel-note" style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4 }}>
         Both metals' dashed 10th/90th lines are always shown, dimmed — click a metal in the legend
         to bring its pair (and its labels) forward on that metal's own axis. They're percentiles of
         only the points in the currently-selected window, so they move when you change the range.
@@ -604,12 +605,12 @@ function CategoryCompositionChart({ weeks, since, until, pinnedDate, onPin }) {
                 tickFormatter={(d) => new Date(d).toLocaleString(undefined, { month: "short", year: "2-digit" })}
                 interval="preserveStartEnd"
                 minTickGap={40}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
               />
               <YAxis
                 domain={[0, 100]}
                 tickFormatter={(v) => `${v}%`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
               />
               <Tooltip content={<CategoryCompositionTooltipContent rows={rows} />} />
               {pinnedDateSnapped && (
@@ -667,7 +668,7 @@ function CategoryCompositionChart({ weeks, since, until, pinnedDate, onPin }) {
             </PieChart>
           </ResponsiveContainer>
           {pieRow?.report_date && (
-            <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+            <div style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4 }}>
               {pinnedDateSnapped ? `As of ${pieRow.report_date}` : `Latest — ${pieRow.report_date}`}
             </div>
           )}
@@ -909,7 +910,7 @@ function metalChartLegend(metalLabel) {
     {
       key: "volume",
       legendLabel: "Volume",
-      color: "#5a6278",
+      color: TEXT_SUBTLE,
       eli5: "Real daily contracts-traded figure from metalcharts.org — the one thing on this chart CFTC's own report doesn't provide at all (CoT reports positions, never trading volume). Only accumulates forward from whenever this feature started polling, no historical backfill exists or is possible (metalcharts.org's own volume-oi endpoint has no date-range support, confirmed live) — expect this to show as a handful of recent bars, not a full-window series, until more real days pile up.",
     },
     {
@@ -950,7 +951,7 @@ function MetalLeverageCurveVolumeTooltipContent({ active, label, merged }) {
       <div style={{ color: "#c8d0de", marginBottom: 4 }}>{new Date(label).toLocaleDateString()}</div>
       {row.paper_leverage != null && <div style={{ color: "#e0a84c" }}>Paper Leverage: {row.paper_leverage.toFixed(2)}x</div>}
       {row.curve_spread_pct != null && <div style={{ color: "#7b9fff" }}>Curve Spread: {(row.curve_spread_pct * 100).toFixed(2)}%</div>}
-      {row.volume != null && <div style={{ color: "#5a6278" }}>Volume: {Number(row.volume).toLocaleString()} contracts</div>}
+      {row.volume != null && <div style={{ color: TEXT_MUTED }}>Volume: {Number(row.volume).toLocaleString()} contracts</div>}
       {row.price_high != null && row.price_low != null && (
         <div style={{ color: "#5aa9e6" }}>
           Price: ${row.price_low.toFixed(2)}–${row.price_high.toFixed(2)}
@@ -1110,7 +1111,7 @@ function MetalLeverageCurveVolumeChart({ metal, since, until, pinnedDate, onPin 
           <Bar
             yAxisId="volume"
             dataKey="volume"
-            fill="#5a6278"
+            fill={TEXT_SUBTLE}
             fillOpacity={clickedKey && clickedKey !== "volume" ? 0.15 : 0.4}
             name="volume"
             barSize={4}
@@ -1199,6 +1200,17 @@ export default function SilverCoTTracker() {
   const [days, setDays] = useState(180);
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
+  // Trading Simulator sub-page (margin-simulator-spec.md). Mounted on first
+  // open and then only hidden, so its setup survives going back to Paper
+  // Games and returning — same mounted-but-hidden move Money Management's
+  // overview uses.
+  const [showSim, setShowSim] = useState(false);
+  const [simOpened, setSimOpened] = useState(false);
+  const openSim = () => {
+    setSimOpened(true);
+    setShowSim(true);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
   // Shared GLOBALLY across Trading + Money Supply + Inventory via
   // PinnedDateProvider (frontend/src/pinned_date_context.jsx) — pinning a
   // date on any of those three tabs pins it on all of them, each chart
@@ -1260,10 +1272,18 @@ export default function SilverCoTTracker() {
 
   return (
     <div className="app-shell">
-      <div className="comex-panel">
+      {simOpened && (
+        <div style={showSim ? undefined : { display: "none" }}>
+          <MarginSimulator onClose={() => setShowSim(false)} />
+        </div>
+      )}
+      <div className="comex-panel" style={showSim ? { display: "none" } : undefined}>
         <div className="comex-panel-header">
           Paper Games
           <div className="comex-range-selector">
+            <button type="button" className="comex-range-btn" onClick={openSim}>
+              Trading Simulator →
+            </button>
             {pinnedDate && (
               <button
                 className="comex-range-btn"

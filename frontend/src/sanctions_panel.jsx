@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useReducer } from "react";
 import ChartStaleness from "./chart_staleness";
 import { apiFetch } from "./api_client";
 
+import { TEXT_MUTED } from "./palette";
 // Client-side sort over an already-fetched array — same shape as
 // stack_tracker.jsx's own useSort/SortTh (this repo's established pattern
 // for a plain sortable table), duplicated here rather than shared since
@@ -397,7 +398,7 @@ export default function SanctionsPanel() {
                         <td>
                           {r.entity_name}
                           {r.entity_type === "vessel" && r.vessel_flag && (
-                            <span style={{ color: "#8a94a6" }}> ({r.vessel_flag}{r.vessel_type ? `, ${r.vessel_type}` : ""})</span>
+                            <span style={{ color: TEXT_MUTED }}> ({r.vessel_flag}{r.vessel_type ? `, ${r.vessel_type}` : ""})</span>
                           )}
                         </td>
                         <td>{r.entity_type ?? "—"}</td>
@@ -420,7 +421,7 @@ export default function SanctionsPanel() {
                   <button className="comex-range-btn" disabled={pageClamped <= 1} onClick={() => setPage(pageClamped - 1)}>
                     ← Prev
                   </button>
-                  <span style={{ fontSize: 12, color: "#8a94a6" }}>
+                  <span style={{ fontSize: 12, color: TEXT_MUTED }}>
                     Page {pageClamped} of {totalPages}
                   </span>
                   <button className="comex-range-btn" disabled={pageClamped >= totalPages} onClick={() => setPage(pageClamped + 1)}>

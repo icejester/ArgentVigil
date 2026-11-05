@@ -738,6 +738,47 @@ CREATE TABLE IF NOT EXISTS fed_soma_holdings (
     agencies REAL,
     fetched_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Trading Simulator (margin-simulator-spec.md Story #5). COMEX silver
+-- futures margin requirements, loaded replace-all from the hand-maintained
+-- seed_data/futures_margins.json (same "seed file is the record, table is
+-- its queryable copy" shape as fed_board). There is no automated source:
+-- cmegroup.com refuses automated requests (403, confirmed 2026-10-02) and
+-- its terms prohibit it. Since 2026-01-13 CME sets metals margins as a
+-- percent of contract value (basis='pct_notional'), so *_pct carry the
+-- figure and *_usd stay NULL; a row predating that switch would be
+-- basis='usd' with the reverse. Every field CME/the cited source didn't
+-- state is NULL, never guessed.
+CREATE TABLE IF NOT EXISTS futures_margin_requirements (
+    contract TEXT NOT NULL,
+    effective_date TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    initial_pct REAL,
+    maintenance_pct REAL,
+    initial_margin_usd REAL,
+    maintenance_margin_usd REAL,
+    source_note TEXT,
+    source_url TEXT,
+    loaded_at TEXT,
+    PRIMARY KEY (contract, effective_date)
+);
+
+-- Trading Simulator saved setups (margin-simulator-spec.md Story #4). Pure
+-- user CRUD, no upstream. JSON columns are json.dumps'd at the db.py
+-- boundary (same convention as ofac_designations.program_tags).
+-- margin_rate_used records the rate the simulation ran with, including
+-- whether it was the seeded figure or one the user typed in.
+CREATE TABLE IF NOT EXISTS margin_sim_scenario (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_name TEXT NOT NULL,
+    contract TEXT NOT NULL,
+    participants TEXT NOT NULL,
+    margin_rate_used TEXT,
+    price_source_type TEXT NOT NULL,
+    price_source_params TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -3408,3 +3449,99 @@ def get_top_banks(n: int = 100, members_only: bool = True) -> dict:
         "financials_as_of": agg["asof"],
         "members_only": members_only,
     }
+
+
+# --- Trading Simulator (margin-simulator-spec.md) ---------------------------
+
+_FUTURES_MARGIN_COLS = (
+    "contract", "effective_date", "basis", "initial_pct", "maintenance_pct",
+    "initial_margin_usd", "maintenance_margin_usd", "source_note", "source_url", "loaded_at",
+)
+
+
+def replace_futures_margins(rows: list[dict]):
+    """Replace-all load of the margin seed — the seed file is the record."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM futures_margin_requirements")
+        conn.executemany(
+            f"INSERT INTO futures_margin_requirements ({', '.join(_FUTURES_MARGIN_COLS)}) "
+            f"VALUES ({', '.join(':' + c for c in _FUTURES_MARGIN_COLS)})",
+            [{c: r.get(c) for c in _FUTURES_MARGIN_COLS} for r in rows],
+        )
+
+
+def get_futures_margins(contract: str | None = None) -> list[dict]:
+    """Every margin row, oldest effective_date first, optionally for one contract."""
+    query = "SELECT * FROM futures_margin_requirements"
+    params: tuple = ()
+    if contract:
+        query += " WHERE contract = ?"
+        params = (contract,)
+    query += " ORDER BY contract, effective_date"
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+
+_SCENARIO_JSON_COLS = ("participants", "margin_rate_used", "price_source_params")
+
+
+def _scenario_row(r) -> dict:
+    out = dict(r)
+    for c in _SCENARIO_JSON_COLS:
+        out[c] = json.loads(out[c]) if out[c] is not None else None
+    return out
+
+
+def _scenario_params(fields: dict) -> dict:
+    return {
+        "scenario_name": fields["scenario_name"],
+        "contract": fields["contract"],
+        "participants": json.dumps(fields["participants"]),
+        "margin_rate_used": json.dumps(fields["margin_rate_used"]) if fields.get("margin_rate_used") is not None else None,
+        "price_source_type": fields["price_source_type"],
+        "price_source_params": json.dumps(fields["price_source_params"]) if fields.get("price_source_params") is not None else None,
+    }
+
+
+def create_margin_sim_scenario(fields: dict) -> int:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO margin_sim_scenario (scenario_name, contract, participants, margin_rate_used,
+                   price_source_type, price_source_params, created_at, updated_at)
+               VALUES (:scenario_name, :contract, :participants, :margin_rate_used,
+                   :price_source_type, :price_source_params, :now, :now)""",
+            {**_scenario_params(fields), "now": now},
+        )
+        return cur.lastrowid
+
+
+def update_margin_sim_scenario(scenario_id: int, fields: dict) -> bool:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE margin_sim_scenario SET scenario_name = :scenario_name, contract = :contract,
+                   participants = :participants, margin_rate_used = :margin_rate_used,
+                   price_source_type = :price_source_type, price_source_params = :price_source_params,
+                   updated_at = :now
+               WHERE id = :id""",
+            {**_scenario_params(fields), "now": now, "id": scenario_id},
+        )
+        return cur.rowcount > 0
+
+
+def get_margin_sim_scenarios() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM margin_sim_scenario ORDER BY updated_at DESC, id DESC").fetchall()
+    return [_scenario_row(r) for r in rows]
+
+
+def get_margin_sim_scenario(scenario_id: int) -> dict | None:
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM margin_sim_scenario WHERE id = ?", (scenario_id,)).fetchone()
+    return _scenario_row(r) if r else None
+
+
+def delete_margin_sim_scenario(scenario_id: int) -> bool:
+    with get_conn() as conn:
+        return conn.execute("DELETE FROM margin_sim_scenario WHERE id = ?", (scenario_id,)).rowcount > 0

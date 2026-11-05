@@ -51,6 +51,7 @@ NON_SOURCE_TABLES = {
     "research_messages",
     "research_log",
     "squeeze_case_log",    # hand-maintained reference data, no fetch
+    "margin_sim_scenario", # Trading Simulator saved setups — user CRUD, no upstream
 }
 
 
@@ -86,6 +87,7 @@ ALLOWED_NON_DB_API = {
     "/api/config/status": "Settings' Configuration status — os.environ presence check, no upstream, no value ever returned",
     "/api/silver/market-balance": "reads seed_data JSON server-side — no upstream fetch",
     "/api/catcor/research/": "Research workflow (sessions/personas/preview) — on-demand chat, no market upstream",
+    "/api/margin-sim/scenarios": "Trading Simulator saved-setup CRUD (margin-simulator-spec.md Story #4) — user-owned data, no upstream; reads are /db-suffixed",
     "/api/stack/": "Stack Tracker CRUD (specs/stackTracker-spec.md) — user-owned data, no upstream fetch at all",
 }
 

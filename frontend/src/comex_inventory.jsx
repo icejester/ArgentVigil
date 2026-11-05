@@ -18,7 +18,7 @@ import {
 import MarketBalancePanel, { DemandCompositionPanel } from "./market_balance";
 import DeliveryBehaviorPanel from "./delivery_behavior_panel";
 import TradeFlowPanel from "./trade_flow_panel";
-import { VAULT_COLORS } from "./palette";
+import { VAULT_COLORS, TEXT_MUTED, TEXT_SUBTLE, TEXT_BODY } from "./palette";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import { apiFetch } from "./api_client";
 import { nearestRowDate, xTicks } from "./date_utils";
@@ -116,7 +116,7 @@ function VaultTooltipContent({ active, label, rows, vaultKeys, vaultColor, click
   return (
     <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px" }}>
       <div style={{ color: "#c8d0de", fontWeight: 600, marginBottom: 4 }}>{label}</div>
-      <div style={{ color: "#8a94a6", marginBottom: 4 }}>Total: {fmt_oz(dayTotal)}</div>
+      <div style={{ color: TEXT_MUTED, marginBottom: 4 }}>Total: {fmt_oz(dayTotal)}</div>
       {shownKeys.map((v) => (
         <div key={v} style={{ color: vaultColor(v) }}>
           {shortName(v)}: {fmt_oz(row[v].oz)}
@@ -124,7 +124,7 @@ function VaultTooltipContent({ active, label, rows, vaultKeys, vaultColor, click
         </div>
       ))}
       {hiddenCount > 0 && (
-        <div style={{ color: "#5a6278", marginTop: 2 }}>
+        <div style={{ color: TEXT_SUBTLE, marginTop: 2 }}>
           +{hiddenCount} more — click a legend row for detail
         </div>
       )}
@@ -361,11 +361,11 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, aggregateHistory, sfWi
                   <XAxis
                     dataKey="date"
                     tickFormatter={(d) => `${d.slice(5, 7)}/${d.slice(8, 10)}`}
-                    tick={{ fill: "#8a94a6", fontSize: 11 }}
+                    tick={{ fill: TEXT_MUTED, fontSize: 11 }}
                   />
                   <YAxis
                     tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
-                    tick={{ fill: "#8a94a6", fontSize: 11 }}
+                    tick={{ fill: TEXT_MUTED, fontSize: 11 }}
                   />
                   <Tooltip
                     content={
@@ -473,7 +473,7 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, aggregateHistory, sfWi
                     return (
                       <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "6px 10px" }}>
                         <div style={{ color: "#c8d0de", fontWeight: 600 }}>{d.fullName}</div>
-                        <div style={{ color: "#8a94a6" }}>{fmt_oz(d.value)}</div>
+                        <div style={{ color: TEXT_MUTED }}>{fmt_oz(d.value)}</div>
                         {d.delta != null && (
                           <div className={delta_class(d.delta)}>{delta_str(d.delta)} vs. prior day</div>
                         )}
@@ -484,7 +484,7 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, aggregateHistory, sfWi
               </PieChart>
             </ResponsiveContainer>
             {snapshotDate && (
-              <div style={{ fontSize: 11, color: "#8a94a6", textAlign: "center" }}>
+              <div style={{ fontSize: 11, color: TEXT_BODY, textAlign: "center" }}>
                 {pinnedDateSnapped ? `As of ${snapshotDate}` : `Latest — ${snapshotDate}`}
               </div>
             )}
@@ -539,12 +539,12 @@ function VaultSnapshotPanel({ metal, depositoriesHistory, aggregateHistory, sfWi
                   dataKey="date"
                   ticks={xTicks(pctDeliverableSeries, 8)}
                   tickFormatter={(d) => `${d.slice(5, 7)}/${d.slice(8, 10)}`}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  tick={{ fill: TEXT_MUTED, fontSize: 11 }}
                 />
                 <YAxis
                   domain={["auto", "auto"]}
                   tickFormatter={(v) => `${v.toFixed(0)}%`}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  tick={{ fill: TEXT_MUTED, fontSize: 11 }}
                   width={44}
                 />
                 <Tooltip
@@ -829,7 +829,7 @@ function CrossExchangePanel({ comexHistory, shfeHistory, pslv, sfWindow, sfCusto
               }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <XAxis dataKey="date" ticks={ticks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
               <YAxis
                 yAxisId="comex"
                 tickFormatter={(v) => `${(v / 1e6).toFixed(0)}M`}
@@ -926,10 +926,10 @@ function ShfeHistoryPanel({ shfeHistory, sfWindow, sfCustomStart, sfCustomEnd, p
             }}
           >
             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <XAxis dataKey="date" ticks={ticks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
             <YAxis
               tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
-              tick={{ fill: "#8a94a6", fontSize: 11 }}
+              tick={{ fill: TEXT_MUTED, fontSize: 11 }}
             />
             <Tooltip content={<ShfeHistoryTooltipContent rows={filtered} />} />
             {pinnedDateSnapped && (
@@ -970,7 +970,7 @@ function ShfeVaultTooltipContent({ active, label, rows, warehouseKeys, warehouse
   return (
     <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "8px 10px" }}>
       <div style={{ color: "#c8d0de", fontWeight: 600, marginBottom: 4 }}>{label}</div>
-      <div style={{ color: "#8a94a6", marginBottom: 4 }}>Total: {fmt_oz(dayTotal)}</div>
+      <div style={{ color: TEXT_MUTED, marginBottom: 4 }}>Total: {fmt_oz(dayTotal)}</div>
       {ranked.slice(0, 3).map((w) => (
         <div key={w} style={{ color: warehouseColor(w) }}>
           {w}: {fmt_oz(row[w].oz)}
@@ -978,7 +978,7 @@ function ShfeVaultTooltipContent({ active, label, rows, warehouseKeys, warehouse
         </div>
       ))}
       {ranked.length > 3 && (
-        <div style={{ color: "#5a6278", marginTop: 2 }}>
+        <div style={{ color: TEXT_SUBTLE, marginTop: 2 }}>
           +{ranked.length - 3} more — click a legend row for detail
         </div>
       )}
@@ -1112,11 +1112,11 @@ function ShfeWarehousePanel({ metal, shfeWarehousesHistory, sfWindow, sfCustomSt
                 <XAxis
                   dataKey="date"
                   tickFormatter={(d) => `${d.slice(5, 7)}/${d.slice(8, 10)}`}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  tick={{ fill: TEXT_MUTED, fontSize: 11 }}
                 />
                 <YAxis
                   tickFormatter={(v) => `${(v / 1e6).toFixed(1)}M`}
-                  tick={{ fill: "#8a94a6", fontSize: 11 }}
+                  tick={{ fill: TEXT_MUTED, fontSize: 11 }}
                 />
                 <Tooltip
                   content={
@@ -1194,7 +1194,7 @@ function ShfeWarehousePanel({ metal, shfeWarehousesHistory, sfWindow, sfCustomSt
                   return (
                     <div style={{ background: "#1a1f2b", border: "1px solid #2e3547", padding: "6px 10px" }}>
                       <div style={{ color: "#c8d0de", fontWeight: 600 }}>{d.name}</div>
-                      <div style={{ color: "#8a94a6" }}>{fmt_oz(d.value)}</div>
+                      <div style={{ color: TEXT_MUTED }}>{fmt_oz(d.value)}</div>
                       {d.delta != null && (
                         <div className={delta_class(d.delta)}>{delta_str(d.delta)} vs. prior day</div>
                       )}
@@ -1205,7 +1205,7 @@ function ShfeWarehousePanel({ metal, shfeWarehousesHistory, sfWindow, sfCustomSt
             </PieChart>
           </ResponsiveContainer>
           {snapshotDate && (
-            <div style={{ fontSize: 11, color: "#8a94a6", textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: TEXT_BODY, textAlign: "center" }}>
               {pinnedDateSnapped ? `As of ${snapshotDate}` : `Latest — ${snapshotDate}`}
             </div>
           )}
@@ -1506,7 +1506,7 @@ export default function ComexInventoryDashboard() {
       </div>
       {sfWindow === "custom" && (
         <div className="comex-range-selector" style={{ marginBottom: 8 }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: TEXT_MUTED }}>
             From
             <input
               type="date"
@@ -1515,7 +1515,7 @@ export default function ComexInventoryDashboard() {
               max={sfCustomEnd || undefined}
             />
           </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: TEXT_MUTED }}>
             To
             <input
               type="date"

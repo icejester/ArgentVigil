@@ -7,7 +7,7 @@ import ChartStaleness from "./chart_staleness";
 import { apiFetch } from "./api_client";
 import { nearestRowDate, xTicks, windowToSinceUntil, inDateRange } from "./date_utils";
 import { usePinnedDate } from "./pinned_date_context";
-import { MONEY_MGMT_COLORS, MM_PIE_COLORS, MM_PIE_OTHER_COLOR, MM_PIE_REST_COLOR, MM_SURFACE } from "./palette";
+import { MONEY_MGMT_COLORS, MM_PIE_COLORS, MM_PIE_OTHER_COLOR, MM_PIE_REST_COLOR, MM_SURFACE, TEXT_MUTED } from "./palette";
 import { WIN_COLOR, LOSS_COLOR } from "./money_supply_shared";
 import { FORCE_REFRESH_EVENT } from "./refresh_controls";
 import FedBankGrowthPanel from "./fed_bank_growth_panel";
@@ -19,7 +19,7 @@ import FedBankGrowthPanel from "./fed_bank_growth_panel";
 // framing — every series is charted on its own.
 
 const PIN_LINE_COLOR = "#e8ecf4";
-const MUTED = "#8a94a6";
+const MUTED = TEXT_MUTED;
 
 function fmtPctVal(v, digits = 2) {
   return v == null ? "—" : `${v.toFixed(digits)}%`;
