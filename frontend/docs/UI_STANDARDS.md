@@ -106,3 +106,7 @@ When a toggle/mode is removed from the UI (not just hidden), remove its entire c
 state, the branches that only existed to serve it, any props threaded through solely for its
 benefit — rather than leaving it unreachable-but-present. Confirmed via `grep` that the
 relevant state/prop name has zero remaining references before considering the removal done.
+
+## Secondary / description text
+
+Use `var(--text-muted)` (CSS) or `TEXT_MUTED` from `palette.js` (JS/SVG props) for secondary text; `--text-subtle`/`TEXT_SUBTLE` for the dimmer tier. Never write a gray hex inline. Both are defined once in `index.css` `:root` and mirrored in `palette.js` — change them together.

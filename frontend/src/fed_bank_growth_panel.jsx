@@ -6,6 +6,7 @@ import ChartStaleness from "./chart_staleness";
 import { apiFetch } from "./api_client";
 import { nearestRowDate, xTicks, windowToSinceUntil, inDateRange } from "./date_utils";
 
+import { TEXT_MUTED } from "./palette";
 // soma-bank-growth-spec.md — Money Management's 6th sub-panel. A read-time
 // correlation view of two real, independently-measured quarterly
 // aggregates: total U.S. bank assets (bank_financials) and Fed SOMA
@@ -16,7 +17,7 @@ import { nearestRowDate, xTicks, windowToSinceUntil, inDateRange } from "./date_
 // (this pass) is the system-wide chart; Story B (top-10-cohort growth
 // share) is a later addition to this same sub-panel.
 
-const MUTED = "#8a94a6";
+const MUTED = TEXT_MUTED;
 const PIN_LINE_COLOR = "#e8ecf4";
 const BANK_ASSETS_COLOR = "#4caf76";
 const SOMA_COLOR = "#4ac6ff";

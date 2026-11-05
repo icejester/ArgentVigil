@@ -1,4 +1,4 @@
-# ArgentVigil v2.36.0
+# ArgentVigil v2.37.0
 
 Silver market observability, with gold as comparative context. AV exists to help understand the silver market as it actually is — paper positioning, physical movement, and the currency it's priced in — not to trade it. No price targets, no predictions, no risk commentary: instrumentation built to be right about what already happened.
 
@@ -35,6 +35,8 @@ Silver doesn't move — traders' opinions of the dollar do. This panel reads tho
 The rest of the panel isn't sentiment, and doesn't pretend to be. **Paper leverage** (open interest in ounces vs. registered deliverable metal — silver runs ~5–6× more paper claims than metal that could actually settle them) is structural, not a mood — it moves with the paper market's own growth or shrinkage. The **futures curve spread** (contango vs. backwardation) is a physical-tightness tell, not a feeling — it's useful precisely because it can agree or disagree with what the crowd is doing (capitulated positioning *and* deepening backwardation together is a much stronger story than either alone). Daily highs/lows are price action, downstream of sentiment plus everything else that moves a market that day — reading a wide range as "traders were scared" is an inferential leap this panel deliberately doesn't make on its own.
 
 None of it is a price call — it's a read on how stretched the crowd's dollar-skepticism currently is, and whether the metal underneath, and the market it trades in, actually back that read up.
+
+A **Trading Simulator** sub-page (button in the panel header) makes the leverage mechanics tangible. Hypothetical long and short accounts run on CME's real margin rules, which are a percent of contract value since January 2026, against either a price slider or a day-by-day path. The path can be a random walk, moves you choose, or a real historical window of silver closes. Each account's margin balance updates as the price moves, and margin calls are flagged. The accounts are synthetic, and nothing in it is a forecast.
 
 #### Inventory ("Stock & Flow")
 

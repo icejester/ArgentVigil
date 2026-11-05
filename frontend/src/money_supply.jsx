@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { nearestRowDate } from "./date_utils";
-import { VAULT_COLORS } from "./palette";
+import { VAULT_COLORS, TEXT_MUTED, TEXT_SUBTLE, TEXT_BODY } from "./palette";
 import ChartStaleness from "./chart_staleness";
 import { usePinnedDate } from "./pinned_date_context";
 import { apiFetch } from "./api_client";
@@ -218,7 +218,7 @@ function mergeOutlays(rows) {
 // per month. Mirrors comex_inventory.jsx's VAULT_COLORS-cycling convention
 // for "N real categories, more than a hand-picked palette" charts.
 const OUTLAYS_BY_AGENCY_TOP_N = 8;
-const OUTLAYS_OTHER_COLOR = "#5a6278";
+const OUTLAYS_OTHER_COLOR = TEXT_SUBTLE;
 // Matches backend/main.py's TREASURY_OUTLAYS_BY_AGENCY_MONTHS — display copy
 // only, not a value the fetch itself depends on (the backend already trims
 // what it persists; this is just so the panel note states the same number).
@@ -893,7 +893,7 @@ function CompositionTooltipContent({ active, label, composition, compositionView
       <div style={{ color: "#c8d0de", marginBottom: 4 }}>
         {label}
         {!isExact && row.date && (
-          <span style={{ color: "#5a6278" }}> (nearest weekly reading: {row.date})</span>
+          <span style={{ color: TEXT_SUBTLE }}> (nearest weekly reading: {row.date})</span>
         )}
       </div>
       {showAssets && (
@@ -1036,7 +1036,7 @@ function OutlaysInterestPieChart({ pieData, pieRow, clickedAgencyKey }) {
         </PieChart>
       </ResponsiveContainer>
       {pieRow.date && (
-        <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+        <div style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4 }}>
           {pieRow.fiscalYear != null
             ? `FY${pieRow.fiscalYear}${pieRow.monthsPresent < 12 ? " (partial)" : ""}`
             : `As of ${pieRow.date}`}
@@ -1109,7 +1109,7 @@ function OutlaysInterestLegend({
                 <span>
                   <strong>{a}</strong>
                   {treasuryInterestPct != null && (
-                    <span style={{ color: "#8a94a6", fontWeight: "normal" }}> ({treasuryInterestPct}% interest)</span>
+                    <span style={{ color: TEXT_MUTED, fontWeight: "normal" }}> ({treasuryInterestPct}% interest)</span>
                   )}
                   {/* Per-department total at the resolved pin/hover/latest
                       date (pieRow) — replaces the static full-width pinned
@@ -1117,7 +1117,7 @@ function OutlaysInterestLegend({
                       the chart, per the user's explicit request to move it
                       here instead. */}
                   {pieRow[a] != null && (
-                    <span style={{ color: "#8a94a6", fontWeight: "normal" }}> — {fmtBillions(pieRow[a])}</span>
+                    <span style={{ color: TEXT_MUTED, fontWeight: "normal" }}> — {fmtBillions(pieRow[a])}</span>
                   )}
                 </span>
               </button>
@@ -1140,13 +1140,13 @@ function OutlaysInterestLegend({
             <span>
               <strong>Other ({otherCount} more)</strong>
               {pieRow.other != null && (
-                <span style={{ color: "#8a94a6", fontWeight: "normal" }}> — {fmtBillions(pieRow.other)}</span>
+                <span style={{ color: TEXT_MUTED, fontWeight: "normal" }}> — {fmtBillions(pieRow.other)}</span>
               )}
             </span>
           </button>
         </div>
       </div>
-      <div className="comex-panel-note" style={{ marginTop: 8, color: "#8a94a6" }}>
+      <div className="comex-panel-note" style={{ marginTop: 8, color: TEXT_BODY }}>
         Note: Department of the Treasury's own reported total includes Interest on the Public Debt
         (Treasury is who issues/services it) — shown here as one wedge, shaded internally by its
         own interest share (darker portion) vs. the rest of Treasury's spending (lighter portion).
@@ -1787,7 +1787,7 @@ export default function MoneySupply() {
       </div>
       {window_ === "custom" && (
         <div className="comex-range-selector" style={{ marginBottom: 8 }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: TEXT_MUTED }}>
             From
             <input
               type="date"
@@ -1796,7 +1796,7 @@ export default function MoneySupply() {
               max={customEnd || undefined}
             />
           </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#8a94a6" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: TEXT_MUTED }}>
             To
             <input
               type="date"
@@ -1847,19 +1847,19 @@ export default function MoneySupply() {
             }}
           >
             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-            <XAxis dataKey="date" ticks={ticks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <XAxis dataKey="date" ticks={ticks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
             <YAxis
               yAxisId="level"
               tickFormatter={(v) => `$${v.toFixed(0)}T`}
-              tick={{ fill: "#8a94a6", fontSize: 11 }}
-              label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+              tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+              label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
             />
             <YAxis
               yAxisId="pct"
               orientation="right"
               tickFormatter={(v) => `${v.toFixed(0)}%`}
               tick={{ fill: "#e8ecf4", fontSize: 11 }}
-              label={{ value: "Percent", angle: 90, position: "insideRight", fill: "#5a6278", fontSize: 11 }}
+              label={{ value: "Percent", angle: 90, position: "insideRight", fill: TEXT_SUBTLE, fontSize: 11 }}
             />
             <Tooltip content={<MoneySupplyTooltip merged={merged} />} />
             {pinnedDateMerged && (
@@ -1969,7 +1969,7 @@ export default function MoneySupply() {
         <ChartStaleness sourceKey="money_supply" />
         <span>Fed Balance Sheet Composition</span>
         {compositionPieRow?.assetsLiabilitiesRatio != null && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+          <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
             {pinnedDate && `${compositionPieRow.date} · `}
             Assets / Liabilities:{" "}
             <span style={{ color: compositionPieRow.assetsLiabilitiesRatio > 1.25 ? WIN_COLOR : LOSS_COLOR }}>
@@ -2022,12 +2022,12 @@ export default function MoneySupply() {
               }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={compositionTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <XAxis dataKey="date" ticks={compositionTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
               <YAxis
                 yAxisId="level"
                 tickFormatter={(v) => `$${v.toFixed(1)}T`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                label={{ value: "Trillions USD", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               {(compositionView === "assets" || compositionView === "liabilities" || compositionView === "both") && (
                 <YAxis
@@ -2035,7 +2035,7 @@ export default function MoneySupply() {
                   orientation="right"
                   tickFormatter={(v) => `${v.toFixed(1)}x`}
                   tick={{ fill: "#e8ecf4", fontSize: 11 }}
-                  label={{ value: "Assets ÷ Liabilities", angle: 90, position: "insideRight", fill: "#5a6278", fontSize: 11 }}
+                  label={{ value: "Assets ÷ Liabilities", angle: 90, position: "insideRight", fill: TEXT_SUBTLE, fontSize: 11 }}
                 />
               )}
               {pinnedDateComposition && (
@@ -2203,7 +2203,7 @@ export default function MoneySupply() {
                 reflect (the pinned/hovered date, or the latest reading if
                 neither is set). */}
             {compositionPieRow?.date && (
-              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+              <div style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4 }}>
                 As of {compositionPieRow.date}
               </div>
             )}
@@ -2253,7 +2253,7 @@ export default function MoneySupply() {
         <ChartStaleness sourceKey={["treasury_outlays", "treasury_outlays_by_agency"]} />
         <span>Federal Outlays{outlaysView === "byAgency" ? " by Department/Agency" : ""}</span>
         {outlaysView === "topline" && outlaysMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+          <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
             {(() => {
               const row = pinnedDate
                 ? outlaysMerged.find((r) => r.date === pinnedDateOutlays)
@@ -2278,7 +2278,7 @@ export default function MoneySupply() {
           </span>
         )}
         {outlaysView === "byAgency" && outlaysByAgencyPieRow?.date && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+          <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
             {outlaysByAgencyPieRow.fiscalYear != null
               ? `FY${outlaysByAgencyPieRow.fiscalYear}${outlaysByAgencyPieRow.monthsPresent < 12 ? ` (partial, ${outlaysByAgencyPieRow.monthsPresent}/12 mo.)` : ""}`
               : outlaysByAgencyPieRow.date}
@@ -2343,7 +2343,7 @@ export default function MoneySupply() {
       {outlaysView === "topline" ? (
         <>
       {outlaysGranularity === "annual" && outlaysAnnual.some((r) => r.monthsPresent < 12) && (
-        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
+        <div className="comex-panel-note" style={{ color: TEXT_BODY }}>
           {outlaysAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
             <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
           ))}
@@ -2362,11 +2362,11 @@ export default function MoneySupply() {
               }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={outlaysTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <XAxis dataKey="date" ticks={outlaysTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
               <YAxis
                 tickFormatter={(v) => `$${v.toFixed(0)}B`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               <Tooltip content={<OutlaysTooltipContent outlaysMerged={outlaysMerged} />} />
               {pinnedDateOutlays && (
@@ -2423,7 +2423,7 @@ export default function MoneySupply() {
               </PieChart>
             </ResponsiveContainer>
             {outlaysToplinePieRow?.date && (
-              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4 }}>
+              <div style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4 }}>
                 {outlaysToplinePieRow.fiscalYear != null
                   ? `FY${outlaysToplinePieRow.fiscalYear}${outlaysToplinePieRow.monthsPresent < 12 ? ` (partial)` : ""}`
                   : `As of ${outlaysToplinePieRow.date}`}
@@ -2474,7 +2474,7 @@ export default function MoneySupply() {
       ) : (
         <>
       {outlaysGranularity === "annual" && outlaysByAgencyAnnual.some((r) => r.monthsPresent < 12) && (
-        <div className="comex-panel-note" style={{ color: "#8a94a6" }}>
+        <div className="comex-panel-note" style={{ color: TEXT_BODY }}>
           {outlaysByAgencyAnnual.filter((r) => r.monthsPresent < 12).map((r) => (
             <span key={r.fiscalYear}>FY{r.fiscalYear} is partial ({r.monthsPresent} of 12 months) — not a complete fiscal-year total yet. </span>
           ))}
@@ -2497,13 +2497,13 @@ export default function MoneySupply() {
               }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={outlaysByAgencyTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <XAxis dataKey="date" ticks={outlaysByAgencyTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
               <YAxis
                 domain={clickedAgencyYDomain}
                 allowDataOverflow={!!clickedAgencyKey || hiddenAgencies.size > 0}
                 tickFormatter={(v) => `$${v.toFixed(0)}B`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                label={{ value: "Billions USD", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               <Tooltip
                 content={(props) => (
@@ -2639,7 +2639,7 @@ export default function MoneySupply() {
           if (!row) return null;
           const change = row.assetsChangeBillions;
           return (
-            <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
               {pinnedDate && `${row.date} · `}
               Assets {fmtTrillions(row.totalAssets)}
               {change != null && (
@@ -2671,19 +2671,19 @@ export default function MoneySupply() {
               }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={xTicks(qeQtRows)} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <XAxis dataKey="date" ticks={xTicks(qeQtRows)} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
               <YAxis
                 yAxisId="delta"
                 tickFormatter={(v) => `$${v.toFixed(0)}B`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Weekly Δ, Billions USD", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                label={{ value: "Weekly Δ, Billions USD", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               <YAxis
                 yAxisId="level"
                 orientation="right"
                 tickFormatter={(v) => `$${v.toFixed(1)}T`}
                 tick={{ fill: "#e8ecf4", fontSize: 11 }}
-                label={{ value: "Balance Sheet Total, Trillions USD", angle: 90, position: "insideRight", fill: "#5a6278", fontSize: 11 }}
+                label={{ value: "Balance Sheet Total, Trillions USD", angle: 90, position: "insideRight", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               {pinnedDateQeQt && (
                 <ReferenceLine yAxisId="delta" x={pinnedDateQeQt} stroke={RATIO_COLOR} strokeDasharray="3 3" />
@@ -2770,7 +2770,7 @@ export default function MoneySupply() {
         <ChartStaleness sourceKey="money_supply" />
         <span>Treasury Yields</span>
         {yieldsMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+          <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
             {(() => {
               const row = pinnedDate
                 ? yieldsMerged.find((r) => r.date === pinnedDateYields)
@@ -2805,7 +2805,7 @@ export default function MoneySupply() {
               }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-              <XAxis dataKey="date" ticks={yieldsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+              <XAxis dataKey="date" ticks={yieldsTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
               {/* Two axes, not one — dgs2/dgs10/dfii10 are yield LEVELS
                   (~2-5%), t10y2y is a SPREAD between two of them (~0.3-0.5%,
                   can go negative on an inversion). Forcing all four onto one
@@ -2821,16 +2821,16 @@ export default function MoneySupply() {
                 yAxisId="level"
                 domain={["dataMin - 0.1", "dataMax + 0.1"]}
                 tickFormatter={(v) => `${v.toFixed(1)}%`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "Yield %", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                label={{ value: "Yield %", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               <YAxis
                 yAxisId="spread"
                 orientation="right"
                 domain={["dataMin - 0.05", "dataMax + 0.05"]}
                 tickFormatter={(v) => `${v.toFixed(2)}%`}
-                tick={{ fill: "#8a94a6", fontSize: 11 }}
-                label={{ value: "10Y–2Y Spread", angle: 90, position: "insideRight", fill: "#5a6278", fontSize: 11 }}
+                tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                label={{ value: "10Y–2Y Spread", angle: 90, position: "insideRight", fill: TEXT_SUBTLE, fontSize: 11 }}
               />
               <Tooltip content={<YieldsTooltipContent yieldsMerged={yieldsMerged} />} />
               {pinnedDateYields && (
@@ -2917,7 +2917,7 @@ export default function MoneySupply() {
           if (!row) return null;
           const baselineLabel = METAL_SERIES.find((s) => s.key === baseline)?.shortLabel ?? baseline;
           return (
-            <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+            <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
               {pinnedDate && `${row.date} · `}
               Baseline {baselineLabel}
               {row.xau_index != null && (
@@ -2971,13 +2971,13 @@ export default function MoneySupply() {
             }}
           >
             <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-            <XAxis dataKey="date" ticks={metalsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+            <XAxis dataKey="date" ticks={metalsTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
             <YAxis
               domain={metalsYDomain}
-              tick={{ fill: "#8a94a6", fontSize: 11 }}
+              tick={{ fill: TEXT_MUTED, fontSize: 11 }}
               tickFormatter={(v) => `${Math.round(v)}%`}
               width={70}
-              label={{ value: "Return vs. baseline (%)", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11, dx: -10 }}
+              label={{ value: "Return vs. baseline (%)", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11, dx: -10 }}
             />
             <Tooltip
               content={
@@ -3116,7 +3116,7 @@ export default function MoneySupply() {
                   justifyContent: "center",
                   textAlign: "center",
                   fontSize: 11,
-                  color: "#5a6278",
+                  color: TEXT_SUBTLE,
                   border: "1px dashed #2e3547",
                   borderRadius: "50%",
                   padding: 16,
@@ -3128,7 +3128,7 @@ export default function MoneySupply() {
             {/* Single-date snapshot caption, same convention as the
                 Composition pie's own "As of" line. */}
             {metalsHeldComparison && (
-              <div style={{ fontSize: 11, color: "#8a94a6", marginTop: 4, textAlign: "center" }}>
+              <div style={{ fontSize: 11, color: TEXT_BODY, marginTop: 4, textAlign: "center" }}>
                 Since {metalsHeldComparison.heldDate} → {metalsHeldComparison.latestDate}
                 <br />
                 {"$" + HELD_STAKE_USD} held in each, relative to {METAL_SERIES.find((s) => s.key === baseline)?.shortLabel}

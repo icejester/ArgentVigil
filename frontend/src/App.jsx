@@ -15,6 +15,7 @@ import { HealthProvider, useHealthRows } from "./health_context";
 import { PinnedDateProvider } from "./pinned_date_context";
 import { apiFetch } from "./api_client";
 
+import { TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 // Nav tab set. MUST stay in lockstep with backend main.py's
 // _VALID_NAV_SECTIONS allowlist — tests/test_conventions.py's
 // test_nav_sections_match_backend_allowlist fails the suite on drift
@@ -100,7 +101,7 @@ function TickerTooltipContent({ active, payload, color }) {
   const row = payload[0].payload;
   return (
     <div style={{ background: "#141820", border: "1px solid #2e3547", padding: "6px 8px", fontSize: 11 }}>
-      <div style={{ color: "#8a94a6" }}>{new Date(row.ts).toLocaleString()}</div>
+      <div style={{ color: TEXT_MUTED }}>{new Date(row.ts).toLocaleString()}</div>
       <div style={{ color }}>${row.price.toFixed(2)}</div>
     </div>
   );
@@ -175,7 +176,7 @@ function TickerRow({ metalKey, label, color }) {
   const latest = rows.length ? rows[rows.length - 1].price : null;
   const first = rows.length ? rows[0].price : null;
   const change = latest != null && first != null ? latest - first : null;
-  const changeColor = change == null ? "#5a6278" : change === 0 ? "#5a6278" : change > 0 ? "#4caf76" : "#e0555c";
+  const changeColor = change == null ? TEXT_SUBTLE : change === 0 ? TEXT_SUBTLE : change > 0 ? "#4caf76" : "#e0555c";
 
   const activeWindowLabel = PRICE_HISTORY_WINDOWS.find((w) => w.ms === windowMs)?.label
     ?? (windowMs === "custom" ? "Custom" : "6H");

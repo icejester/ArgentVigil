@@ -66,6 +66,7 @@ from fastapi import HTTPException
 from . import catcor
 from . import db
 from . import fed_structure
+from . import margin_sim
 from . import sources
 from . import stack_db
 from . import mc_token
@@ -2576,6 +2577,17 @@ async def _fetch_and_persist_fed_governance_check() -> dict:
     return {"members": len(live)}
 
 
+async def _fetch_and_persist_futures_margins() -> dict:
+    """futures_margins' fetch_fn (margin-simulator-spec.md Story #5). No
+    upstream request: re-loads the hand-maintained seed
+    (seed_data/futures_margins.json) replace-all. cmegroup.com refuses
+    automated requests, so a human transcribes each margin change into the
+    seed. Runs at startup (a seed edit ships with a deploy) and on the Data
+    tab's "Re-run now"."""
+    seed = margin_sim.persist_seed()
+    return {"rows": len(seed["rows"])}
+
+
 async def _fetch_and_persist_yahoo_daily_close() -> dict:
     """Real daily (not month-end) Yahoo closes for both metals — one
     settlement_price instrument (XAG_YAHOO_DAILY_CLOSE/XAU_YAHOO_DAILY_CLOSE)
@@ -3214,6 +3226,16 @@ def register_sources() -> None:
         tables=["fed_board", "fed_reserve_banks", "fed_governance_meta"],
         cadence=CadenceSpec(trigger="interval", interval_seconds=604800, fire_at_startup=True, enabled_flag="slow_enabled"),
         rate_limit=RateLimitSpec(kind="undocumented", note="One HTML page fetch per week from federalreserve.gov; User-Agent sent."),
+    ))
+    # Trading Simulator (margin-simulator-spec.md Story #5). Hand-maintained
+    # seed, no upstream — registered so the table has an owner, a health
+    # badge, and a "Re-run now" to reload after editing the seed.
+    sources.register(SourceDefinition(
+        key="futures_margins", label="COMEX Silver Margin Requirements (hand-maintained seed)",
+        affinity_group="static_internal", fetch_fn=_fetch_and_persist_futures_margins,
+        tables=["futures_margin_requirements"],
+        cadence=CadenceSpec(trigger="manual_only", fire_at_startup=True),
+        rate_limit=RateLimitSpec(kind="undocumented", note="No upstream request at all: reads seed_data/futures_margins.json, which ships with the code. cmegroup.com refuses automated requests (403) and its terms prohibit them, so each margin change is transcribed by hand."),
     ))
     # Fed Operational Flow (more-fed-spec.md, Story #5). Two tables under
     # one source key, same shape ofac_sanctions already uses for four —

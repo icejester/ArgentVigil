@@ -42,3 +42,8 @@ export const MM_SURFACE = "#141820"; // 2px ring between slices
 // always-rendered % label, its legend row and the ranked table beside it.
 // Lighter steps raise contrast but fall under the ΔE 15 floor vs. #6b7280.
 export const MM_PIE_REST_COLOR = "#3d4454";
+
+// Secondary/description text. Mirrors --text-muted/--text-subtle in index.css (SVG tick props need a literal).
+export const TEXT_MUTED = "#bac2d2";
+export const TEXT_SUBTLE = "#919bb0";
+export const TEXT_BODY = "#969ca7";

@@ -1,3 +1,10 @@
+:root {
+  /* Secondary text on the #141820 panel surface. JS-side twins: TEXT_MUTED/TEXT_SUBTLE in palette.js. */
+  --text-muted: #bac2d2;
+  --text-body: #969ca7;
+  --text-subtle: #919bb0;
+}
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
@@ -34,7 +41,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .collapsible-pane-title .staleness-label { margin-left: auto; }
 .collapsible-pane-title::-webkit-details-marker { display: none; }
 .collapsible-pane-title::before {
-  content: "▸"; display: inline-block; margin-right: 8px; color: #5a6278;
+  content: "▸"; display: inline-block; margin-right: 8px; color: var(--text-subtle);
   transition: transform 0.15s ease;
 }
 .collapsible-pane[open] > .collapsible-pane-title::before { transform: rotate(90deg); }
@@ -58,7 +65,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .section-nav-button {
   background: none; border: 1px solid #2e3547; border-radius: 4px;
-  padding: 6px 14px; font-size: 12px; font-weight: 600; color: #8a94a6;
+  padding: 6px 14px; font-size: 12px; font-weight: 600; color: var(--text-muted);
   cursor: pointer; letter-spacing: 0.05em; text-transform: uppercase;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
   display: inline-flex; align-items: center; gap: 6px;
@@ -83,7 +90,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   gap: 16px; flex-wrap: wrap;
 }
 .app-title { font-size: 26px; font-weight: 700; letter-spacing: 0.03em; color: #e8ecf4; }
-.app-subtitle { font-size: 13px; color: #6b778d; }
+.app-subtitle { font-size: 13px; color: var(--text-subtle); }
 
 /* Header ticker — purely visual "stuff's running" pulse, not a trading
    readout. Sits parallel with the "ArgentVigil" title, as the second
@@ -177,10 +184,10 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
    skip ever recorded. Deliberately distinct palette from computeStatus's
    ok/stale/error (green/amber/red) used elsewhere (Data tab,
    HeaderHealthDot) — gray-as-the-good-state is specific to this glyph. */
-.chart-staleness-glyph--fine { color: #6b7488; }
+.chart-staleness-glyph--fine { color: var(--text-subtle); }
 .chart-staleness-glyph--explained-stale { color: #d9a441; }
 .chart-staleness-glyph--unexplained-stale { color: #e0555c; }
-.chart-staleness-glyph--unknown { color: #6b7488; }
+.chart-staleness-glyph--unknown { color: var(--text-subtle); }
 .chart-staleness-glyph:hover,
 .chart-staleness-glyph:focus { outline: none; border-color: currentColor; }
 
@@ -200,7 +207,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   opacity: 1; visibility: visible; transform: translateY(0);
   pointer-events: auto;
 }
-.chart-staleness-popover-label { font-weight: 600; color: #8a94a6; }
+.chart-staleness-popover-label { font-weight: 600; color: var(--text-muted); }
 .chart-staleness-popover-row { white-space: normal; }
 .chart-staleness-popover-error { color: #e0555c; }
 .chart-staleness-refresh { align-self: flex-start; padding: 2px 8px; font-size: 10px; }
@@ -228,7 +235,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .banner-header {
   font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
-  text-transform: uppercase; color: #5a6278;
+  text-transform: uppercase; color: var(--text-subtle);
 }
 .banner-value { font-size: 13px; color: #c8d0de; }
 .banner-windows { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -239,11 +246,11 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .window-label {
   font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
-  text-transform: uppercase; color: #5a6278; flex-basis: 100%;
+  text-transform: uppercase; color: var(--text-subtle); flex-basis: 100%;
 }
 .window-percentile { font-size: 16px; font-weight: 700; line-height: 1.1; }
 .window-classification { font-size: 12px; color: #c8d0de; }
-.window-size { font-size: 10px; color: #4a5268; }
+.window-size { font-size: 10px; color: var(--text-subtle); }
 .disagree-warning {
   font-size: 11px; background: #1a1510; border: 1px solid #4a3820;
   border-radius: 5px; padding: 5px 10px; color: #c89a4a;
@@ -256,7 +263,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .chart-title {
   font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
-  text-transform: uppercase; color: #5a6278; margin-bottom: 8px;
+  text-transform: uppercase; color: var(--text-subtle); margin-bottom: 8px;
 }
 .chart-legend {
   display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;
@@ -264,7 +271,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .legend-btn {
   display: flex; align-items: center; gap: 6px;
   background: none; border: 1px solid #2e3547; border-radius: 4px;
-  padding: 4px 10px; font-size: 11px; color: #8a94a6;
+  padding: 4px 10px; font-size: 11px; color: var(--text-muted);
   cursor: pointer; transition: opacity 0.15s, border-color 0.15s;
 }
 .legend-btn:hover { border-color: #4a5268; color: #c8d0de; }
@@ -273,7 +280,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   display: inline-block; width: 12px; height: 3px; border-radius: 2px;
   background: var(--legend-color);
 }
-.chart-note { margin-top: 10px; font-size: 11px; color: #4a5268; }
+.chart-note { margin-top: 10px; font-size: 11px; color: var(--text-body); }
 
 /* ── Signal Track Record ── */
 .track-record {
@@ -284,18 +291,18 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   width: 100%; display: flex; justify-content: space-between; align-items: center;
   padding: 14px 20px; background: none; border: none; cursor: pointer;
   font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
-  color: #5a6278;
+  color: var(--text-subtle);
 }
-.track-record-toggle:hover { color: #8a94a6; }
+.track-record-toggle:hover { color: var(--text-muted); }
 .toggle-caret { font-size: 10px; }
 .track-record-body { padding: 0 20px 20px; display: flex; flex-direction: column; gap: 20px; }
 .track-record-disclaimer {
-  font-size: 11px; color: #4a5860; background: #0f1520; border: 1px solid #1e2d3a;
+  font-size: 11px; color: var(--text-subtle); background: #0f1520; border: 1px solid #1e2d3a;
   border-radius: 5px; padding: 8px 12px; line-height: 1.6;
 }
 .zone-block { display: flex; flex-direction: column; gap: 10px; }
 .zone-title {
-  font-size: 12px; font-weight: 600; color: #7b8fa6; letter-spacing: 0.04em;
+  font-size: 12px; font-weight: 600; color: var(--text-muted); letter-spacing: 0.04em;
 }
 .thin-sample-warning {
   font-size: 12px; background: #1a1510; border: 1px solid #4a3820;
@@ -305,34 +312,34 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   width: 100%; border-collapse: collapse; font-size: 12px;
 }
 .track-table th, .events-table th {
-  text-align: left; padding: 5px 10px; color: #4a5268;
+  text-align: left; padding: 5px 10px; color: var(--text-subtle);
   font-weight: 500; border-bottom: 1px solid #1e2333; font-size: 11px;
 }
 .track-table td, .events-table td {
   padding: 6px 10px; border-bottom: 1px solid #1a1f2b;
 }
 .track-table tr:last-child td, .events-table tr:last-child td { border-bottom: none; }
-.tr-label { color: #7b8fa6; }
+.tr-label { color: var(--text-muted); }
 .tr-hitrate { font-weight: 600; color: #c8d0de; font-size: 14px; }
-.tr-count { color: #5a6278; }
+.tr-count { color: var(--text-subtle); }
 .tr-median { font-weight: 600; }
-.tr-range { color: #4a5268; font-size: 11px; }
-.tr-empty { color: #2e3547; font-style: italic; }
+.tr-range { color: var(--text-subtle); font-size: 11px; }
+.tr-empty { color: var(--text-subtle); font-style: italic; }
 .pos { color: #4caf76; }
 .neg { color: #e05252; }
-.zone-note { font-size: 11px; color: #3e4860; }
+.zone-note { font-size: 11px; color: var(--text-body); }
 .events-toggle {
   align-self: flex-start; background: none; border: 1px solid #2e3547;
-  border-radius: 4px; padding: 4px 10px; font-size: 11px; color: #5a6278;
+  border-radius: 4px; padding: 4px 10px; font-size: 11px; color: var(--text-subtle);
   cursor: pointer;
 }
-.events-toggle:hover { color: #8a94a6; border-color: #4a5268; }
+.events-toggle:hover { color: var(--text-muted); border-color: #4a5268; }
 .events-table { margin-top: 6px; }
 
 /* ── Metal section divider ── */
 .metal-section-label {
   font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
-  text-transform: uppercase; color: #4a5268;
+  text-transform: uppercase; color: var(--text-subtle);
   border-top: 1px solid #1e2333; padding-top: 18px;
 }
 
@@ -346,13 +353,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-header {
   display: flex; flex-direction: column; gap: 4px; padding-top: 16px;
 }
-.stock-flow-title-source { font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: #3e4860; }
+.stock-flow-title-source { font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-subtle); }
 .comex-title {
   font-size: 22px; font-weight: 700; letter-spacing: 0.03em; color: #e8ecf4;
 }
-.comex-subtitle { font-size: 12px; color: #4a5268; }
+.comex-subtitle { font-size: 12px; color: var(--text-subtle); }
 .comex-freshness {
-  font-size: 11px; color: #5a6278; margin-top: 2px;
+  font-size: 11px; color: var(--text-subtle); margin-top: 2px;
 }
 .comex-freshness--stale {
   color: #c89a4a; background: #1e1a10; border: 1px solid #3a2f14;
@@ -366,7 +373,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 
 .refresh-controls {
   display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
-  margin-top: 6px; font-size: 12px; color: #9aa4bc;
+  margin-top: 6px; font-size: 12px; color: var(--text-muted);
 }
 .refresh-controls-row {
   display: flex; align-items: center; justify-content: flex-end; gap: 8px;
@@ -395,7 +402,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   background: #141820; border: 1px solid #2e3547;
   border-radius: 6px; padding: 8px 14px;
 }
-.comex-spot-label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #5a6278; }
+.comex-spot-label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-subtle); }
 .comex-spot-price { font-size: 18px; font-weight: 700; color: #c8d0de; }
 .comex-spot-change { font-size: 11px; font-weight: 500; }
 
@@ -424,10 +431,10 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   display: flex; align-items: center; justify-content: space-between;
   flex-wrap: wrap; gap: 8px;
   font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
-  text-transform: uppercase; color: #5a6278;
+  text-transform: uppercase; color: var(--text-subtle);
 }
 .comex-panel-note {
-  font-size: 11px; color: #3e4860; line-height: 1.55;
+  font-size: 11px; color: var(--text-body); line-height: 1.55;
 }
 /* eli5 tooltip text uses \n\n for paragraph breaks — pre-wrap (not
    pre-line) so a blank line actually renders between paragraphs, not just
@@ -447,19 +454,19 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   color: #c8d0de; font-size: 12px; line-height: 1.6; text-align: center;
 }
 .signal-detail > div + div { margin-top: 2px; }
-.signal-detail-gap { display: inline-block; width: 4ch; text-align: center; color: #8a94a6; }
+.signal-detail-gap { display: inline-block; width: 4ch; text-align: center; color: var(--text-muted); }
 .signal-legend-flag { margin-left: 5px; font-size: 11px; }
 .live-toggle {
   display: flex; align-items: center; gap: 5px; cursor: pointer;
   font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
-  text-transform: uppercase; color: #5a6278;
+  text-transform: uppercase; color: var(--text-subtle);
 }
 .live-toggle input { cursor: pointer; accent-color: #7b9fff; }
 .live-toggle:has(input:checked) { color: #7b9fff; }
 .comex-chart-block { flex-basis: 100%; width: 100%; margin-top: 6px; }
 .comex-chart-subheader {
   font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
-  text-transform: uppercase; color: #5a6278; margin-bottom: 4px;
+  text-transform: uppercase; color: var(--text-muted); margin-bottom: 4px;
 }
 
 .comex-legend-list {
@@ -473,7 +480,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .comex-legend-item {
   display: flex; align-items: baseline; gap: 8px;
-  font-size: 11px; color: #8a94a6; line-height: 1.5;
+  font-size: 11px; color: var(--text-muted); line-height: 1.5;
 }
 .comex-legend-item strong { color: #c8d0de; }
 .legend-btn-row {
@@ -487,7 +494,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   outline: 1px solid #c8d0de; outline-offset: 2px;
 }
 .metals-legend-baseline-note {
-  color: #3e4860;
+  color: var(--text-subtle);
 }
 .metals-legend-row {
   display: flex; align-items: center; gap: 8px;
@@ -526,17 +533,17 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-range-selector { display: flex; gap: 4px; }
 .comex-range-btn {
   background: none; border: 1px solid #2a2f3a; border-radius: 3px;
-  padding: 2px 8px; font-size: 11px; color: #5a6278; cursor: pointer;
+  padding: 2px 8px; font-size: 11px; color: var(--text-subtle); cursor: pointer;
   transition: border-color 0.15s, color 0.15s;
   text-transform: uppercase; letter-spacing: 0.05em;
 }
-.comex-range-btn:hover { border-color: #4a5268; color: #8a94a6; }
+.comex-range-btn:hover { border-color: #4a5268; color: var(--text-muted); }
 .comex-range-btn--active {
   border-color: #7b9fff; color: #7b9fff; background: #0d1428;
 }
 
 /* COMEX/SHFE sub-section labels */
-.comex-dual-axis-note { font-size: 11px; color: #4a5268; margin-top: 6px; }
+.comex-dual-axis-note { font-size: 11px; color: var(--text-body); margin-top: 6px; }
 /* Some Data-tab table notes (e.g. fred_observations, a table shared by
    several unrelated series_id values) are multi-line bulleted breakdowns
    authored with real newlines — preserve them instead of collapsing to one
@@ -556,13 +563,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .comex-exchange-size-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
 .comex-exchange-size-val { font-size: 11px; color: #c8d0de; white-space: nowrap; }
-.comex-exchange-size-pct { color: #4a5268; }
-.comex-exchange-size-note { font-size: 11px; color: #3e4860; }
+.comex-exchange-size-pct { color: var(--text-subtle); }
+.comex-exchange-size-note { font-size: 11px; color: var(--text-body); }
 
 /* COMEX/SHFE sub-section labels */
 .comex-section-label {
   font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
-  text-transform: uppercase; color: #4a5268;
+  text-transform: uppercase; color: var(--text-subtle);
   border-top: 1px solid #1e2333; padding-top: 14px;
 }
 
@@ -579,10 +586,10 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-leverage--med  { color: #c9a227; }
 .comex-leverage--high { color: #e05252; }
 .comex-leverage-meta {
-  display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: #6b778d;
+  display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--text-subtle);
 }
 .comex-leverage-meta strong { color: #c8d0de; }
-.comex-leverage-note { font-size: 11px; color: #8a94a6; flex-basis: 100%; }
+.comex-leverage-note { font-size: 11px; color: var(--text-body); flex-basis: 100%; }
 
 /* Vault pie chart */
 .comex-vault-pie-row { display: flex; flex-direction: column; gap: 8px; }
@@ -617,7 +624,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .stack-thumb-count {
   position: absolute; bottom: -4px; right: -6px;
   background: #0f1117; border: 1px solid #2e3547; border-radius: 8px;
-  font-size: 9px; font-weight: 700; color: #8a94a6;
+  font-size: 9px; font-weight: 700; color: var(--text-muted);
   padding: 0 4px; line-height: 1.4; font-variant-numeric: tabular-nums;
 }
 .stack-thumb-placeholder {
@@ -640,11 +647,11 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   width: 100%; border-collapse: collapse; font-size: 12px; min-width: 620px;
 }
 .comex-table th {
-  text-align: left; padding: 6px 10px; color: #4a5268;
+  text-align: left; padding: 6px 10px; color: var(--text-subtle);
   font-weight: 500; border-bottom: 1px solid #1e2333; font-size: 11px;
 }
 .comex-table th.right, .comex-table td.right { text-align: right; }
-.comex-th-hint { cursor: help; color: #5a6278; }
+.comex-th-hint { cursor: help; color: var(--text-subtle); }
 .comex-table td {
   padding: 7px 10px; border-bottom: 1px solid #1a1f2b; color: #c8d0de;
 }
@@ -652,11 +659,11 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .comex-row-hoverable { cursor: pointer; }
 .comex-row-hoverable:hover td { background: #1c2231; }
 .comex-table-total td { border-top: 1px solid #2e3547; color: #e8ecf4; }
-.comex-vault-name { color: #7b8fa6; font-size: 12px; }
+.comex-vault-name { color: var(--text-muted); font-size: 12px; }
 .comex-total-col { font-weight: 600; color: #e8ecf4; }
 .comex-delta-pos { color: #4caf76; font-weight: 600; }
 .comex-delta-neg { color: #e05252; font-weight: 600; }
-.comex-delta-flat { color: #3e4860; }
+.comex-delta-flat { color: var(--text-subtle); }
 
 /* Delivery notices */
 .comex-delivery-list { display: flex; flex-direction: column; gap: 6px; }
@@ -666,7 +673,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border-radius: 4px; padding: 8px 12px; font-size: 12px;
 }
 .comex-delivery-kv { display: flex; gap: 4px; }
-.comex-delivery-key { color: #5a6278; }
+.comex-delivery-key { color: var(--text-subtle); }
 .comex-delivery-val { color: #c8d0de; font-weight: 500; }
 .comex-delivery-table { font-size: 12px; }
 .comex-delivery-table td { padding: 3px 8px; }
@@ -683,11 +690,11 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
    the default .comex-delivery-val since this is reference/provenance text,
    not a figure the user is meant to read at a glance like the Delivery
    Notices table's values. */
-.data-meta-val { color: #6b778d; font-weight: 400; }
+.data-meta-val { color: var(--text-subtle); font-weight: 400; }
 .data-curl-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .data-copy-btn {
   background: none; border: 1px solid #2e3547; border-radius: 4px;
-  padding: 3px 10px; font-size: 11px; font-weight: 600; color: #8a94a6;
+  padding: 3px 10px; font-size: 11px; font-weight: 600; color: var(--text-muted);
   cursor: pointer; letter-spacing: 0.03em; transition: border-color 0.15s, color 0.15s;
 }
 .data-copy-btn:hover { border-color: #4a5268; color: #c8d0de; }
@@ -733,8 +740,8 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   display: flex; align-items: center; gap: 8px; font-size: 12px; flex-wrap: wrap;
 }
 .data-health-summary-tier { color: #c8d0de; font-weight: 600; min-width: 40px; }
-.data-health-summary-state { color: #6b778d; }
-.data-health-summary-rollup { color: #8a94a6; margin-left: auto; }
+.data-health-summary-state { color: var(--text-subtle); }
+.data-health-summary-rollup { color: var(--text-muted); margin-left: auto; }
 .header-health-dot {
   width: 10px; height: 10px; border-radius: 50%; display: inline-block;
   margin-left: 8px; vertical-align: middle;
@@ -766,14 +773,14 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .settings-view-title { font-size: 20px; font-weight: 700; color: #e8ecf4; }
 .settings-view-close {
-  margin-left: auto; font-size: 13px; color: #8a94a6; cursor: pointer;
+  margin-left: auto; font-size: 13px; color: var(--text-muted); cursor: pointer;
   background: none; border: 1px solid #2e3547; border-radius: 4px;
   padding: 4px 10px;
 }
 .settings-view-close:hover { color: #e8ecf4; border-color: #3e4860; }
 .config-status-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 8px; }
 .config-status-table th {
-  text-align: left; color: #6b778d; font-weight: 600; padding: 4px 8px;
+  text-align: left; color: var(--text-subtle); font-weight: 600; padding: 4px 8px;
   border-bottom: 1px solid #1e2333;
 }
 .config-status-table td { padding: 6px 8px; border-bottom: 1px solid #141820; color: #c8d0de; }
@@ -783,13 +790,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .config-status-pill--set { background: #16351f; color: #4caf76; }
 .config-status-pill--unset { background: #341a1c; color: #e0555c; }
-.config-status-usedby { color: #5a6278; font-size: 11px; }
+.config-status-usedby { color: var(--text-subtle); font-size: 11px; }
 
 /* Inline form label — a small caption sitting left of a control, used
    across OFAC filters, CoT's custom-range From/To, and anywhere else a
    short label precedes an <input>/<select> on one line. */
 .form-inline-label {
-  display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8a94a6;
+  display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-muted);
 }
 
 /* OFAC panel — filter row controls */
@@ -799,21 +806,21 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   padding: 4px 8px; font-size: 12px; min-width: 260px;
 }
 .comex-table td.data-reference-col,
-.comex-table th.data-reference-col { color: #5a6278; font-size: 11px; }
+.comex-table th.data-reference-col { color: var(--text-subtle); font-size: 11px; }
 
 /* Empty states */
-.comex-empty { color: #3e4860; font-size: 12px; padding: 20px 0; text-align: center; }
-.comex-empty-note { font-size: 11px; color: #2e3547; }
+.comex-empty { color: var(--text-subtle); font-size: 12px; padding: 20px 0; text-align: center; }
+.comex-empty-note { font-size: 11px; color: var(--text-subtle); }
 
 /* Global silver context panel */
 .global-silver-bars { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 16px; }
 .global-silver-row { display: grid; grid-template-columns: 200px 1fr 90px 1fr; align-items: center; gap: 10px; }
 .global-silver-row--tracked { border-top: 1px solid #1e2333; padding-top: 8px; margin-top: 2px; }
-.global-silver-label { font-size: 12px; color: #8a94a6; }
+.global-silver-label { font-size: 12px; color: var(--text-muted); }
 .global-silver-track { height: 8px; background: #1e2333; border-radius: 3px; overflow: hidden; }
 .global-silver-fill { height: 100%; background: #4a5268; border-radius: 3px; transition: width 0.4s ease; }
 .global-silver-amt { font-size: 12px; color: #c8d0de; text-align: right; font-weight: 600; }
-.global-silver-note { font-size: 11px; color: #3e4860; }
+.global-silver-note { font-size: 11px; color: var(--text-body); }
 
 /* Stack calculator */
 .global-stack-calc {
@@ -823,7 +830,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .global-stack-header {
   font-size: 11px; font-weight: 600; letter-spacing: 0.1em;
-  text-transform: uppercase; color: #5a6278;
+  text-transform: uppercase; color: var(--text-subtle);
 }
 .global-stack-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .global-stack-input {
@@ -832,33 +839,33 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   font-family: "Fira Code", monospace;
 }
 .global-stack-input:focus { outline: 1px solid #4a5268; }
-.global-stack-unit { font-size: 13px; color: #5a6278; }
-.global-stack-eq { font-size: 13px; color: #8a94a6; }
+.global-stack-unit { font-size: 13px; color: var(--text-subtle); }
+.global-stack-eq { font-size: 13px; color: var(--text-muted); }
 .global-stack-eq strong { color: #e8ecf4; font-size: 15px; }
 .global-stack-context {
-  display: flex; gap: 20px; flex-wrap: wrap; font-size: 11px; color: #5a6278;
+  display: flex; gap: 20px; flex-wrap: wrap; font-size: 11px; color: var(--text-subtle);
 }
 .global-stack-context strong { color: #c8d0de; }
-.global-stack-note { font-size: 11px; color: #3e4860; line-height: 1.6; }
+.global-stack-note { font-size: 11px; color: var(--text-body); line-height: 1.6; }
 
 /* ── Layer 3 — Annual Market Balance ── */
-.flow-panel-note { font-size: 11px; color: #3e4860; line-height: 1.55; }
+.flow-panel-note { font-size: 11px; color: var(--text-body); line-height: 1.55; }
 .flow-stat-row { display: flex; flex-wrap: wrap; gap: 20px; margin: 12px 0 8px; }
 .flow-stat-card {
   background: #0f1117; border: 1px solid #1e2333; border-radius: 6px;
   padding: 12px 16px; min-width: 220px; flex: 1;
 }
 .flow-stat-label {
-  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #5a6278;
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-subtle);
 }
 .flow-stat-value { font-size: 20px; font-weight: 700; color: #c8d0de; margin-top: 4px; }
-.flow-stat-sub { font-size: 11px; color: #6b778d; margin-top: 4px; }
-.flow-stat-caption { font-size: 11px; color: #3e4860; line-height: 1.6; margin-top: 8px; flex-basis: 100%; }
-.flow-legend-note { font-size: 11px; color: #3e4860; margin-top: 6px; }
+.flow-stat-sub { font-size: 11px; color: var(--text-subtle); margin-top: 4px; }
+.flow-stat-caption { font-size: 11px; color: var(--text-body); line-height: 1.6; margin-top: 8px; flex-basis: 100%; }
+.flow-legend-note { font-size: 11px; color: var(--text-body); margin-top: 6px; }
 
 /* Footer */
 .comex-footer {
-  font-size: 11px; color: #2e3547;
+  font-size: 11px; color: var(--text-body);
   border-top: 1px solid #1e2333; padding-top: 16px;
 }
 
@@ -872,7 +879,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .research-mono { font-family: "Fira Code", "Courier New", monospace; }
 
 .research-empty-hint {
-  color: #3e4860; font-size: 12px; text-align: center; padding: 40px 0;
+  color: var(--text-subtle); font-size: 12px; text-align: center; padding: 40px 0;
 }
 
 /* Session list/browser */
@@ -904,17 +911,17 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .research-status-badge {
   font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
   text-transform: uppercase; padding: 2px 8px; border-radius: 4px;
-  border: 1px solid #2e3547; color: #8892a8;
+  border: 1px solid #2e3547; color: var(--text-muted);
 }
 .research-status-badge--active { border-color: #7b9fff; color: #7b9fff; }
 .research-status-badge--promoted { border-color: #3fae6a; color: #3fae6a; }
-.research-status-badge--dismissed { border-color: #5a6278; color: #5a6278; }
+.research-status-badge--dismissed { border-color: #5a6278; color: var(--text-subtle); }
 
 /* Session view shell */
 .research-session-view { display: flex; flex-direction: column; gap: 14px; }
 .research-back-btn {
   align-self: flex-start; background: none; border: 1px solid #2e3547;
-  color: #8892a8; border-radius: 6px; padding: 6px 12px; font-size: 12px;
+  color: var(--text-muted); border-radius: 6px; padding: 6px 12px; font-size: 12px;
   cursor: pointer;
 }
 .research-back-btn:hover { border-color: #7b9fff; color: #7b9fff; }
@@ -923,9 +930,9 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
   white-space: pre-wrap;
 }
-.research-source-url { font-size: 11px; color: #5a6278; }
+.research-source-url { font-size: 11px; color: var(--text-subtle); }
 .research-readonly-note {
-  font-size: 12px; color: #5a6278; font-style: italic; padding: 8px 0;
+  font-size: 12px; color: var(--text-subtle); font-style: italic; padding: 8px 0;
 }
 
 /* Terminal-style transcript — monospace log, not chat bubbles */
@@ -939,7 +946,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .research-turn:first-child { padding-top: 0; }
 .research-turn:last-child { border-bottom: none; padding-bottom: 0; }
 .research-turn-meta {
-  color: #5a6278; font-size: 11px; display: flex; gap: 12px;
+  color: var(--text-subtle); font-size: 11px; display: flex; gap: 12px;
   flex-wrap: wrap; margin-bottom: 6px;
 }
 .research-turn-memory-divider {
@@ -949,13 +956,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .research-turn-input-details { margin-bottom: 8px; }
 .research-turn-input-details summary {
-  cursor: pointer; color: #5a6278; font-size: 11px; user-select: none;
+  cursor: pointer; color: var(--text-subtle); font-size: 11px; user-select: none;
 }
 .research-turn-input {
-  color: #8892a8; white-space: pre-wrap; margin-top: 6px;
+  color: var(--text-body); white-space: pre-wrap; margin-top: 6px;
   padding-left: 8px; border-left: 2px solid #2e3547;
 }
-.research-turn-input-msg { color: #6b778d; }
+.research-turn-input-msg { color: var(--text-subtle); }
 .research-evidence-block {
   border-left: 2px solid #4a9eff; padding-left: 8px; margin: 6px 0;
   color: #9fc2f5; white-space: pre-wrap;
@@ -967,7 +974,7 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 .research-controls-row { display: flex; gap: 16px; flex-wrap: wrap; }
 .research-control {
   display: flex; flex-direction: column; gap: 4px; font-size: 11px;
-  color: #8892a8; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;
 }
 .research-control select {
   background: #0f1117; border: 1px solid #2e3547; border-radius: 6px;
@@ -978,16 +985,16 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 }
 .research-checkbox-item {
   display: flex; align-items: center; gap: 6px; font-size: 12px;
-  color: #8892a8; cursor: pointer;
+  color: var(--text-muted); cursor: pointer;
 }
 .research-preview-details {
   border: 1px solid #2e3547; border-radius: 6px; padding: 8px 12px;
 }
 .research-preview-details summary {
-  cursor: pointer; color: #5a6278; font-size: 11px; user-select: none;
+  cursor: pointer; color: var(--text-subtle); font-size: 11px; user-select: none;
 }
 .research-preview-body {
-  color: #6b778d; font-size: 11px; white-space: pre-wrap; margin-top: 8px;
+  color: var(--text-body); font-size: 11px; white-space: pre-wrap; margin-top: 8px;
 }
 .research-input-row { display: flex; gap: 8px; align-items: flex-end; }
 .research-textarea {
@@ -1029,9 +1036,9 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
 
 /* Read -> disposition */
 .research-disposition { display: flex; flex-direction: column; gap: 10px; }
-.research-read-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8892a8; }
+.research-read-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-muted); }
 .research-read-btn {
-  background: none; border: 1px solid #2e3547; color: #8892a8;
+  background: none; border: 1px solid #2e3547; color: var(--text-muted);
   border-radius: 6px; padding: 5px 12px; font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer;
 }
@@ -1058,13 +1065,13 @@ code { font-family: "Fira Code", "Courier New", monospace; font-size: 12px; }
   border: 1px dashed #2e3547; border-radius: 6px; padding: 8px 12px;
 }
 .research-forge-placeholder summary {
-  cursor: pointer; color: #5a6278; font-size: 11px; user-select: none;
+  cursor: pointer; color: var(--text-subtle); font-size: 11px; user-select: none;
 }
 .research-forge-placeholder-body {
-  color: #5a6278; font-size: 11px; margin-top: 8px; font-style: italic;
+  color: var(--text-body); font-size: 11px; margin-top: 8px; font-style: italic;
 }
 
-.loading { color: #4a5268; padding: 40px 0; text-align: center; }
+.loading { color: var(--text-subtle); padding: 40px 0; text-align: center; }
 
 /* Money Management: clickable names (Reserve Bank -> district screen,
    bank -> bank screen). Text ink, not a series color; underline on hover. */
@@ -1078,3 +1085,48 @@ tr:hover .mm-link,
 .mm-link:hover {
   text-decoration-color: #e8ecf4;
 }
+
+/* Trading Simulator (margin_simulator.jsx, margin-simulator-spec.md) */
+.msim-controls {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+}
+.msim-num { width: 64px; }
+.msim-time { display: flex; flex-direction: column; gap: 8px; }
+.msim-slider { display: flex; flex-direction: column; gap: 6px; }
+.msim-slider input[type="range"] { width: 100%; accent-color: #c8d0de; }
+.msim-slider-readout {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  font-size: 12px; color: #c8d0de;
+}
+.msim-tooltip {
+  background: #1a1f2b; border: 1px solid #2e3547; padding: 8px 10px;
+  font-size: 12px; line-height: 1.5;
+}
+.msim-zerosum { font-size: 12px; color: #c8d0de; }
+.msim-book {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+}
+@media (max-width: 720px) {
+  .msim-book { grid-template-columns: 1fr; }
+}
+.msim-column { display: flex; flex-direction: column; gap: 8px; transition: opacity 0.15s; }
+.msim-card {
+  border: 1px solid #2e3547; border-radius: 6px; padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 6px; font-size: 11px;
+}
+.msim-card--call { border-color: #e05252; }
+.msim-card-top { display: flex; align-items: baseline; gap: 8px; }
+.msim-card-pct { margin-left: auto; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.msim-card-bottom { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
+.msim-card-history { font-size: 11px; }
+/* 0–200% of posted margin. Shorts mirror right-to-left so the two columns
+   read as opposite sides of one book. */
+.msim-bar {
+  position: relative; height: 8px; border-radius: 4px; background: #232937;
+}
+.msim-bar--short { transform: scaleX(-1); }
+.msim-bar-fill { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 4px; }
+.msim-bar-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; transform: translateX(-1px); }
+.msim-bar-mark--posted { background: var(--text-muted); }
+.msim-bar-mark--call { background: #e05252; }
+.msim-linkbtn { background: none; border: none; padding: 0; cursor: pointer; font: inherit; }

@@ -17,6 +17,7 @@ import { usePinnedDate } from "./pinned_date_context";
 import { xTicks, round1, RATIO_COLOR } from "./money_supply_shared";
 import { apiFetch } from "./api_client";
 
+import { TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 // Extracted from money_supply.jsx (cleanup-spec.md Stage 3.5). Treasury
 // Auctions — bid-to-cover by security type + buyer-category mix per real
 // settled auction. Its data comes from its OWN fetch (/api/treasury-auctions/db
@@ -190,7 +191,7 @@ export default function TreasuryAuctionsPanel() {
         <ChartStaleness sourceKey="treasury_auctions" />
         <span>Treasury Auctions</span>
         {auctionsMerged.length > 0 && (
-          <span style={{ fontWeight: "normal", fontSize: 12, color: "#8a94a6", marginLeft: 10 }}>
+          <span style={{ fontWeight: "normal", fontSize: 12, color: TEXT_MUTED, marginLeft: 10 }}>
             {(() => {
               const latest = auctionsMerged[auctionsMerged.length - 1];
               return `${latest.security_type} (${latest.security_term}) ${latest.date} · ${latest.bid_to_cover_ratio.toFixed(2)}x bid-to-cover`;
@@ -220,12 +221,12 @@ export default function TreasuryAuctionsPanel() {
                   }}
                 >
                   <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-                  <XAxis dataKey="date" ticks={auctionsTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+                  <XAxis dataKey="date" ticks={auctionsTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
                   <YAxis
                     domain={["dataMin - 0.2", "dataMax + 0.2"]}
                     tickFormatter={(v) => `${v.toFixed(1)}x`}
-                    tick={{ fill: "#8a94a6", fontSize: 11 }}
-                    label={{ value: "Bid-to-Cover", angle: -90, position: "insideLeft", fill: "#5a6278", fontSize: 11 }}
+                    tick={{ fill: TEXT_MUTED, fontSize: 11 }}
+                    label={{ value: "Bid-to-Cover", angle: -90, position: "insideLeft", fill: TEXT_SUBTLE, fontSize: 11 }}
                   />
                   <Tooltip content={<AuctionsTooltipContent auctionsMerged={auctionsMerged} />} />
                   {pinnedDateAuctions && (
@@ -320,8 +321,8 @@ export default function TreasuryAuctionsPanel() {
                       }}
                     >
                       <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
-                      <XAxis dataKey="date" ticks={auctionMixTicks} tick={{ fill: "#8a94a6", fontSize: 11 }} />
-                      <YAxis tickFormatter={(v) => `${Math.round(v * 100)}%`} tick={{ fill: "#8a94a6", fontSize: 11 }} />
+                      <XAxis dataKey="date" ticks={auctionMixTicks} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
+                      <YAxis tickFormatter={(v) => `${Math.round(v * 100)}%`} tick={{ fill: TEXT_MUTED, fontSize: 11 }} />
                       <Tooltip content={<AuctionMixTooltipContent rows={auctionMixRows} hiddenBuyers={hiddenAuctionBuyers} />} />
                       {pinnedDateAuctionMix && (
                         <ReferenceLine x={pinnedDateAuctionMix} stroke={RATIO_COLOR} strokeDasharray="3 3" />

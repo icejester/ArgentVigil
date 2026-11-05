@@ -1,0 +1,17 @@
+{
+  "reviewed_as_of": "2026-10-02",
+  "review_notes": "Hand-maintained. cmegroup.com refuses automated requests (403, 2026-10-02), so figures are transcribed from CME's own notices or reputable reporting of them, each row citing its source. Since 2026-01-13 CME sets metals margins as a percent of contract value (basis 'pct_notional'). Only figures a source states outright are entered; anything unstated stays null. Known gaps: CME raised silver margins on 2026-01-30 and 2026-02-02, but the levels set on those dates aren't confirmed here, nor is anything after 2026-02-06, nor any Micro Silver (SIL) figure. Add a row per contract per effective date as notices are found.",
+  "rows": [
+    {
+      "contract": "SI",
+      "effective_date": "2026-02-06",
+      "basis": "pct_notional",
+      "initial_pct": 18.0,
+      "maintenance_pct": 18.0,
+      "initial_margin_usd": null,
+      "maintenance_margin_usd": null,
+      "source_note": "COMEX 5000 Silver: initial and maintenance raised to 18% from 15%, effective after the close of business Friday 2026-02-06 (Reuters wire via Kitco, 2026-02-06). investingLive's report of the same hike mentions only the initial margin. Third hike since the 2026-01-13 switch to percent-of-value margins.",
+      "source_url": "https://www.kitco.com/news/off-the-wire/2026-02-06/cme-group-hikes-gold-silver-margins-again-volatility-grips-markets"
+    }
+  ]
+}
