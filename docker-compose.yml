@@ -131,7 +131,10 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        VITE_API_BASE_URL: "http://localhost:${API_PORT:-6977}"
+        # Empty = same-origin relative /api/... paths, proxied by nginx
+        # (nginx.conf's `location /api/`) to the api service. Machine-
+        # agnostic: no host/IP baked into the bundle, no CORS involved.
+        VITE_API_BASE_URL: ""
         # Stamped into the built bundle so the UI can show a visual
         # non-prod indicator (purple health dot, see App.jsx/
         # HeaderHealthDot) that survives independent of which port you
