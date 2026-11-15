@@ -13,13 +13,8 @@
 # which has nothing to do with Docker but lives here now so there's one
 # script, one entrypoint, for everything.
 #
-# Formerly `vigil-docker.sh`, renamed to `vigil.sh` once prod itself moved
-# to this containerized workflow. The OLD `vigil.sh` (bare host processes,
-# no Docker — uvicorn + Vite dev server directly) is now `vigil-native.sh`,
-# kept only as a fallback/faster local inner loop — see that script's own
-# header. `vigil-native.sh` and this script's `prod` environment must never
-# run against runtime/data/prod/ at the same time (see `refuse_if_vigil_
-# native_running` below and environments/prod.env's own comment).
+# `vigil.sh` is the only process-management script. Prod itself runs as
+# the containerized "prod" environment (environments/prod.env).
 #
 # Checks whether Docker's daemon is reachable; if not, starts Colima (this
 # machine's docker context — see `docker context ls`) with the user's
@@ -154,28 +149,6 @@ ensure_docker() {
 
 # ── compose actions ──────────────────────────────────────────────────────────
 
-# Guards against the exact two-writer hazard prod.env's own comment
-# documents: vigil-native.sh's bare-process backend and this environment's
-# compose project must never run against runtime/data/prod at the same
-# time. Checks vigil-native.sh's own PID file (runtime/vigil/pids/
-# backend.pid) the same way that script does — a live PID there means its
-# backend is actually running right now, not just that it ran at some point.
-refuse_if_vigil_native_running() {
-  local pid_file="$REPO/runtime/vigil/pids/backend.pid"
-  if [ -f "$pid_file" ]; then
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      log "!!! vigil-native.sh's backend is currently running (pid $pid) against runtime/data/prod."
-      log "    Bringing up the 'prod' compose environment at the same time would have"
-      log "    two processes writing the same SQLite files simultaneously — the exact"
-      log "    hazard documented in environments/prod.env. Run 'utils/vigil-native.sh stop"
-      log "    backend' first."
-      exit 1
-    fi
-  fi
-}
-
 # ── API key check ────────────────────────────────────────────────────────────
 # docker-compose.yml passes FRED/GAPI/CENSUS/ANTHROPIC keys through as
 # ${VAR:-} from THE SHELL RUNNING THIS SCRIPT — not from environments/*.env.
@@ -295,9 +268,6 @@ do_up() {
   resolve_env "$1"
   local require_keys=0
   [ "${2:-}" = "--require-keys" ] && require_keys=1
-  if [ "$AV_ENV_NAME" = "prod" ]; then
-    refuse_if_vigil_native_running
-  fi
   check_shell_keys
   if [ "$require_keys" = "1" ] && [ "$KEYS_MISSING_REQUIRED" = "1" ]; then
     log "!!! --require-keys: refusing to start '$AV_ENV_NAME' with missing keys (see above)."
@@ -369,9 +339,7 @@ do_logs() {
 }
 
 # ── test ─────────────────────────────────────────────────────────────────────
-# Lifted from the old vigil.sh (now vigil-native.sh) unchanged — pytest
-# always runs directly on the host regardless of which script starts the
-# app, no Docker/container involved at all.
+# pytest always runs directly on the host, no Docker/container involved.
 
 # Creates .venv and installs requirements.txt if either is missing.
 # Probes for both a runtime dep (fastapi) and a test dep (pytest) so a venv

@@ -1,4 +1,4 @@
-# ArgentVigil v2.37.0
+# ArgentVigil v2.38.0
 
 Silver market observability, with gold as comparative context. AV exists to help understand the silver market as it actually is — paper positioning, physical movement, and the currency it's priced in — not to trade it. No price targets, no predictions, no risk commentary: instrumentation built to be right about what already happened.
 
@@ -60,6 +60,10 @@ Every other panel is about the market. This one is personal: a plain inventory o
 
 Did the catalyst actually move the metal? A macro-event calendar (FOMC, CPI, NFP) with consensus vs. actual, and captured price reactions at four fixed windows around each event — observed only, no scoring, no story attached after the fact. Pre-alpha and still forming: the idea is that a claim worked through in Research (its sub-pane — a manual, one-turn-at-a-time workbench for testing a thought against AV's own data) can be promoted into a tracked catalyst here, closing the loop between "someone had a thought" and "did reality agree," but the shape of that loop isn't fully settled yet.
 
+#### Mobile site
+
+A separate phone-sized view (opens automatically on a narrow screen; a "Desktop site" / "Mobile site" link switches, remembered per device). Four panels, each a short list of glance rows that drill into one chart: **Trading** (paper leverage, curve spread, volume, price high/low per metal), **Inventory** (COMEX vaults sorted by how much they moved, delivery behavior), **Money** (six questions: money-pool growth, created/destroyed, Treasuries, who holds US debt, bank lookup, how money is created) and **Stack** (the pile at a glance, then what each purchase did to your average cost). Spec: `specs/mobile-spec.md`; UI rules: `frontend/docs/MOBILE_UI_STANDARDS.md`. CATCOR and OFAC are desktop-only.
+
 #### OFAC
 
 A monitoring view over OFAC's full SDN and Consolidated Sanctions List — every current designation, across every program, with real per-entity designation dates going back to 1981. Search matches across every field at once; group by program, entity type, or list source to see counts before drilling in; sort by any column. Each designation also carries its real legal authority (e.g. "Executive Order 14024 (Russia)") wherever OFAC's own data provides one. Not a correlation tool against the metals/debasement data (that idea was tried as a chart overlay and dropped as noise); just a straight list for keeping an eye on what's currently sanctioned. Every entity's aliases, addresses, and ID/registration documents (passport numbers, SWIFT/BIC codes, and more, wherever OFAC publishes them) are captured server-side.
@@ -88,8 +92,8 @@ CATCOR and Research then keep the *narrative* honest: did the catalyst everyone 
 
 - **Backend**: Python / FastAPI + uvicorn, stdlib `sqlite3` (no ORM), `httpx` for all outbound calls. Every upstream source is a `SourceDefinition` in `backend/sources.py` (cadence, rate limit, table ownership) dispatched by one scheduler loop; every fetch persists to SQLite, and the frontend reads only `/db`-suffixed routes — never upstream directly.
 - **Pipeline**: `pipeline/` — stdlib-only CoT fetch/compute (CFTC Socrata), runnable without the venv, persists through the same shared `backend/db.py`.
-- **Frontend**: React 19 + Vite 5 + Recharts. No state library, no router — one page, seven tab-sections plus a gear-icon Settings view, all mounted once and toggled by visibility. Two React contexts wrap the app: `HealthProvider` (one shared `/api/health/db` poll) and `PinnedDateProvider` (one date pin shared across Trading / Money Supply / Inventory).
-- **Tests**: pytest + respx, 241 tests in ~11s, never touch the real DB or a live upstream. Includes convention guards that mechanically enforce the documented rules (Settings/Data registry sync, persist-on-fetch, table ownership, nav-list ↔ backend allowlist sync, this doc's version binding).
+- **Frontend**: React 19 + Vite 5 + Recharts. No state library, no router — one page, seven tab-sections plus a gear-icon Settings view, all mounted once and toggled by visibility. A separate mobile view (`frontend/src/mobile/`, hand-rolled SVG charts, no Recharts) is chosen at the top of `main.jsx`; each view is its own lazy bundle. Two React contexts wrap the app: `HealthProvider` (one shared `/api/health/db` poll) and `PinnedDateProvider` (one date pin shared across Trading / Money Supply / Inventory).
+- **Tests**: pytest + respx, 342 tests in ~12s, never touch the real DB or a live upstream. Includes convention guards that mechanically enforce the documented rules (Settings/Data registry sync, persist-on-fetch, table ownership, nav-list ↔ backend allowlist sync, this doc's version binding).
 
 *(Carve-out: architecture diagram, table schematic, and relationship map to land here. Until then, `utils/gen_data_dictionary.py` generates `docs/data-dictionary.md` from the live DDL + source registry.)*
 
@@ -113,19 +117,7 @@ Layer-level detail: [`backend/README.md`](backend/README.md) · [`frontend/READM
   See `environments/README.md` for the full field reference (ports, `REFRESH_POLICY`,
   `UPDATE_MODE`) and how to add a new environment.
 
-- **Local dev fallback — bare host processes, no Docker** (`utils/vigil-native.sh`,
-  formerly this repo's `vigil.sh`) — faster inner loop for local Python/JS edits, or a
-  fallback if Docker/Colima itself is unavailable. Must never run against
-  `runtime/data/prod/` at the same time as the containerized `prod` environment above
-  (see `environments/prod.env`'s own comment for the two-writer hazard this would cause):
-
-  ```bash
-  bash utils/vigil-native.sh start            # venv bootstrap + backend :8000 + frontend :5173
-  bash utils/vigil-native.sh restart backend  # after backend Python edits
-  bash utils/vigil-native.sh stop
-  ```
-
-- **Python**: always through `.venv` (`vigil.sh test` or `vigil-native.sh start` creates it) — `pipeline/` is the sole stdlib-only exception.
+- **Python**: always through `.venv` (`vigil.sh test` creates it) — `pipeline/` is the sole stdlib-only exception.
 - **API keys** (all optional at boot; a missing key leaves that source's table empty, nothing crashes): `FRED_API_KEY` (Money Supply, CATCOR actuals), `GAPI_API_KEY` (LBMA fix), `CENSUS_API_KEY` (trade flow), `ANTHROPIC_API_KEY` (Research, only if `AI_BACKEND=anthropic` — default is the local `forge` backend).
 - **Versioning**: this README and `CLAUDE.md` carry the same `vX.Y.Z` in their titles, bumped together on feature completion (not per commit); `tests/test_conventions.py` fails on drift.
 - **Pre-commit hook**: `utils/githooks/pre-commit` runs the full test suite (~11s) on every commit — including the version-binding guard. Per-clone, one-time setup: `git config core.hooksPath utils/githooks`. Bypass deliberately with `git commit --no-verify`.

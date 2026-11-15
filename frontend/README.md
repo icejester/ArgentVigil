@@ -1,9 +1,7 @@
 # ArgentVigil — Frontend
 
 React 19 + Vite 5 + Recharts. No state library, no router — one page, seven tab-sections
-plus a Settings view. Dev server runs on :5173 via `bash utils/vigil-native.sh start` (Vite HMR
-picks up edits automatically); `/api` and `/stack_images` are proxied to the backend on
-:8000.
+plus a Settings view. Served by nginx in the containerized deploy (`bash utils/vigil.sh up <env>`); `/api` and `/stack_images` are proxied to that environment's `api`.
 
 This is an orientation doc. The durable, exhaustive record (per-panel behavior,
 interaction history, bug narratives) is the repo-root `CLAUDE.md`; `docs/UI_STANDARDS.md`
@@ -32,6 +30,10 @@ internally, so they get both rewrites for free.
   src="/stack_images/...">` tags need zero code change for this, the proxy is nginx-only.
   CORS on the backend is env-driven (`CORS_ALLOWED_ORIGINS`, no wildcard) rather than the
   old permissive `*`.
+
+## Mobile view
+
+`src/mobile/` is a separate phone view (spec: `specs/mobile-spec.md`, rules: `docs/MOBILE_UI_STANDARDS.md`), picked in `main.jsx` by `view_mode.js` (narrow viewport, with a per-device Desktop/Mobile override). It does not import Recharts or any desktop panel; charts are small SVG components in `mobile/charts.jsx`, pure helpers in `mobile/stats.js` (`node src/mobile/stats.test.mjs` tests them).
 
 ## Component map (one file per tab, plus shared modules)
 
@@ -66,6 +68,6 @@ internally, so they get both rewrites for free.
 
 ## Building / serving
 
-- **Local dev**: Vite dev server (`vigil-native.sh start`), HMR, talks to the backend via its proxy — no build step needed.
+- **Local dev**: `bash utils/vigil.sh up <env>` builds and serves the frontend through nginx; `/api` and `/stack_images` are proxied to that environment's `api`.
 - **Containerized deploy**: `npm run build` produces `frontend/dist`, served by nginx (`Dockerfile.frontend`) — the backend has no `/` route and never serves this bundle itself (the old `StaticFiles` mount was removed as part of the API split).
 </content>

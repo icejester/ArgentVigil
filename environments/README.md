@@ -6,11 +6,7 @@ a disposable or persistent instance of the `docker-compose.yml` stack
 with zero manual port juggling, all through `utils/vigil.sh up <name>`.
 
 `prod` is one of these environments too, as of the containerized-prod
-cutover — see `prod.env` in this directory. `utils/vigil-native.sh` (the
-old bare-process `vigil.sh`, before the rename) is now only a faster
-local-dev fallback that happens to default to the same `runtime/data/prod/`
-directory; it must never run at the same time as this directory's `prod`
-environment — see `prod.env`'s own comment.
+cutover — see `prod.env` in this directory. Never run another process against `runtime/data/prod/` while it is up.
 
 Adding environment #`n` is: copy an existing file, pick two free ports and
 a runtime dir, done — no changes to `docker-compose.yml` or the scripts.
@@ -40,8 +36,7 @@ API key, on purpose (they're the opposite of secret — meant to be
 committed and diffed like any other config). Compose resolves `${VAR}`
 references in the compose file from whatever's in **the shell that invokes
 `docker compose`/`vigil.sh`** at that moment — i.e. it inherits your
-real, exported shell environment, the same way `vigil-native.sh`'s bare-process
-backend already does.
+real, exported shell environment, 
 
 **This means `utils/vigil.sh up <env>` only has real API keys if the
 shell you run it from already has them exported.** If it doesn't, compose

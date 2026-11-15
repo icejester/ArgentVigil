@@ -12,8 +12,8 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # AV_RUNTIME_DIR overrides where the SQLite file lives — defaults to
 # runtime/ unchanged (today's behavior) so nothing breaks for anyone not
 # setting it. Added 2026-09-16 for the prod/test/backup data split under
-# runtime/data/<env>/ — vigil-native.sh sets this to runtime/data/prod when
-# starting its bare-process prod fallback; docker-compose.yml's api/collector
+# runtime/data/<env>/ — each compose service sets this; unset it defaults to runtime/.
+# docker-compose.yml's api/collector
 # services set it to the fixed in-container path /app/runtime, bind-mounted
 # from each environment's own HOST_RUNTIME_DIR (environments/<name>.env) —
 # runtime/data/prod for the "prod" environment, runtime/data/test for

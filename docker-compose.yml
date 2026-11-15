@@ -10,9 +10,7 @@
 #
 # This is the containerized-deploy path, and — as of the prod cutover — the
 # primary one: prod itself now runs as the "prod" named environment here
-# (environments/prod.env), brought up via `utils/vigil.sh up prod` (`vigil.sh`
-# used to mean bare-process local dev; that script is now `vigil-native.sh`,
-# kept only as a faster/no-Docker local inner loop — see its own header).
+# (environments/prod.env), brought up via `utils/vigil.sh up prod`.
 # This compose stack runs N disposable-or-persistent named environments
 # (utils/vigil.sh up <env>) side by side, each on its own ports, with zero
 # manual port juggling.
@@ -35,13 +33,8 @@
 # the prod cutover — see environments/prod.env's own comment for the
 # current state): each environment bind-mounts its own HOST_RUNTIME_DIR
 # (environments/<name>.env), independent of every other environment's data
-# — including "prod", which now bind-mounts the same runtime/data/prod/
-# {argentvigil.db,stack.db,stack_images/} that vigil-native.sh's bare
-# backend used to own exclusively. `vigil-native.sh` and the "prod" compose
-# environment must never run against that directory at the same time —
-# `vigil.sh up prod` checks for a running vigil-native.sh backend and
-# refuses if found (see that script's `refuse_if_vigil_native_running`),
-# but there's no check in the other direction yet. A directory that
+# — including "prod" (runtime/data/prod/). Never run a second process
+# against one environment's directory. A directory that
 # doesn't exist yet is created empty by Docker's bind-mount on first `up`
 # — booting a brand-new environment before ever seeding it will show the
 # same "No CoT data persisted yet" behavior documented under Tab: CoT
@@ -144,9 +137,6 @@ services:
         # prod; environments/prod.env sets AV_ENV_NAME=prod explicitly, so
         # the containerized prod environment's web build gets
         # VITE_AV_ENV=prod set directly rather than relying on absence.
-        # vigil-native.sh's bare-process frontend (Vite dev server, not
-        # this build) still has no VITE_AV_ENV set at all, so it still
-        # falls through to the absence path.
         VITE_AV_ENV: "${AV_ENV_NAME:-test}"
     container_name: av-${AV_ENV_NAME:-test}-web
     ports:
