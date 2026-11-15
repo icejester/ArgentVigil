@@ -648,6 +648,105 @@ def value_history(
     return rows
 
 
+def acquisitions() -> dict:
+    """Per-metal, per-purchase-date view answering "did that buy make my
+    pile better or worse?" (mobile-spec.md Story S2). Descriptive facts
+    only, computed at read time from stack.db items + settlement_price
+    closes; nothing persisted.
+
+    For each metal (silver, gold), purchases are grouped by purchase_date
+    (same-date rows summed) and walked oldest to newest. Per date:
+      - oz, paid, paid_per_oz  (paid is NULL if any row that date has no
+        price — never a partial sum presented as the total)
+      - close, premium_per_oz, premium_pct: paid_per_oz vs. that date's
+        real daily close, as-of on-or-before (NULL if no close exists)
+      - dca_before / dca_after / dca_change: the pile's average cost per
+        oz (cumulative spend / cumulative oz) before and after this date
+      - now_value, now_gain, now_gain_pct: this purchase at today's spot
+    Bimetallic items and items with no purchase_date/weight are skipped.
+    Returned newest first."""
+    import bisect
+
+    spot = _spot_prices()
+    result = {"spot": spot, "silver": [], "gold": []}
+    for metal, instrument in (("silver", "XAG_YAHOO_DAILY_CLOSE"), ("gold", "XAU_YAHOO_DAILY_CLOSE")):
+        closes = {
+            r["date"]: r["price"]
+            for r in main_db.get_settlement_price_series(instrument)
+            if r["price"] is not None
+        }
+        dates_sorted = sorted(closes)
+
+        def close_asof(target: str):
+            idx = bisect.bisect_right(dates_sorted, target)
+            return closes[dates_sorted[idx - 1]] if idx else None
+
+        by_date: dict[str, list[dict]] = {}
+        for item in list_items():
+            if item.get("metal") != metal or not item.get("purchase_date"):
+                continue
+            s_oz, g_oz = _total_weight_oz(item)
+            oz = s_oz if metal == "silver" else g_oz
+            if not oz:
+                continue
+            by_date.setdefault(item["purchase_date"], []).append({**item, "_oz": oz})
+
+        cum_oz = 0.0
+        cum_spend = 0.0
+        cum_priced = True  # false once any earlier row lacked a price
+        rows = []
+        for d in sorted(by_date):
+            group = by_date[d]
+            oz = sum(i["_oz"] for i in group)
+            priced = all(i.get("purchase_price") is not None for i in group)
+            paid = sum(i["purchase_price"] for i in group) if priced else None
+            paid_per_oz = paid / oz if paid is not None and oz else None
+            close = close_asof(d)
+            premium = paid_per_oz - close if paid_per_oz is not None and close is not None else None
+            premium_pct = premium / close * 100 if premium is not None and close else None
+
+            dca_before = cum_spend / cum_oz if cum_oz and cum_priced else None
+            new_oz = cum_oz + oz
+            new_priced = cum_priced and priced
+            new_spend = cum_spend + (paid or 0)
+            dca_after = new_spend / new_oz if new_oz and new_priced else None
+            dca_change = dca_after - dca_before if dca_after is not None and dca_before is not None else None
+            cum_oz, cum_spend, cum_priced = new_oz, new_spend, new_priced
+
+            now_value = oz * spot[metal] if spot[metal] is not None else None
+            now_gain = now_value - paid if now_value is not None and paid is not None else None
+            now_gain_pct = now_gain / paid * 100 if now_gain is not None and paid else None
+
+            rows.append({
+                "date": d,
+                "oz": oz,
+                "paid": paid,
+                "paid_per_oz": paid_per_oz,
+                "close": close,
+                "premium_per_oz": premium,
+                "premium_pct": premium_pct,
+                "dca_before": dca_before,
+                "dca_after": dca_after,
+                "dca_change": dca_change,
+                "now_value": now_value,
+                "now_gain": now_gain,
+                "now_gain_pct": now_gain_pct,
+                "purchases": [
+                    {
+                        "id": i["id"],
+                        "description": i.get("description"),
+                        "series": i.get("series"),
+                        "count": i.get("count"),
+                        "oz": i["_oz"],
+                        "purchase_price": i.get("purchase_price"),
+                    }
+                    for i in group
+                ],
+            })
+        result[metal] = list(reversed(rows))
+    return result
+
+
 def portfolio_summary() -> dict:
     spot = _spot_prices()
     items = list_items()

@@ -1298,3 +1298,68 @@ def test_stack_routes_covered_by_allowed_non_db_api():
     assert any(
         prefix.startswith("/api/stack/") for prefix in test_conventions.ALLOWED_NON_DB_API
     ), "ALLOWED_NON_DB_API needs a /api/stack/ entry for Stack Tracker's CRUD routes"
+
+
+# --- acquisitions() (mobile-spec.md Story S2) ------------------------------
+
+
+def _acq_setup(tmp_db, monkeypatch, silver_spot=40.0):
+    monkeypatch.setattr(stack, "_spot_prices", lambda: {"silver": silver_spot, "gold": None})
+    tmp_db.upsert_settlement_price_rows(
+        "XAG_YAHOO_DAILY_CLOSE",
+        [
+            {"date": "2026-01-02", "price": 28.0, "session": "daily"},
+            {"date": "2026-02-03", "price": 32.0, "session": "daily"},
+        ],
+    )
+
+
+def _silver(date, price, oz=10.0, count=1):
+    return stack.create_item(
+        {"description": "bar", "metal": "silver", "form": "bar", "unit_weight_oz": oz, "count": count,
+         "purchase_date": date, "purchase_price": price}
+    )
+
+
+def test_acquisitions_dca_before_after_and_premium(tmp_db, tmp_stack_db, monkeypatch):
+    _acq_setup(tmp_db, monkeypatch)
+    _silver("2026-01-05", 300.0)   # 30/oz vs 28 close -> +2 premium
+    _silver("2026-02-04", 360.0)   # 36/oz vs 32 close -> +4 premium
+    rows = stack.acquisitions()["silver"]
+    assert [r["date"] for r in rows] == ["2026-02-04", "2026-01-05"]  # newest first
+    first, second = rows[1], rows[0]
+    assert first["dca_before"] is None and first["dca_after"] == pytest.approx(30.0)
+    assert first["premium_per_oz"] == pytest.approx(2.0)
+    assert second["dca_before"] == pytest.approx(30.0)
+    assert second["dca_after"] == pytest.approx(33.0)
+    assert second["dca_change"] == pytest.approx(3.0)
+    assert second["now_value"] == pytest.approx(400.0)
+    assert second["now_gain"] == pytest.approx(40.0)
+
+
+def test_acquisitions_same_date_rows_are_summed(tmp_db, tmp_stack_db, monkeypatch):
+    _acq_setup(tmp_db, monkeypatch)
+    _silver("2026-01-05", 300.0)
+    _silver("2026-01-05", 320.0)
+    rows = stack.acquisitions()["silver"]
+    assert len(rows) == 1
+    assert rows[0]["oz"] == pytest.approx(20.0) and rows[0]["paid"] == pytest.approx(620.0)
+    assert len(rows[0]["purchases"]) == 2
+
+
+def test_acquisitions_nulls_not_zeros(tmp_db, tmp_stack_db, monkeypatch):
+    _acq_setup(tmp_db, monkeypatch, silver_spot=None)
+    _silver("2005-01-05", 300.0)   # predates every close
+    stack.create_item({"description": "x", "metal": "silver", "form": "bar", "unit_weight_oz": 1, "purchase_date": "2026-02-10"})  # no price
+    rows = stack.acquisitions()["silver"]
+    unpriced, old = rows[0], rows[1]
+    assert old["close"] is None and old["premium_per_oz"] is None
+    assert old["now_value"] is None and old["now_gain"] is None
+    assert unpriced["paid"] is None and unpriced["dca_after"] is None
+
+
+async def test_acquisitions_route(client, tmp_stack_db, monkeypatch):
+    monkeypatch.setattr(stack, "_spot_prices", lambda: {"silver": 40.0, "gold": None})
+    r = await client.get("/api/v1/stack/acquisitions/db")
+    assert r.status_code == 200
+    assert r.json()["data"]["silver"] == [] and r.json()["data"]["gold"] == []

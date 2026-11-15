@@ -1727,6 +1727,14 @@ async def stack_timeseries_db():
     return {"success": True, "data": stack.timeseries()}
 
 
+@api_router.get("/stack/acquisitions/db", response_model=models.StackAcquisitionsResponse)
+async def stack_acquisitions_db():
+    """Per-metal, per-purchase-date acquisition impact (mobile-spec.md S2):
+    paid vs. that day's close, the pile's average cost before/after, and
+    each purchase's gain/loss at today's spot. Read-time derivation."""
+    return {"success": True, "data": stack.acquisitions()}
+
+
 @api_router.get("/stack/value-history/db", response_model=models.StackValueHistoryResponse)
 async def stack_value_history_db(
     series: list[str] = Query(None),

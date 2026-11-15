@@ -14,6 +14,7 @@ import SettingsView from "./settings_panel";
 import { HealthProvider, useHealthRows } from "./health_context";
 import { PinnedDateProvider } from "./pinned_date_context";
 import { apiFetch } from "./api_client";
+import { setViewPref } from "./view_mode";
 
 import { TEXT_MUTED, TEXT_SUBTLE } from "./palette";
 // Nav tab set. MUST stay in lockstep with backend main.py's
@@ -392,6 +393,14 @@ export default function App() {
             </div>
             <div className="app-subtitle">
               Silver Market Observability Platform
+              {" · "}
+              <a
+                href="#mobile"
+                style={{ color: "inherit", textDecoration: "underline" }}
+                onClick={(e) => { e.preventDefault(); setViewPref("mobile"); }}
+              >
+                Mobile site
+              </a>
             </div>
           </div>
           <HeaderTicker />

@@ -307,6 +307,43 @@ class StackValueHistoryResponse(BaseModel):
     data: list[StackValueHistoryPoint]
 
 
+class StackAcquisitionPurchase(BaseModel):
+    id: int
+    description: str | None = None
+    series: str | None = None
+    count: int | None = None
+    oz: float
+    purchase_price: float | None = None
+
+
+class StackAcquisition(BaseModel):
+    date: str
+    oz: float
+    paid: float | None = None
+    paid_per_oz: float | None = None
+    close: float | None = None
+    premium_per_oz: float | None = None
+    premium_pct: float | None = None
+    dca_before: float | None = None
+    dca_after: float | None = None
+    dca_change: float | None = None
+    now_value: float | None = None
+    now_gain: float | None = None
+    now_gain_pct: float | None = None
+    purchases: list[StackAcquisitionPurchase]
+
+
+class StackAcquisitionsData(BaseModel):
+    spot: dict[str, float | None]
+    silver: list[StackAcquisition]
+    gold: list[StackAcquisition]
+
+
+class StackAcquisitionsResponse(BaseModel):
+    success: bool
+    data: StackAcquisitionsData
+
+
 class IdResponse(BaseModel):
     """Generic {"id": N} data payload — create-item, add-link."""
 
