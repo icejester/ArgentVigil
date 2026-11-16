@@ -10,7 +10,7 @@ const RED = "#e05252";
 const AXIS = "#919bb0";
 const GRID = "#2e3547";
 
-function niceTicks(min, max, n = 4) {
+export function niceTicks(min, max, n = 4) {
   if (!(max > min)) return [min];
   const raw = (max - min) / n;
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -52,7 +52,7 @@ export function Sparkline({ rows, color = "#7b9fff", width = 96, height = 28 }) 
   );
 }
 
-function useWidth() {
+export function useWidth() {
   const ref = useRef(null);
   const [w, setW] = useState(320);
   useEffect(() => {
@@ -258,6 +258,99 @@ export function DrillChart({
         ) : (
           <div className="m-hint">Touch the chart to read a date{onPin ? " and pin it" : ""}.</div>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+// Pie (inventory composition). slices: [{key,label,value,color}]. Slices are
+// separated by a surface-colored ring; the legend beside it carries names,
+// shares and values, so color is never the only identity channel.
+export function PieChart({ slices, size = 180, onSlice, ariaLabel }) {
+  const total = slices.reduce((s, x) => s + x.value, 0);
+  if (!(total > 0)) return null;
+  const r = size / 2 - 2, c = size / 2;
+  let a0 = -Math.PI / 2;
+  const paths = slices.map((sl) => {
+    const frac = sl.value / total;
+    const a1 = a0 + frac * 2 * Math.PI;
+    let d;
+    if (frac >= 0.9999) {
+      d = `M${c} ${c - r}A${r} ${r} 0 1 1 ${c - 0.01} ${c - r}Z`;
+    } else {
+      const x0 = c + r * Math.cos(a0), y0 = c + r * Math.sin(a0);
+      const x1 = c + r * Math.cos(a1), y1 = c + r * Math.sin(a1);
+      d = `M${c} ${c}L${x0.toFixed(2)} ${y0.toFixed(2)}A${r} ${r} 0 ${frac > 0.5 ? 1 : 0} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}Z`;
+    }
+    a0 = a1;
+    return { ...sl, d };
+  });
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={ariaLabel}>
+      {paths.map((p) => (
+        <path key={p.key} d={p.d} fill={p.color} stroke="#141820" strokeWidth="2" onClick={onSlice && p.onTap !== false ? () => onSlice(p) : undefined} style={onSlice ? { cursor: "pointer" } : undefined} />
+      ))}
+    </svg>
+  );
+}
+
+// Tick chart: rows [{t: ms, price}] on a true time axis, optional dashed
+// high/low reference lines. Touch/drag scrubs a readout (vertical scroll
+// still works: touch-action pan-y).
+export function TickChart({ rows, color = "#5aa9e6", height = 150, hi, lo, fmt = (v) => v.toFixed(2) }) {
+  const [ref, w] = useWidth();
+  const [idx, setIdx] = useState(null);
+  const pts = rows || [];
+  if (pts.length < 2) return <div className="m-empty">Not enough ticks yet for this window.</div>;
+  const padL = 6, padR = 52, padT = 10, padB = 20;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  let min = Math.min(...pts.map((p) => p.price)), max = Math.max(...pts.map((p) => p.price));
+  if (hi != null) max = Math.max(max, hi);
+  if (lo != null) min = Math.min(min, lo);
+  const span = max - min || 1;
+  min -= span * 0.06; max += span * 0.06;
+  const X = (t) => padL + ((t - t0) / (t1 - t0 || 1)) * (w - padL - padR);
+  const Y = (v) => padT + (1 - (v - min) / (max - min)) * (height - padT - padB);
+  const ds = downsample(pts, 240);
+  const path = ds.map((p, i) => (i ? "L" : "M") + X(p.t).toFixed(1) + " " + Y(p.price).toFixed(1)).join("");
+  const ticks = niceTicks(min, max, 3);
+  const multiDay = t1 - t0 > 36 * 3600 * 1000;
+  const lab = (t) => new Date(t).toLocaleString([], multiDay ? { month: "short", day: "numeric" } : { hour: "numeric", minute: "2-digit" });
+  const at = (clientX) => {
+    const rect = ref.current.getBoundingClientRect();
+    const t = t0 + ((clientX - rect.left - padL) / (w - padL - padR)) * (t1 - t0);
+    let best = 0;
+    for (let i = 1; i < pts.length; i++) if (Math.abs(pts[i].t - t) < Math.abs(pts[best].t - t)) best = i;
+    setIdx(best);
+  };
+  const sel = idx != null ? pts[idx] : null;
+  return (
+    <div>
+      <div ref={ref} className="m-chart-box" style={{ touchAction: "pan-y" }}
+        onPointerDown={(e) => at(e.clientX)} onPointerMove={(e) => (e.buttons || e.pointerType === "touch") && at(e.clientX)}>
+        <svg width={w} height={height} viewBox={`0 0 ${w} ${height}`} role="img" aria-label="Price ticks">
+          {ticks.map((v) => (
+            <g key={v}>
+              <line x1={padL} x2={w - padR} y1={Y(v)} y2={Y(v)} stroke={GRID} strokeWidth="0.5" />
+              <text x={w - padR + 4} y={Y(v) + 4} fontSize="11" fill={AXIS}>{fmt(v)}</text>
+            </g>
+          ))}
+          {hi != null && <line x1={padL} x2={w - padR} y1={Y(hi)} y2={Y(hi)} stroke={AXIS} strokeDasharray="4 3" />}
+          {lo != null && <line x1={padL} x2={w - padR} y1={Y(lo)} y2={Y(lo)} stroke={AXIS} strokeDasharray="4 3" />}
+          <path d={path} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" />
+          <text x={padL} y={height - 5} fontSize="11" fill={AXIS}>{lab(t0)}</text>
+          <text x={w - padR} y={height - 5} fontSize="11" fill={AXIS} textAnchor="end">{lab(t1)}</text>
+          {sel && (
+            <g>
+              <line x1={X(sel.t)} x2={X(sel.t)} y1={padT} y2={height - padB} stroke={AXIS} />
+              <circle cx={X(sel.t)} cy={Y(sel.price)} r="4" fill={color} stroke="#141820" strokeWidth="2" />
+            </g>
+          )}
+        </svg>
+      </div>
+      <div className="m-readout">
+        {sel ? <><b>{fmt(sel.price)}</b> <span className="m-hint">{new Date(sel.t).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</span></> : <span className="m-hint">Touch the chart for a price and time.</span>}
       </div>
     </div>
   );

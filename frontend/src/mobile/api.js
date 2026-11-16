@@ -62,3 +62,23 @@ export function useGetAll(paths) {
   }, [key]);
   return state;
 }
+
+// Live tick feed (/api/prices/db/ticks), uncached, polled. Rows come back as
+// [{t: ms, price}]. sinceMs = lookback from now; pollMs 0 = fetch once.
+export function useTicks(metal, sinceMs, pollMs = 60000) {
+  const [state, setState] = useState({ rows: null, error: null });
+  useEffect(() => {
+    let live = true;
+    const run = () => {
+      const since = new Date(Date.now() - sinceMs).toISOString();
+      apiFetch(`/api/prices/db/ticks?series_id=${metal}&since=${encodeURIComponent(since)}`)
+        .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
+        .then((j) => live && setState({ rows: (j.data ?? []).filter((x) => x.price != null).map((x) => ({ t: new Date(x.ts).getTime(), price: x.price })), error: null }))
+        .catch((e) => live && setState((s) => ({ rows: s.rows, error: String(e.message || e) })));
+    };
+    run();
+    const id = pollMs ? setInterval(run, pollMs) : null;
+    return () => { live = false; if (id) clearInterval(id); };
+  }, [metal, sinceMs, pollMs]);
+  return state;
+}

@@ -83,3 +83,10 @@ Append one line per decision. Format: date, area, decision, who, reason.
 | 2026-11-15 | Money | Divergence bands = quarters where Fed and M2 moved in opposite directions | Claude (default) | Descriptive, not a signal |
 | 2026-11-15 | Copy | Mechanism card 2 drops the fixed 1.9x | Claude | The ratio changes; the app computes it |
 | 2026-11-15 | Perf | gzip for JSON in nginx; SOMA read with a future `since` | Claude | 2 MB and 4 MB payloads on a phone |
+| 2026-11-16 | Header | Ag/Au cells show price, change over the last 6H from real ticks, and a sparkline; tap opens a tick chart with 6H/24H/7D | User, Claude (details) | Match desktop HeaderTicker; spot 24h% was less useful than recent movement |
+| 2026-11-16 | Trading | Lead with a current-session high/low range bar and a session tick chart; leverage, curve spread, volume and daily range move into a collapsed card | User | The positioning rows were low value on a phone |
+| 2026-11-16 | Trading | Session = since the 22:00 UTC Globex reopen; on a closure the last real session is shown and labeled | Claude (default) | Same boundary as the spot persist-skip rule |
+| 2026-11-16 | Inventory | Vault rows replaced by a pie of share by vault (Total/Registered/Eligible) plus a movement list over a chosen window | User | Day-over-day vault deltas were nearly all zero |
+| 2026-11-16 | Inventory | Pie names the top 7 vaults, the rest fold into one gray Other; legend carries share, oz and change | Claude (default) | Validated 8-hue palette, color never the only channel |
+| 2026-11-16 | Windows | Inventory and Delivery behavior add 1W, 2W and 30D to 45D/3M/6M/All; vault movement defaults to 30D | User | Shorter looks at delivery behavior |
+

@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useGetAll } from "./api";
 import { DrillChart } from "./charts";
-import { Screen, Loading, MetalToggle, WindowBar, GlanceRow, Caveat, SyncedAgo } from "./ui";
+import { Screen, Loading, MetalToggle, WindowBar, GlanceRow, Caveat, SyncedAgo, Collapsible } from "./ui";
+import SessionRange from "./session";
 import { TRADING_WINDOWS } from "./windows";
 import { usePin } from "./pin";
 import { sliceWindow, lastChange, percentileRank, ordinal, fmtNum, fmtUsd, fmtCompact, fmtSigned, DASH } from "./stats";
@@ -97,20 +98,24 @@ export default function Trading() {
           <>
             <h2 className="m-h2">Trading <SyncedAgo sourceKey={["silver_leverage", "futures_curve_spread", "metals_prices"]} /></h2>
             {toggle}
-            <WindowBar windows={TRADING_WINDOWS} value={winKey} onChange={setWinKey} />
-            {rowFor("lev")}
-            {rowFor("curve")}
-            {rowFor("vol")}
-            <GlanceRow
-              label="Price high / low"
-              value={pxLast ? fmtUsd(pxLast.close) : DASH}
-              sub={pxLast ? `High ${fmtUsd(pxLast.high)} · Low ${fmtUsd(pxLast.low)}` : undefined}
-              asOf={pxLast?.date}
-              spark={windowed("px")}
-              sparkColor={defs.px.color}
-              onTap={() => setDrill("px")}
-            />
-            <Caveat>Percentiles compare each series with its own history over the selected window. They are descriptive, not a signal.</Caveat>
+            <div className="m-section">Current session · {metal === "XAG" ? "Silver" : "Gold"}</div>
+            <SessionRange metal={metal} color={metal === "XAG" ? "#5aa9e6" : "#e0c14c"} />
+            <Collapsible title="Positioning, volume and daily range">
+              <WindowBar windows={TRADING_WINDOWS} value={winKey} onChange={setWinKey} />
+              {rowFor("lev")}
+              {rowFor("curve")}
+              {rowFor("vol")}
+              <GlanceRow
+                label="Daily high / low"
+                value={pxLast ? fmtUsd(pxLast.close) : DASH}
+                sub={pxLast ? `High ${fmtUsd(pxLast.high)} · Low ${fmtUsd(pxLast.low)}` : undefined}
+                asOf={pxLast?.date}
+                spark={windowed("px")}
+                sparkColor={defs.px.color}
+                onTap={() => setDrill("px")}
+              />
+              <Caveat>Percentiles compare each series with its own history over the selected window. They are descriptive, not a signal.</Caveat>
+            </Collapsible>
           </>
         );
       })()}

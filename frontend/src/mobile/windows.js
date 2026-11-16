@@ -10,7 +10,14 @@ export const TRADING_WINDOWS = [
   { key: "all", label: "All", all: true },
 ];
 
+export const W1 = { key: "1w", label: "1W", days: 7 };
+export const W2 = { key: "2w", label: "2W", days: 14 };
+export const D30 = { key: "30d", label: "30D", days: 30 };
+
 export const INVENTORY_WINDOWS = [
+  W1,
+  W2,
+  D30,
   D45,
   { key: "3m", label: "3M", days: 91 },
   { key: "6m", label: "6M", days: 182 },

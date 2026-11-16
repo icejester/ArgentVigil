@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useGetAll, useGet } from "./api";
-import { DrillChart } from "./charts";
+import { DrillChart, PieChart } from "./charts";
+import { MM_PIE_COLORS, MM_PIE_OTHER_COLOR } from "../palette";
 import { Screen, Loading, MetalToggle, WindowBar, GlanceRow, Caveat, SyncedAgo } from "./ui";
 import { INVENTORY_WINDOWS, D45 } from "./windows";
 import { usePin } from "./pin";
@@ -9,37 +10,66 @@ import { sliceWindow, fmtCompact, fmtSignedCompact, DASH } from "./stats";
 // Inventory (mobile-spec.md Section 5): COMEX only. Vaults sorted by how
 // much they moved on the snapshot day, then delivery behavior.
 
-function snapshot(depo, date) {
+// Snapshot at `date` plus each vault's change since the nearest history date
+// on/before date - win.days (or the earliest date if history is shorter or
+// the window is All). Day-over-day is mostly zeros for vaults, so movement is
+// shown over a window instead.
+function snapshot(depo, date, win) {
   const dates = [...new Set(depo.map((r) => r.date))].sort();
-  const i = dates.indexOf(date);
-  if (i < 0) return null;
-  const prevDate = i > 0 ? dates[i - 1] : null;
+  if (!dates.includes(date)) return null;
+  let baseDate = dates[0];
+  if (!win.all) {
+    const cutoff = new Date(date + "T00:00:00Z").getTime() - win.days * 86400000;
+    for (const d of dates) if (new Date(d + "T00:00:00Z").getTime() <= cutoff) baseDate = d;
+  }
+  if (baseDate >= date) baseDate = null;
   const byVault = new Map();
   for (const r of depo) {
-    if (r.date !== date && r.date !== prevDate) continue;
+    if (r.date !== date && r.date !== baseDate) continue;
     const v = byVault.get(r.depository) ?? { name: r.depository };
-    v[r.date === date ? "cur" : "prev"] = r;
+    v[r.date === date ? "cur" : "base"] = r;
     byVault.set(r.depository, v);
   }
-  const vaults = [...byVault.values()].filter((v) => v.cur).map((v) => {
-    const dReg = v.prev ? v.cur.registered - v.prev.registered : null;
-    const dElig = v.prev ? v.cur.eligible - v.prev.eligible : null;
-    const dTot = v.prev ? v.cur.total - v.prev.total : null;
-    return { name: v.name, reg: v.cur.registered, elig: v.cur.eligible, total: v.cur.total, dReg, dElig, dTot, move: (Math.abs(dReg ?? 0) + Math.abs(dElig ?? 0)) };
-  });
-  // Biggest movers first; vaults with no change sink to the bottom by size.
-  vaults.sort((a, b) => (b.move !== a.move ? b.move - a.move : b.total - a.total));
-  const sum = (k) => vaults.reduce((s, v) => s + (v[k] ?? 0), 0);
-  const hasPrev = vaults.some((v) => v.dReg != null);
-  return {
-    date, prevDate, vaults,
-    totals: { reg: sum("reg"), elig: sum("elig"), total: sum("total"), dReg: hasPrev ? sum("dReg") : null, dElig: hasPrev ? sum("dElig") : null, dTot: hasPrev ? sum("dTot") : null },
-  };
+  const vaults = [...byVault.values()].filter((v) => v.cur).map((v) => ({
+    name: v.name, cur: v.cur, base: v.base ?? null,
+  }));
+  return { date, baseDate, vaults, spanDays: baseDate ? Math.round((new Date(date) - new Date(baseDate)) / 86400000) : 0 };
 }
 
-const Delta = ({ label, v }) => (
-  <div className="m-delta"><span className="m-delta-label">{label}</span><span className="m-delta-val">{v == null ? DASH : fmtSignedCompact(v)}</span></div>
-);
+// Per-metric view of a snapshot: values, change over the window, shares.
+function measureView(snap, metric) {
+  const vs = snap.vaults.map((v) => {
+    const val = v.cur[metric];
+    const prev = v.base ? v.base[metric] : null;
+    return { name: v.name, val: val ?? 0, delta: val != null && prev != null ? val - prev : null };
+  });
+  const total = vs.reduce((s, v) => s + v.val, 0);
+  const hasBase = snap.baseDate != null;
+  const sumDelta = vs.some((v) => v.delta != null) ? vs.reduce((s, v) => s + (v.delta ?? 0), 0) : null;
+  return { vaults: vs.sort((a, b) => b.val - a.val), total, delta: hasBase ? sumDelta : null };
+}
+
+const MEASURES = [["total", "Total"], ["registered", "Registered"], ["eligible", "Eligible"]];
+const arrow = (v) => (v > 0 ? "▲ " : v < 0 ? "▼ " : "");
+const toneOf = (v) => (v > 0 ? "m-pos" : v < 0 ? "m-neg" : "");
+
+function Movement({ view, metric }) {
+  const rows = [...view.vaults].filter((v) => v.delta != null).sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  const max = Math.max(...rows.map((v) => Math.abs(v.delta)), 0);
+  if (rows.length === 0) return <div className="m-empty">No earlier snapshot to compare with yet.</div>;
+  if (max === 0) return <div className="m-empty">No vault moved over this window.</div>;
+  return rows.filter((v) => v.delta !== 0).map((v) => {
+    const w = (Math.abs(v.delta) / max) * 50;
+    return (
+      <div className="m-move-row" key={v.name}>
+        <div className="m-move-head"><span>{v.name}</span><b className={toneOf(v.delta)}>{arrow(v.delta)}{fmtSignedCompact(v.delta)} oz</b></div>
+        <div className="m-move-track" aria-hidden="true">
+          <div className="m-move-fill" style={v.delta > 0 ? { left: "50%", width: w + "%", background: "#4caf76" } : { right: "50%", width: w + "%", background: "#e05252" }} />
+        </div>
+      </div>
+    );
+  });
+}
 
 function VaultHistory({ vault, depo, metal, onBack }) {
   const [metric, setMetric] = useState("total");
@@ -111,9 +141,12 @@ function DeliveryScreen({ metal, onBack }) {
 
 export default function Inventory() {
   const [metal, setMetal] = useState("XAG");
+  const [metric, setMetric] = useState("total");
+  const [winKey, setWinKey] = useState("30d");
   const [screen, setScreen] = useState(null); // {kind:'vault', name} | {kind:'delivery'}
   const { pinnedDate, onPin } = usePin();
   const m = metal === "XAG" ? "silver" : "gold";
+  const win = INVENTORY_WINDOWS.find((w) => w.key === winKey);
   const state = useGetAll([`/api/${m}/db/depositories/history`]);
 
   const depo = state.data?.[0];
@@ -122,15 +155,30 @@ export default function Inventory() {
     const dates = [...new Set(depo.map((r) => r.date))].sort();
     if (pinnedDate) {
       // Exact-match rule (desktop's VaultSnapshotPanel): no nearby-date fallback.
-      return dates.includes(pinnedDate) ? snapshot(depo, pinnedDate) : { missing: pinnedDate };
+      return dates.includes(pinnedDate) ? snapshot(depo, pinnedDate, win) : { missing: pinnedDate };
     }
-    return snapshot(depo, dates[dates.length - 1]);
-  }, [depo, pinnedDate]);
+    return snapshot(depo, dates[dates.length - 1], win);
+  }, [depo, pinnedDate, win]);
+  const view = snap?.vaults ? measureView(snap, metric) : null;
 
   const toggle = <MetalToggle metal={metal} onChange={(k) => { setMetal(k); setScreen(null); }} />;
 
   if (screen?.kind === "delivery") return <DeliveryScreen metal={metal} onBack={() => setScreen(null)} />;
   if (screen?.kind === "vault") return <VaultHistory vault={screen.name} depo={depo} metal={metal} onBack={() => setScreen(null)} />;
+
+  // Pie: top 7 vaults get the validated hues; the rest fold into one gray "Other".
+  const pieSlices = (() => {
+    if (!view) return [];
+    const pos = view.vaults.filter((v) => v.val > 0);
+    const top = pos.slice(0, 7).map((v, i) => ({ key: v.name, label: v.name, value: v.val, delta: v.delta, color: MM_PIE_COLORS[i] }));
+    const rest = pos.slice(7);
+    if (rest.length) {
+      const ds = rest.filter((v) => v.delta != null);
+      top.push({ key: "__other", label: `Other (${rest.length} vaults)`, value: rest.reduce((s, v) => s + v.val, 0), delta: ds.length ? ds.reduce((s, v) => s + v.delta, 0) : null, color: MM_PIE_OTHER_COLOR, onTap: false });
+    }
+    return top;
+  })();
+  const spanText = snap?.baseDate ? `${snap.spanDays} days, since ${snap.baseDate}` : "no earlier snapshot";
 
   return (
     <>
@@ -144,31 +192,45 @@ export default function Inventory() {
             <div><button type="button" className="m-btn" onClick={() => onPin(null)}>Clear pinned date</button></div>
           </div>
         )}
-        {snap?.vaults && (
+        {view && (
           <>
-            <div className="m-section">COMEX totals · {snap.date}{pinnedDate ? " (pinned)" : ""}</div>
-            <div className="m-acq">
-              {[["Registered", snap.totals.reg, snap.totals.dReg], ["Eligible", snap.totals.elig, snap.totals.dElig], ["Total", snap.totals.total, snap.totals.dTot]].map(([l, v, d]) => (
-                <div className="m-kv" key={l}><span>{l}</span><span>{fmtCompact(v)} oz <b>{d == null ? "" : fmtSignedCompact(d)}</b></span></div>
+            <div className="m-seg" role="group" aria-label="Measure">
+              {MEASURES.map(([k, l]) => (
+                <button key={k} type="button" className={"m-seg-btn" + (metric === k ? " m-seg-btn--on" : "")} aria-pressed={metric === k} onClick={() => setMetric(k)}>{l}</button>
               ))}
-              <div className="m-row-asof">change vs {snap.prevDate ?? DASH}</div>
             </div>
-            <div className="m-section">Vaults, biggest movers first</div>
-            {snap.vaults.map((v) => (
-              <button key={v.name} type="button" className="m-row m-vault" onClick={() => setScreen({ kind: "vault", name: v.name })}>
-                <div className="m-row-main">
-                  <div className="m-row-label">{v.name}</div>
-                  <div className="m-delta-pair"><Delta label="Registered" v={v.dReg} /><Delta label="Eligible" v={v.dElig} /></div>
-                  <div className="m-row-sub">Reg {fmtCompact(v.reg)} · Elig {fmtCompact(v.elig)} · Total {fmtCompact(v.total)} oz</div>
-                </div>
-                <span className="m-chev" aria-hidden="true">›</span>
-              </button>
-            ))}
+            <WindowBar windows={INVENTORY_WINDOWS} value={winKey} onChange={setWinKey} />
+            <div className="m-section">Where it sits · {snap.date}{pinnedDate ? " (pinned)" : ""}</div>
+            <div className="m-acq">
+              <div className="m-kv"><span>{MEASURES.find((x) => x[0] === metric)[1]} stock</span><span>{fmtCompact(view.total)} oz</span></div>
+              <div className="m-kv"><span>Change, {spanText}</span><span className={toneOf(view.delta)}>{view.delta == null ? DASH : arrow(view.delta) + fmtSignedCompact(view.delta) + " oz"}</span></div>
+            </div>
+            <div className="m-pie-wrap">
+              <PieChart slices={pieSlices} ariaLabel={`Share of COMEX ${metal === "XAG" ? "silver" : "gold"} ${metric} by vault`} onSlice={(sl) => setScreen({ kind: "vault", name: sl.key })} />
+              <div className="m-pie-legend">
+                {pieSlices.map((sl) => {
+                  const body = (
+                    <>
+                      <span className="m-swatch" style={{ background: sl.color }} />
+                      <span className="m-pie-name">{sl.label}</span>
+                      <span className="m-pie-share">{((sl.value / view.total) * 100).toFixed(1)}%</span>
+                      <span className="m-pie-sub">{fmtCompact(sl.value)} oz · <span className={toneOf(sl.delta)}>{sl.delta == null ? DASH : sl.delta === 0 ? "no change" : arrow(sl.delta) + fmtSignedCompact(sl.delta)}</span></span>
+                    </>
+                  );
+                  return sl.onTap === false
+                    ? <div key={sl.key} className="m-pie-row">{body}</div>
+                    : <button key={sl.key} type="button" className="m-pie-row" onClick={() => setScreen({ kind: "vault", name: sl.key })}>{body}</button>;
+                })}
+              </div>
+            </div>
+            <div className="m-section">Movement · {spanText}</div>
+            <div className="m-acq"><Movement view={view} metric={metric} /></div>
+            <Caveat>Tap a slice or a row for that vault's history. Per-vault history only goes back to when AV started recording it, so short windows may cover the whole record.</Caveat>
           </>
         )}
       </Loading>
       <div className="m-section">Delivery</div>
-      <GlanceRow label="Delivery behavior" value="Last 45 days" sub="Daily stock change against registered and delivery volume" onTap={() => setScreen({ kind: "delivery" })} />
+      <GlanceRow label="Delivery behavior" value="Daily stock change" sub="1W, 2W, 30D and longer, against registered and delivery volume" onTap={() => setScreen({ kind: "delivery" })} />
     </>
   );
 }
